@@ -1,0 +1,130 @@
+{
+  "description": "Parameter mapping configuration for AODN/IMOS data standardization. Maps raw variable names from datasets to standard parameter codes, namespaces, and units.",
+  "parameter_mapping": {
+    "TEMP": ["TEMP", "bodc", "Degrees Celsius"],
+    "TEMPERATURE": ["TEMP", "bodc", "Degrees Celsius"],
+    "SEA_WATER_TEMPERATURE": ["TEMP", "cf", "Degrees Celsius"],
+    "SST": ["SST", "bodc", "Degrees Celsius"],
+    "SEA_SURFACE_TEMPERATURE": ["SST", "cf", "Degrees Celsius"],
+    "SURFACE_TEMPERATURE": ["SST", "custom", "Degrees Celsius"],
+    
+    "PSAL": ["PSAL", "bodc", "PSS-78"],
+    "SALINITY": ["PSAL", "bodc", "PSS-78"],
+    "SEA_WATER_SALINITY": ["PSAL", "cf", "PSS-78"],
+    "PRACTICAL_SALINITY": ["PSAL", "bodc", "PSS-78"],
+    
+    "CPHL": ["CPHL", "bodc", "mg/m3"],
+    "CHLOROPHYLL": ["CPHL", "bodc", "mg/m3"],
+    "CHLOROPHYLL_A": ["CPHL", "bodc", "mg/m3"],
+    "CHL_A": ["CPHL", "bodc", "mg/m3"],
+    "CHLOROPHYLL_CONCENTRATION": ["CPHL", "cf", "mg/m3"],
+    "OCEAN_COLOUR_CHLOROPHYLL": ["CPHL", "cf", "mg/m3"],
+    "PHYTOPLANKTON_CHLOROPHYLL": ["CPHL", "cf", "mg/m3"],
+    
+    "DOXY": ["DOXY", "bodc", "ml/l"],
+    "DISSOLVED_OXYGEN": ["DOXY", "cf", "ml/l"],
+    "DO": ["DOXY", "custom", "ml/l"],
+    "OXYGEN_CONCENTRATION": ["DOXY", "cf", "ml/l"],
+    
+    "PH": ["PH", "bodc", "unitless"],
+    "PH_IN_SITU": ["PH", "cf", "unitless"],
+    "SEA_WATER_PH": ["PH", "cf", "unitless"],
+    
+    "DEPTH": ["DEPTH", "bodc", "Meters"],
+    "Z": ["DEPTH", "cf", "Meters"],
+    "ALTITUDE": ["DEPTH", "cf", "Meters"],
+    "HEIGHT": ["DEPTH", "cf", "Meters"],
+    
+    "PRES": ["PRES", "bodc", "Decibars"],
+    "PRESSURE": ["PRES", "bodc", "Decibars"],
+    "SEA_WATER_PRESSURE": ["PRES", "cf", "Decibars"],
+    
+    "VOLT": ["VOLT", "bodc", "Volts"],
+    "VOLTAGE": ["VOLT", "custom", "Volts"],
+    "SENSOR_OUTPUT": ["VOLT", "custom", "Volts"],
+    
+    "COND": ["COND", "bodc", "mS/cm"],
+    "CONDUCTIVITY": ["COND", "bodc", "mS/cm"],
+    "SEA_WATER_ELECTRICAL_CONDUCTIVITY": ["COND", "cf", "mS/cm"],
+    
+    "TURB": ["TURB", "bodc", "NTU"],
+    "TURBIDITY": ["TURB", "bodc", "NTU"],
+    "TURBIDITY_COEFFICIENT": ["TURB", "cf", "NTU"],
+    
+    "SCAT": ["SCAT", "bodc", "counts"],
+    "BACKSCATTER": ["SCAT", "custom", "counts"],
+    "OPTICAL_BACKSCATTER": ["SCAT", "cf", "counts"],
+    
+    "FLUO": ["FLUO", "bodc", "mg/m3"],
+    "FLUORESCENCE": ["FLUO", "custom", "mg/m3"],
+    "CHLOROPHYLL_FLUORESCENCE": ["FLUO", "cf", "mg/m3"],
+    
+    "VELOCITY_U": ["VELOCITY_U", "cf", "m/s"],
+    "VELOCITY_V": ["VELOCITY_V", "cf", "m/s"],
+    "VELOCITY_W": ["VELOCITY_W", "cf", "m/s"],
+    "EASTWARD_VELOCITY": ["VELOCITY_U", "cf", "m/s"],
+    "NORTHWARD_VELOCITY": ["VELOCITY_V", "cf", "m/s"],
+    "UPWARD_VELOCITY": ["VELOCITY_W", "cf", "m/s"],
+    
+    "WAVE_HEIGHT": ["WAVE_HGT", "bodc", "Meters"],
+    "SIGNIFICANT_WAVE_HEIGHT": ["WAVE_HGT", "cf", "Meters"],
+    "SWVHT": ["WAVE_HGT", "custom", "Meters"],
+    
+    "WAVE_PERIOD": ["WAVE_PER", "bodc", "Seconds"],
+    "MEAN_WAVE_PERIOD": ["WAVE_PER", "cf", "Seconds"],
+    "SWPD": ["WAVE_PER", "custom", "Seconds"],
+    
+    "WIND_SPEED": ["WIND_SPEED", "bodc", "m/s"],
+    "WIND_VELOCITY": ["WIND_SPEED", "cf", "m/s"],
+    "WIND_U": ["WIND_U", "cf", "m/s"],
+    "WIND_V": ["WIND_V", "cf", "m/s"],
+    "EASTWARD_WIND": ["WIND_U", "cf", "m/s"],
+    "NORTHWARD_WIND": ["WIND_V", "cf", "m/s"],
+    
+    "CURRENT_SPEED": ["CURRENT_SPEED", "custom", "m/s"],
+    "CURRENT_DIRECTION": ["CURRENT_DIR", "custom", "Degrees"],
+    
+    "ZOOPLANKTON_COUNT": ["ZOOP_COUNT", "custom", "count"],
+    "PHYTOPLANKTON_COUNT": ["PHYTO_COUNT", "custom", "count"],
+    
+    "ABUNDANCE": ["ABUNDANCE", "custom", "count"],
+    "BIOMASS": ["BIOMASS", "custom", "kg/m3"],
+    "DENSITY": ["DENSITY", "custom", "individuals/m3"],
+    
+    "NITRATE": ["NO3", "custom", "mmol/m3"],
+    "PHOSPHATE": ["PO4", "custom", "mmol/m3"],
+    "SILICATE": ["SIO4", "custom", "mmol/m3"],
+    "AMMONIUM": ["NH4", "custom", "mmol/m3"],
+    
+    "LATITUDE": ["LATITUDE", "cf", "Degrees"],
+    "LONGITUDE": ["LONGITUDE", "cf", "Degrees"],
+    "LAT": ["LATITUDE", "cf", "Degrees"],
+    "LON": ["LONGITUDE", "cf", "Degrees"],
+    "X": ["LONGITUDE", "cf", "Degrees"],
+    "Y": ["LATITUDE", "cf", "Degrees"]
+  },
+  "time_format_hints": {
+    "description": "Guide for automatic time format detection. Values are typical ranges for each format.",
+    "iso_8601": "ISO 8601 strings (e.g., '2023-12-19T04:50:00Z')",
+    "days_since_1900": "Numeric: 40000 < value < 50000 (e.g., 44250)",
+    "days_since_1970": "Numeric: 15000 < value < 25000 (e.g., 19500)",
+    "months_since_1900": "Numeric: 1000 < value < 2000 (typical IMOS CF, e.g., 1487)",
+    "decimal_year": "Float 1900 < value < 2100 with fraction (e.g., 2023.5 = mid-2023)",
+    "year_integer": "Integer 1900 < value < 2100 (e.g., 2023)",
+    "unix_timestamp": "Numeric > 1e8 (seconds since Jan 1 1970, e.g., 1640000000)",
+    "year_month_day_columns": "Separate columns: 'year', 'month', 'day', (optional) 'hour', 'minute', 'second'"
+  },
+  "spatial_column_hints": [
+    "latitude", "lat", "y", "northing",
+    "longitude", "lon", "x", "easting",
+    "depth", "z", "altitude", "level"
+  ],
+  "quality_flags": {
+    "1": "Good data",
+    "2": "Questionable data",
+    "3": "Bad data",
+    "4": "Missing data",
+    "9": "Unknown"
+  },
+  "notes": "Add custom parameter mappings by extending the 'parameter_mapping' object. Keys are uppercase variable names as they appear in source files."
+}
