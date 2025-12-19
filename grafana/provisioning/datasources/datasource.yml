@@ -1,0 +1,16 @@
+apiVersion: 1
+datasources:
+  - name: TimescaleDB
+    type: postgres
+    access: proxy
+    url: timescaledb:5432
+    database: marine_db
+    user: marine_user
+    secureJsonData:
+      password: marine_pass123
+    jsonData:
+      sslmode: disable
+      maxOpenConns: 100
+      maxIdleConns: 100
+      connMaxLifetime: 14400
+    isDefault: true

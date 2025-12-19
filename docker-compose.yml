@@ -1,0 +1,67 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg18.1-ts2.23.1-all-oss
+    container_name: marine_timescaledb
+    restart: always
+    environment:
+      POSTGRES_DB: marine_db
+      POSTGRES_USER: marine_user
+      POSTGRES_PASSWORD: marine_pass123
+      TIMESCALEDB_TELEMETRY: 'off'
+    ports:
+      - "5433:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marine_user -d marine_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marine_net
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: marine_grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: grafana123
+      GF_INSTALL_PLUGINS: 'grafana-clock-panel,grafana-worldmap-panel'
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - marine_net
+
+  pgadmin:
+    image: dpage/pgadmin4:8.3
+    container_name: marine_pgadmin
+    restart: always
+    ports:
+      - "8088:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: pgadmin123
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - marine_net
+
+volumes:
+  timescaledb_data:
+  grafana_data:
+  pgadmin_data:
+
+networks:
+  marine_net:
+    driver: bridge
