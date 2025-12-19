@@ -48,7 +48,7 @@ services:
       - "8088:80"
     environment:
       # Login credentials for pgAdmin web interface
-      PGADMIN_DEFAULT_EMAIL: peter@huonestuary.local
+      PGADMIN_DEFAULT_EMAIL: peter@huonestuary.com
       PGADMIN_DEFAULT_PASSWORD: pgadmin123
     volumes:
       - pgadmin_data:/var/lib/pgadmin
