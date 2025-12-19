@@ -179,12 +179,12 @@ CREATE TABLE metadata (
     bbox_envelope BOX2D GENERATED ALWAYS AS (BOX2D(extent_geom)) STORED
 );
 
--- Metadata indexes
-CREATE INDEX CONCURRENTLY idx_metadata_uuid ON metadata(uuid);
-CREATE INDEX CONCURRENTLY idx_metadata_bbox ON metadata(west, east, south, north);
-CREATE INDEX CONCURRENTLY idx_metadata_time ON metadata(time_start, time_end);
-CREATE INDEX CONCURRENTLY idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
-CREATE INDEX CONCURRENTLY idx_metadata_dataset_name ON metadata(dataset_name);
+-- Metadata indexes (removed CONCURRENTLY for init script compatibility)
+CREATE INDEX idx_metadata_uuid ON metadata(uuid);
+CREATE INDEX idx_metadata_bbox ON metadata(west, east, south, north);
+CREATE INDEX idx_metadata_time ON metadata(time_start, time_end);
+CREATE INDEX idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
+CREATE INDEX idx_metadata_dataset_name ON metadata(dataset_name);
 
 CREATE TABLE public.spatial_ref_system (
     id SERIAL PRIMARY KEY,
@@ -222,10 +222,10 @@ CREATE TABLE parameters (
     UNIQUE(uuid, parameter_code)
 );
 
-CREATE INDEX CONCURRENTLY idx_parameters_metadata_id ON parameters(metadata_id);
-CREATE INDEX CONCURRENTLY idx_parameters_code ON parameters(parameter_code);
-CREATE INDEX CONCURRENTLY idx_parameters_aodn_uri ON parameters(aodn_parameter_uri);
-CREATE INDEX CONCURRENTLY idx_parameters_imos_uri ON parameters(imos_parameter_uri);
+CREATE INDEX idx_parameters_metadata_id ON parameters(metadata_id);
+CREATE INDEX idx_parameters_code ON parameters(parameter_code);
+CREATE INDEX idx_parameters_aodn_uri ON parameters(aodn_parameter_uri);
+CREATE INDEX idx_parameters_imos_uri ON parameters(imos_parameter_uri);
 
 CREATE TABLE keywords (
     id SERIAL PRIMARY KEY,
@@ -238,9 +238,9 @@ CREATE TABLE keywords (
     UNIQUE(metadata_id, keyword)
 );
 
-CREATE INDEX CONCURRENTLY idx_keywords_metadata_id ON keywords(metadata_id);
-CREATE INDEX CONCURRENTLY idx_keywords_keyword ON keywords(keyword);
-CREATE INDEX CONCURRENTLY idx_keywords_thesaurus ON keywords(thesaurus_uri);
+CREATE INDEX idx_keywords_metadata_id ON keywords(metadata_id);
+CREATE INDEX idx_keywords_keyword ON keywords(keyword);
+CREATE INDEX idx_keywords_thesaurus ON keywords(thesaurus_uri);
 
 -- =============================================================================
 -- MEASUREMENTS HYPERTABLE (your core table - TimescaleDB optimized)
@@ -267,16 +267,16 @@ CREATE TABLE measurements (
 --     number_partitions => 32);
 
 -- CRITICAL INDEXES FOR GRAFANA QUERIES (your 942 parameters)
-CREATE INDEX CONCURRENTLY idx_measurements_time_param ON measurements (time DESC, parameter_code)
+CREATE INDEX idx_measurements_time_param ON measurements (time DESC, parameter_code)
 WHERE namespace = 'bodc'; -- Fastest BODC queries (chl_a, sst, etc.)
 
-CREATE INDEX CONCURRENTLY idx_measurements_param_time ON measurements (parameter_code, time DESC);
-CREATE INDEX CONCURRENTLY idx_measurements_location_time ON measurements (location_id, time DESC)
+CREATE INDEX idx_measurements_param_time ON measurements (parameter_code, time DESC);
+CREATE INDEX idx_measurements_location_time ON measurements (location_id, time DESC)
 WHERE location_id IS NOT NULL;
 
-CREATE INDEX CONCURRENTLY idx_measurements_namespace ON measurements (namespace);
-CREATE INDEX CONCURRENTLY idx_measurements_metadata_id ON measurements (metadata_id);
-CREATE INDEX CONCURRENTLY idx_measurements_uuid ON measurements (uuid);
+CREATE INDEX idx_measurements_namespace ON measurements (namespace);
+CREATE INDEX idx_measurements_metadata_id ON measurements (metadata_id);
+CREATE INDEX idx_measurements_uuid ON measurements (uuid);
 
 -- BRIN indexes for massive time-range scans (Grafana time picker)
 CREATE INDEX idx_measurements_time_brin ON measurements USING BRIN (time);
