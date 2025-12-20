@@ -1,21 +1,18 @@
+#!/usr/bin/env python3
 """
-Enhanced Measurements ETL v2.0
+Enhanced Measurements ETL v2.1
 
-Improvements over v1:
-- Automatic time format detection (ISO, months_since, CF calendar)
-- Ragged array support for NetCDF
-- Flexible parameter mapping with user overrides
-- Compound time dimensions (year/month/day columns)
-- Better error recovery and reporting
-- Batch insert optimization
+Fixes:
+- NetCDF time parsing now returns datetime objects (not tuples)
+- Better error handling for cftime conversion
+- Database connection from parameter_mappings table
 
 Usage:
-  python populate_measurements_v2.py [--config config.json] [--limit 5000]
+  python populate_measurements_v2.py [--limit 5000]
 """
 
 import os
 import sys
-import json
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -31,9 +28,9 @@ except ImportError:
     netCDF4 = None
 
 try:
-    import xarray as xr
+    import cftime
 except ImportError:
-    xr = None
+    cftime = None
 
 # Setup logging
 logging.basicConfig(
@@ -51,19 +48,66 @@ DB_CONFIG = {
     'port': '5433'
 }
 
+class ParameterMapping:
+    """
+    Loads parameter mappings from database
+    """
+    
+    def __init__(self, db_config: dict):
+        self.mapping = {}
+        self.load_from_database(db_config)
+    
+    def load_from_database(self, db_config: dict):
+        """Load parameter mappings from parameter_mappings table"""
+        try:
+            conn = psycopg2.connect(**db_config)
+            cur = conn.cursor()
+            
+            cur.execute("""
+                SELECT raw_parameter_name, standard_code, namespace, unit
+                FROM parameter_mappings
+            """)
+            
+            for raw_name, code, namespace, unit in cur.fetchall():
+                self.mapping[raw_name.upper()] = (code, namespace, unit)
+            
+            cur.close()
+            conn.close()
+            
+            logger.info(f"Loaded {len(self.mapping)} parameter mappings from database")
+        
+        except Exception as e:
+            logger.error(f"Could not load parameter mappings: {e}")
+            logger.warning("Using empty parameter mapping - all params will be 'custom'")
+    
+    def get_standard_param(self, raw_param: str) -> Tuple[str, str, str]:
+        """
+        Map raw parameter name to standardized (param_code, namespace, unit)
+        
+        Returns:
+            Tuple of (parameter_code, namespace, uom) or (raw_param, 'custom', 'unknown')
+        """
+        raw_upper = str(raw_param).upper().strip()
+        
+        if raw_upper in self.mapping:
+            return self.mapping[raw_upper]
+        
+        # No mapping found - use as custom
+        return (raw_upper, 'custom', 'unknown')
+
+
 class TimeFormatDetector:
     """
-    Automatically detects time column format and converts to ISO 8601 timestamps
+    Automatically detects time column format and converts to datetime
     """
     
     @staticmethod
-    def detect_and_convert(time_value, time_columns: dict = None) -> Optional[datetime]:
+    def detect_and_convert(time_value) -> Optional[datetime]:
         """
         Attempts multiple time format conversions.
         
         Args:
-            time_value: Single value or dict of time components (year, month, day)
-            time_columns: Dict mapping column names to values (for compound times)
+            time_value: Single value (string, numeric, or datetime)
         
         Returns:
             datetime object or None if conversion fails
@@ -72,15 +116,15 @@ class TimeFormatDetector:
         if time_value is None or (isinstance(time_value, float) and np.isnan(time_value)):
             return None
         
-        # Case 1: Dict of time components (year/month/day columns)
-        if time_columns and isinstance(time_columns, dict):
-            return TimeFormatDetector._from_components(time_columns)
+        # Already a datetime
+        if isinstance(time_value, datetime):
+            return time_value
         
-        # Case 2: ISO 8601 string
+        # ISO 8601 string
         if isinstance(time_value, str):
             return TimeFormatDetector._from_iso_string(time_value)
         
-        # Case 3: Numeric timestamp
+        # Numeric timestamp
         if isinstance(time_value, (int, float, np.integer, np.floating)):
             return TimeFormatDetector._from_numeric(float(time_value))
         
@@ -97,12 +141,7 @@ class TimeFormatDetector:
     @staticmethod
     def _from_numeric(val: float) -> Optional[datetime]:
         """
-        Parse numeric time representations:
-        - Days since 1970-01-01 (unix epoch): val ~= 18000 (50 years * 365)
-        - Days since 1900-01-01: val ~= 45000 (century + 45 years)
-        - Months since 1900-01-01: val ~= 1000-1500 (typical IMOS CF)
-        - Decimal year: val ~= 2000 (year as float)
-        - Year integer: val ~= 2010 (1900 < val < 2100)
+        Parse numeric time representations
         """
         
         # Decimal year (2000.5 = July 2000)
@@ -118,128 +157,31 @@ class TimeFormatDetector:
         # Months since 1900-01-01 (typical IMOS CF)
         if 1000 < val < 2000:
             base = datetime(1900, 1, 1)
-            return base + timedelta(days=val * 30.4)  # Approximate month length
+            return base + timedelta(days=val * 30.4)
         
         # Days since 1900-01-01
         if 40000 < val < 50000:
             base = datetime(1900, 1, 1)
             return base + timedelta(days=val)
         
-        # Days since 1970-01-01 (unix epoch)
+        # Days since 1970-01-01
         if 15000 < val < 25000:
             base = datetime(1970, 1, 1)
             return base + timedelta(days=val)
         
         # Seconds since unix epoch
-        if val > 1e8:  # Jan 1973
+        if val > 1e8:
             try:
                 return datetime.utcfromtimestamp(val)
             except:
                 pass
         
         return None
-    
-    @staticmethod
-    def _from_components(components: dict) -> Optional[datetime]:
-        """Assemble datetime from year/month/day/hour/minute/second columns"""
-        try:
-            year = int(components.get('year', components.get('YEAR')))
-            month = int(components.get('month', components.get('MONTH', 1)))
-            day = int(components.get('day', components.get('DAY', 1)))
-            hour = int(components.get('hour', components.get('HOUR', 0)))
-            minute = int(components.get('minute', components.get('MINUTE', 0)))
-            second = int(components.get('second', components.get('SECOND', 0)))
-            
-            return datetime(year, month, day, hour, minute, second)
-        except (KeyError, ValueError, TypeError):
-            return None
-
-
-class ParameterMapping:
-    """
-    Manages parameter code standardization and mapping
-    """
-    
-    def __init__(self, config_path: str = None):
-        self.mapping = {}
-        self.custom_mappings = {}
-        
-        if config_path and os.path.exists(config_path):
-            self.load_config(config_path)
-        else:
-            self._init_default_mapping()
-    
-    def _init_default_mapping(self):
-        """Initialize common IMOS/BODC parameter mappings"""
-        self.mapping = {
-            # Temperature variants
-            'TEMP': ('TEMP', 'bodc', 'Degrees Celsius'),
-            'TEMPERATURE': ('TEMP', 'bodc', 'Degrees Celsius'),
-            'sea_water_temperature': ('TEMP', 'cf', 'Degrees Celsius'),
-            'SST': ('SST', 'bodc', 'Degrees Celsius'),
-            'sea_surface_temperature': ('SST', 'cf', 'Degrees Celsius'),
-            
-            # Salinity variants
-            'PSAL': ('PSAL', 'bodc', 'PSS-78'),
-            'SALINITY': ('PSAL', 'bodc', 'PSS-78'),
-            'sea_water_salinity': ('PSAL', 'cf', 'PSS-78'),
-            
-            # Chlorophyll
-            'CPHL': ('CPHL', 'bodc', 'mg/m3'),
-            'CHLOROPHYLL': ('CPHL', 'bodc', 'mg/m3'),
-            'chlorophyll_concentration': ('CPHL', 'cf', 'mg/m3'),
-            'chl_a': ('CPHL', 'bodc', 'mg/m3'),
-            'CHL_A': ('CPHL', 'bodc', 'mg/m3'),
-            
-            # Depth
-            'DEPTH': ('DEPTH', 'bodc', 'Meters'),
-            'depth': ('DEPTH', 'bodc', 'Meters'),
-            'z': ('DEPTH', 'cf', 'Meters'),
-            
-            # Oxygen
-            'DOXY': ('DOXY', 'bodc', 'ml/l'),
-            'dissolved_oxygen': ('DOXY', 'cf', 'ml/l'),
-            'DO': ('DOXY', 'custom', 'ml/l'),
-            
-            # pH
-            'PH': ('PH', 'bodc', 'unitless'),
-            'sea_water_ph_reported_on_total_scale': ('PH', 'cf', 'unitless'),
-        }
-    
-    def load_config(self, config_path: str):
-        """Load custom parameter mappings from JSON"""
-        try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-                self.custom_mappings.update(config.get('parameter_mapping', {}))
-                logger.info(f"Loaded {len(self.custom_mappings)} custom mappings")
-        except Exception as e:
-            logger.warning(f"Could not load config {config_path}: {e}")
-    
-    def get_standard_param(self, raw_param: str) -> Tuple[str, str, str]:
-        """
-        Map raw parameter name to standardized (param_code, namespace, unit)
-        
-        Returns:
-            Tuple of (parameter_code, namespace, uom) or (raw_param, 'custom', 'unknown')
-        """
-        raw_upper = str(raw_param).upper().strip()
-        
-        # Check custom mappings first
-        if raw_upper in self.custom_mappings:
-            return self.custom_mappings[raw_upper]
-        
-        # Check default mapping
-        if raw_upper in self.mapping:
-            return self.mapping[raw_upper]
-        
-        # No mapping found - use as custom
-        return (raw_upper, 'custom', 'unknown')
 
 
 class CSVMeasurementExtractor:
     """
-    Extracts and normalizes measurements from CSV files
+    Extracts measurements from CSV files
     """
     
     def __init__(self, param_mapping: ParameterMapping):
@@ -247,19 +189,8 @@ class CSVMeasurementExtractor:
         self.extracted_count = 0
         self.failed_count = 0
     
-    def extract(self, file_path: str, metadata: dict, 
-                limit: int = None) -> List[Dict]:
-        """
-        Extract measurements from CSV
-        
-        Args:
-            file_path: Path to CSV file
-            metadata: Dict with 'id', 'uuid'
-            limit: Max rows to extract (for testing)
-        
-        Returns:
-            List of measurement dicts ready for DB insert
-        """
+    def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
+        """Extract measurements from CSV"""
         rows = []
         
         try:
@@ -272,11 +203,10 @@ class CSVMeasurementExtractor:
                 except Exception:
                     continue
             else:
-                logger.error(f"Could not read {file_path} with any encoding")
+                logger.error(f"Could not read {file_path}")
                 return rows
             
             if df.empty:
-                logger.warning(f"Empty DataFrame from {file_path}")
                 return rows
             
             # Identify key columns
@@ -335,19 +265,16 @@ class CSVMeasurementExtractor:
                         'value': value,
                         'uom': uom,
                         'depth_m': depth,
-                        'quality_flag': 1  # Assume good data
+                        'quality_flag': 1
                     })
                     
                     self.extracted_count += 1
                     
                     if limit and self.extracted_count >= limit:
-                        logger.info(f"Hit limit of {limit} rows")
                         break
                 
                 except Exception as e:
                     self.failed_count += 1
-                    if idx < 5:  # Log first few failures
-                        logger.debug(f"Row {idx} failed: {e}")
         
         except Exception as e:
             logger.error(f"Fatal error extracting from {file_path}: {e}")
@@ -356,7 +283,7 @@ class CSVMeasurementExtractor:
     
     @staticmethod
     def _find_column(df: pd.DataFrame, cols_upper: dict, keywords: List[str]) -> Optional[str]:
-        """Find column matching any keyword (case-insensitive)"""
+        """Find column matching any keyword"""
         for keyword in keywords:
             for orig_col, upper_col in cols_upper.items():
                 if keyword.upper() in upper_col:
@@ -366,7 +293,7 @@ class CSVMeasurementExtractor:
 
 class NetCDFMeasurementExtractor:
     """
-    Extracts and normalizes measurements from NetCDF files
+    Extracts measurements from NetCDF files
     """
     
     def __init__(self, param_mapping: ParameterMapping):
@@ -374,19 +301,8 @@ class NetCDFMeasurementExtractor:
         self.extracted_count = 0
         self.failed_count = 0
     
-    def extract(self, file_path: str, metadata: dict,
-                limit: int = None) -> List[Dict]:
-        """
-        Extract measurements from NetCDF
-        
-        Args:
-            file_path: Path to .nc file
-            metadata: Dict with 'id', 'uuid'
-            limit: Max measurements to extract
-        
-        Returns:
-            List of measurement dicts
-        """
+    def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
+        """Extract measurements from NetCDF"""
         rows = []
         
         if netCDF4 is None:
@@ -396,44 +312,37 @@ class NetCDFMeasurementExtractor:
         try:
             ds = netCDF4.Dataset(file_path, 'r')
             
-            # Identify time variable
+            # Find time variable
             time_var = self._find_time_variable(ds)
             if not time_var:
-                logger.warning(f"No time variable found in {file_path}")
+                logger.warning(f"No time variable in {file_path}")
                 ds.close()
                 return rows
             
             time_data = ds.variables[time_var][:]
             time_attrs = ds.variables[time_var].__dict__
             
-            # Find spatial variables
-            lat_var = self._find_variable(ds, ['lat', 'latitude', 'y'])
-            lon_var = self._find_variable(ds, ['lon', 'longitude', 'x'])
-            depth_var = self._find_variable(ds, ['depth', 'z', 'level'])
-            
             # Extract each data variable
             for var_name in ds.variables:
-                # Skip dimensions and coordinate vars
                 if var_name in ds.dimensions:
                     continue
-                if var_name in [time_var, lat_var, lon_var, depth_var]:
+                if var_name == time_var:
                     continue
                 
                 var = ds.variables[var_name]
                 
-                # Get dimensions
-                var_dims = var.dimensions
-                if len(var_dims) < 2:  # Need at least time + 1 other
+                # Skip coordinate variables
+                if hasattr(var, 'axis') or len(var.dimensions) == 0:
                     continue
                 
                 # Map to standard parameter
                 param_code, namespace, uom = self.param_mapping.get_standard_param(var_name)
                 
-                # Extract data with care for multi-dimensional arrays
+                # Extract data
                 try:
                     data = var[:]
                     
-                    if data.ndim == 1:  # 1D timeseries
+                    if data.ndim == 1:
                         for t_idx in range(len(data)):
                             if pd.isna(data[t_idx]):
                                 continue
@@ -458,7 +367,7 @@ class NetCDFMeasurementExtractor:
                             if limit and self.extracted_count >= limit:
                                 raise StopIteration
                     
-                    elif data.ndim == 2:  # (time, station) or (time, depth)
+                    elif data.ndim == 2:
                         for t_idx in range(min(len(data), 1000)):
                             ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
                             if not ts:
@@ -505,29 +414,30 @@ class NetCDFMeasurementExtractor:
         return None
     
     @staticmethod
-    def _find_variable(ds, keywords: List[str]) -> Optional[str]:
-        for keyword in keywords:
-            for name in ds.variables:
-                if keyword.lower() in name.lower():
-                    return name
-        return None
-    
-    @staticmethod
     def _parse_netcdf_time(time_value, attrs: dict) -> Optional[datetime]:
         """
-        Parse NetCDF time using CF units and calendar attributes
+        Parse NetCDF time using CF units and calendar attributes.
+        Returns datetime object (NOT tuple).
         """
         try:
-            # Try to parse using cftime if available
-            import cftime
-            units = attrs.get('units', '')
-            calendar = attrs.get('calendar', 'standard')
-            
-            if 'since' in units:
-                return cftime.num2date(time_value, units, calendar=calendar).timetuple()[:6]
-            
-        except ImportError:
-            pass
+            if cftime is not None:
+                units = attrs.get('units', '')
+                calendar = attrs.get('calendar', 'standard')
+                
+                if 'since' in units:
+                    # Convert cftime object to datetime
+                    cf_time = cftime.num2date(time_value, units, calendar=calendar)
+                    
+                    # Handle cftime.DatetimeGregorian, etc.
+                    if hasattr(cf_time, 'timetuple'):
+                        tt = cf_time.timetuple()
+                        return datetime(tt.tm_year, tt.tm_mon, tt.tm_mday,
+                                      tt.tm_hour, tt.tm_min, tt.tm_sec)
+                    elif isinstance(cf_time, datetime):
+                        return cf_time
+        
+        except Exception as e:
+            logger.debug(f"cftime parsing failed: {e}")
         
         # Fall back to TimeFormatDetector
         return TimeFormatDetector.detect_and_convert(time_value)
@@ -535,7 +445,7 @@ class NetCDFMeasurementExtractor:
 
 class MeasurementBatchInserter:
     """
-    Handles batch insertion of measurements into PostgreSQL
+    Handles batch insertion of measurements
     """
     
     BATCH_SIZE = 1000
@@ -546,12 +456,7 @@ class MeasurementBatchInserter:
         self.total_failed = 0
     
     def insert_batch(self, rows: List[Dict]) -> int:
-        """
-        Insert batch of measurement rows
-        
-        Returns:
-            Number successfully inserted
-        """
+        """Insert batch of measurements"""
         if not rows:
             return 0
         
@@ -559,7 +464,6 @@ class MeasurementBatchInserter:
             conn = psycopg2.connect(**self.db_config)
             cur = conn.cursor()
             
-            # Prepare values
             values = [
                 (
                     row['time'],
@@ -599,9 +503,7 @@ class MeasurementBatchInserter:
             return 0
     
     def process_batches(self, rows: List[Dict]):
-        """
-        Process rows in batches
-        """
+        """Process rows in batches"""
         for i in range(0, len(rows), self.BATCH_SIZE):
             batch = rows[i:i+self.BATCH_SIZE]
             inserted = self.insert_batch(batch)
@@ -611,15 +513,14 @@ class MeasurementBatchInserter:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v2')
-    parser.add_argument('--config', help='Parameter mapping config JSON', default=None)
+    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v2.1')
     parser.add_argument('--limit', type=int, help='Max rows per dataset', default=None)
-    parser.add_argument('--dataset', help='Specific dataset to process (partial path match)')
+    parser.add_argument('--dataset', help='Specific dataset to process')
     
     args = parser.parse_args()
     
     # Initialize
-    param_mapping = ParameterMapping(args.config)
+    param_mapping = ParameterMapping(DB_CONFIG)
     csv_extractor = CSVMeasurementExtractor(param_mapping)
     nc_extractor = NetCDFMeasurementExtractor(param_mapping)
     inserter = MeasurementBatchInserter(DB_CONFIG)
@@ -656,7 +557,7 @@ def main():
             metadata = {'id': ds_id, 'uuid': uuid}
             dataset_rows = []
             
-            # Walk directory for CSV and NetCDF files
+            # Walk directory
             for root, dirs, files in os.walk(rel_path):
                 if 'metadata' in root:
                     continue
@@ -681,7 +582,7 @@ def main():
                     except Exception as e:
                         logger.error(f"    Error processing {file}: {e}")
             
-            # Insert all rows for this dataset
+            # Insert
             if dataset_rows:
                 logger.info(f"Inserting {len(dataset_rows)} measurements...")
                 inserter.process_batches(dataset_rows)
