@@ -243,12 +243,12 @@ CREATE INDEX idx_keywords_keyword ON keywords(keyword);
 CREATE INDEX idx_keywords_thesaurus ON keywords(thesaurus_uri);
 
 -- =============================================================================
--- MEASUREMENTS HYPERTABLE (your core table - TimescaleDB optimized)
+-- MEASUREMENTS HYPERTABLE (TimescaleDB optimized for 17M+ measurements)
 -- =============================================================================
 
 CREATE TABLE measurements (
     time TIMESTAMPTZ NOT NULL,
-    data_id BIGSERIAL PRIMARY KEY,
+    data_id BIGSERIAL,
     uuid TEXT REFERENCES metadata(uuid) ON DELETE CASCADE,
     parameter_code TEXT NOT NULL,
     namespace TEXT NOT NULL DEFAULT 'custom',
@@ -257,18 +257,29 @@ CREATE TABLE measurements (
     uncertainty DOUBLE PRECISION,
     depth_m NUMERIC,
     location_id BIGINT REFERENCES locations(id),
-    metadata_id INTEGER REFERENCES metadata(id),  -- FK to normalized metadata
+    metadata_id INTEGER REFERENCES metadata(id),
     quality_flag SMALLINT DEFAULT 1
 );
 
--- Convert to hypertable with COMPOSITE time + parameter_code partitioning
--- SELECT create_hypertable('measurements', by_range('time'),
---     partitioning_column => 'parameter_code',
---     number_partitions => 32);
+-- Create hypertable BEFORE adding indexes
+SELECT create_hypertable('measurements', by_range('time'));
 
--- CRITICAL INDEXES FOR GRAFANA QUERIES (your 942 parameters)
+-- Now add PRIMARY KEY as index (after hypertable creation)
+CREATE UNIQUE INDEX measurements_pkey ON measurements (time, data_id);
+ALTER TABLE measurements ADD CONSTRAINT measurements_pkey_constraint PRIMARY KEY USING INDEX measurements_pkey;
+
+-- Enable compression with segmentation by parameter and namespace
+ALTER TABLE measurements SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'parameter_code, namespace'
+);
+
+-- Add compression policy (compress data older than 7 days)
+SELECT add_compression_policy('measurements', INTERVAL '7 days');
+
+-- CRITICAL INDEXES FOR GRAFANA QUERIES
 CREATE INDEX idx_measurements_time_param ON measurements (time DESC, parameter_code)
-WHERE namespace = 'bodc'; -- Fastest BODC queries (chl_a, sst, etc.)
+WHERE namespace = 'bodc';
 
 CREATE INDEX idx_measurements_param_time ON measurements (parameter_code, time DESC);
 CREATE INDEX idx_measurements_location_time ON measurements (location_id, time DESC)
@@ -278,10 +289,10 @@ CREATE INDEX idx_measurements_namespace ON measurements (namespace);
 CREATE INDEX idx_measurements_metadata_id ON measurements (metadata_id);
 CREATE INDEX idx_measurements_uuid ON measurements (uuid);
 
--- BRIN indexes for massive time-range scans (Grafana time picker)
+-- BRIN indexes for massive time-range scans
 CREATE INDEX idx_measurements_time_brin ON measurements USING BRIN (time);
 
--- GIN for parameter_code fuzzy search (Grafana variables)
+-- GIN for parameter_code fuzzy search
 CREATE INDEX idx_measurements_param_gin ON measurements USING GIN (to_tsvector('english', parameter_code));
 
 -- Partial index for quality data only
@@ -289,13 +300,10 @@ CREATE INDEX idx_measurements_good_data ON measurements (time DESC, parameter_co
 WHERE quality_flag = 1 AND namespace IN ('bodc', 'cf');
 
 -- =============================================================================
--- COMPRESSION & CONTINUOUS AGGREGATES (Grafana performance)
+-- CONTINUOUS AGGREGATES (Grafana performance)
 -- =============================================================================
 
--- Add compression policy (90% space savings)
-SELECT add_compression_policy('measurements', INTERVAL '7 days');
-
--- Continuous aggregates for Grafana (parameter-specific)
+-- Hourly aggregates
 CREATE MATERIALIZED VIEW measurements_1h
 WITH (timescaledb.continuous) AS
 SELECT time_bucket('1 hour', time) AS bucket,
@@ -307,6 +315,7 @@ SELECT time_bucket('1 hour', time) AS bucket,
 FROM measurements 
 GROUP BY bucket, parameter_code, namespace, location_id, metadata_id;
 
+-- Daily aggregates
 CREATE MATERIALIZED VIEW measurements_1d
 WITH (timescaledb.continuous) AS
 SELECT time_bucket('1 day', time) AS bucket,
@@ -332,7 +341,7 @@ SELECT add_continuous_aggregate_policy('measurements_1d',
 -- VIEWS FOR GRAFANA & ANALYSIS
 -- =============================================================================
 
--- View joining measurements with metadata (Grafana-friendly)
+-- View joining measurements with metadata
 CREATE VIEW measurements_with_metadata AS
 SELECT 
     m.time, m.data_id, m.parameter_code, m.namespace, m.value, m.uom,
@@ -363,7 +372,7 @@ GROUP BY p.parameter_code, p.parameter_label, p.aodn_parameter_uri;
 -- SPATIAL & BIOLOGICAL FEATURES
 -- =============================================================================
 
--- Spatial Features Table for non-time-series data (Polygons, etc.)
+-- Spatial Features Table
 CREATE TABLE IF NOT EXISTS spatial_features (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
@@ -374,7 +383,7 @@ CREATE TABLE IF NOT EXISTS spatial_features (
 CREATE INDEX IF NOT EXISTS spatial_features_geom_idx ON spatial_features USING GIST (geom);
 CREATE INDEX IF NOT EXISTS spatial_features_metadata_id_idx ON spatial_features(metadata_id);
 
--- Taxonomy Table (Species Info)
+-- Taxonomy Table
 CREATE TABLE IF NOT EXISTS taxonomy (
     id SERIAL PRIMARY KEY,
     species_name TEXT UNIQUE NOT NULL,
@@ -395,137 +404,17 @@ CREATE TABLE IF NOT EXISTS species_observations (
     taxonomy_id INTEGER REFERENCES taxonomy(id),
     observation_date TIMESTAMP,
     count_value NUMERIC,
-    count_category TEXT, -- For ranges like "2-5" or qualitative counts
+    count_category TEXT,
     depth_m NUMERIC,
     sex TEXT,
     size_class TEXT,
     method TEXT,
     notes TEXT,
-    geom GEOMETRY(Point, 4326) -- Denormalized for easy spatial heatmaps
+    geom GEOMETRY(Point, 4326)
 );
 CREATE INDEX IF NOT EXISTS idx_species_obs_geom ON species_observations USING GIST(geom);
 CREATE INDEX IF NOT EXISTS idx_species_obs_tax ON species_observations(taxonomy_id);
 CREATE INDEX IF NOT EXISTS idx_species_obs_meta ON species_observations(metadata_id);
-
--- =============================================================================
--- POPULATE DEFAULT PARAMETER MAPPINGS (from config_parameter_mapping.json)
--- =============================================================================
-
-INSERT INTO parameter_mappings (raw_parameter_name, standard_code, namespace, unit, description) VALUES
--- Temperature variants
-('TEMP', 'TEMP', 'bodc', 'Degrees Celsius', 'Sea water temperature'),
-('TEMPERATURE', 'TEMP', 'bodc', 'Degrees Celsius', 'Sea water temperature'),
-('SEA_WATER_TEMPERATURE', 'TEMP', 'cf', 'Degrees Celsius', 'CF standard name'),
-('SST', 'SST', 'bodc', 'Degrees Celsius', 'Sea surface temperature'),
-('SEA_SURFACE_TEMPERATURE', 'SST', 'cf', 'Degrees Celsius', 'CF SST'),
-('SURFACE_TEMPERATURE', 'SST', 'custom', 'Degrees Celsius', 'Surface temperature'),
-
--- Salinity variants  
-('PSAL', 'PSAL', 'bodc', 'PSS-78', 'Practical salinity'),
-('SALINITY', 'PSAL', 'bodc', 'PSS-78', 'Practical salinity'),
-('SEA_WATER_SALINITY', 'PSAL', 'cf', 'PSS-78', 'CF salinity'),
-('PRACTICAL_SALINITY', 'PSAL', 'bodc', 'PSS-78', 'Practical salinity'),
-
--- Chlorophyll variants
-('CPHL', 'CPHL', 'bodc', 'mg/m3', 'Chlorophyll-a concentration'),
-('CHLOROPHYLL', 'CPHL', 'bodc', 'mg/m3', 'Chlorophyll-a'),
-('CHLOROPHYLL_A', 'CPHL', 'bodc', 'mg/m3', 'Chlorophyll-a'),
-('CHL_A', 'CPHL', 'bodc', 'mg/m3', 'Chlorophyll-a'),
-('CHLOROPHYLL_CONCENTRATION', 'CPHL', 'cf', 'mg/m3', 'CF chlorophyll'),
-('OCEAN_COLOUR_CHLOROPHYLL', 'CPHL', 'cf', 'mg/m3', 'Ocean colour chl'),
-('PHYTOPLANKTON_CHLOROPHYLL', 'CPHL', 'cf', 'mg/m3', 'Phytoplankton chl'),
-
--- Oxygen
-('DOXY', 'DOXY', 'bodc', 'ml/l', 'Dissolved oxygen'),
-('DISSOLVED_OXYGEN', 'DOXY', 'cf', 'ml/l', 'Dissolved oxygen'),
-('DO', 'DOXY', 'custom', 'ml/l', 'Dissolved oxygen'),
-('OXYGEN_CONCENTRATION', 'DOXY', 'cf', 'ml/l', 'O2 concentration'),
-
--- pH
-('PH', 'PH', 'bodc', 'unitless', 'pH'),
-('PH_IN_SITU', 'PH', 'cf', 'unitless', 'In situ pH'),
-('SEA_WATER_PH', 'PH', 'cf', 'unitless', 'Sea water pH'),
-
--- Depth/Altitude
-('DEPTH', 'DEPTH', 'bodc', 'Meters', 'Depth below surface'),
-('Z', 'DEPTH', 'cf', 'Meters', 'Vertical coordinate'),
-('ALTITUDE', 'DEPTH', 'cf', 'Meters', 'Altitude'),
-('HEIGHT', 'DEPTH', 'cf', 'Meters', 'Height'),
-
--- Pressure
-('PRES', 'PRES', 'bodc', 'Decibars', 'Sea water pressure'),
-('PRESSURE', 'PRES', 'bodc', 'Decibars', 'Pressure'),
-('SEA_WATER_PRESSURE', 'PRES', 'cf', 'Decibars', 'CF pressure'),
-
--- Conductivity
-('COND', 'COND', 'bodc', 'mS/cm', 'Electrical conductivity'),
-('CONDUCTIVITY', 'COND', 'bodc', 'mS/cm', 'Conductivity'),
-('SEA_WATER_ELECTRICAL_CONDUCTIVITY', 'COND', 'cf', 'mS/cm', 'CF conductivity'),
-
--- Turbidity
-('TURB', 'TURB', 'bodc', 'NTU', 'Turbidity'),
-('TURBIDITY', 'TURB', 'bodc', 'NTU', 'Turbidity'),
-('TURBIDITY_COEFFICIENT', 'TURB', 'cf', 'NTU', 'Turbidity coefficient'),
-
--- Backscatter
-('SCAT', 'SCAT', 'bodc', 'counts', 'Optical backscatter'),
-('BACKSCATTER', 'SCAT', 'custom', 'counts', 'Backscatter'),
-('OPTICAL_BACKSCATTER', 'SCAT', 'cf', 'counts', 'Optical backscatter'),
-
--- Fluorescence
-('FLUO', 'FLUO', 'bodc', 'mg/m3', 'Fluorescence'),
-('FLUORESCENCE', 'FLUO', 'custom', 'mg/m3', 'Fluorescence'),
-('CHLOROPHYLL_FLUORESCENCE', 'FLUO', 'cf', 'mg/m3', 'Chl fluorescence'),
-
--- Velocity components
-('VELOCITY_U', 'VELOCITY_U', 'cf', 'm/s', 'Eastward velocity'),
-('VELOCITY_V', 'VELOCITY_V', 'cf', 'm/s', 'Northward velocity'),
-('VELOCITY_W', 'VELOCITY_W', 'cf', 'm/s', 'Upward velocity'),
-('EASTWARD_VELOCITY', 'VELOCITY_U', 'cf', 'm/s', 'U component'),
-('NORTHWARD_VELOCITY', 'VELOCITY_V', 'cf', 'm/s', 'V component'),
-('UPWARD_VELOCITY', 'VELOCITY_W', 'cf', 'm/s', 'W component'),
-
--- Waves
-('WAVE_HEIGHT', 'WAVE_HGT', 'bodc', 'Meters', 'Wave height'),
-('SIGNIFICANT_WAVE_HEIGHT', 'WAVE_HGT', 'cf', 'Meters', 'Significant wave height'),
-('SWVHT', 'WAVE_HGT', 'custom', 'Meters', 'Significant wave height'),
-('WAVE_PERIOD', 'WAVE_PER', 'bodc', 'Seconds', 'Wave period'),
-('MEAN_WAVE_PERIOD', 'WAVE_PER', 'cf', 'Seconds', 'Mean wave period'),
-('SWPD', 'WAVE_PER', 'custom', 'Seconds', 'Wave period'),
-
--- Wind
-('WIND_SPEED', 'WIND_SPEED', 'bodc', 'm/s', 'Wind speed'),
-('WIND_VELOCITY', 'WIND_SPEED', 'cf', 'm/s', 'Wind velocity'),
-('WIND_U', 'WIND_U', 'cf', 'm/s', 'Eastward wind'),
-('WIND_V', 'WIND_V', 'cf', 'm/s', 'Northward wind'),
-('EASTWARD_WIND', 'WIND_U', 'cf', 'm/s', 'U wind component'),
-('NORTHWARD_WIND', 'WIND_V', 'cf', 'm/s', 'V wind component'),
-
--- Currents
-('CURRENT_SPEED', 'CURRENT_SPEED', 'custom', 'm/s', 'Current speed'),
-('CURRENT_DIRECTION', 'CURRENT_DIR', 'custom', 'Degrees', 'Current direction'),
-
--- Biology
-('ZOOPLANKTON_COUNT', 'ZOOP_COUNT', 'custom', 'count', 'Zooplankton count'),
-('PHYTOPLANKTON_COUNT', 'PHYTO_COUNT', 'custom', 'count', 'Phytoplankton count'),
-('ABUNDANCE', 'ABUNDANCE', 'custom', 'count', 'Species abundance'),
-('BIOMASS', 'BIOMASS', 'custom', 'kg/m3', 'Biomass'),
-('DENSITY', 'DENSITY', 'custom', 'individuals/m3', 'Population density'),
-
--- Nutrients
-('NITRATE', 'NO3', 'custom', 'mmol/m3', 'Nitrate'),
-('PHOSPHATE', 'PO4', 'custom', 'mmol/m3', 'Phosphate'),
-('SILICATE', 'SIO4', 'custom', 'mmol/m3', 'Silicate'),
-('AMMONIUM', 'NH4', 'custom', 'mmol/m3', 'Ammonium'),
-
--- Coordinates (for reference, not measurements)
-('LATITUDE', 'LATITUDE', 'cf', 'Degrees', 'Latitude coordinate'),
-('LONGITUDE', 'LONGITUDE', 'cf', 'Degrees', 'Longitude coordinate'),
-('LAT', 'LATITUDE', 'cf', 'Degrees', 'Latitude'),
-('LON', 'LONGITUDE', 'cf', 'Degrees', 'Longitude'),
-('X', 'LONGITUDE', 'cf', 'Degrees', 'X coordinate'),
-('Y', 'LATITUDE', 'cf', 'Degrees', 'Y coordinate')
-ON CONFLICT (raw_parameter_name) DO NOTHING;
 
 -- =============================================================================
 -- GRANTS FOR GRAFANA/PGADMIN
