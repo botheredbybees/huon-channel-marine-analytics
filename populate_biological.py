@@ -1,4 +1,6 @@
 import os
+import sys
+import argparse
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
@@ -389,33 +391,56 @@ def is_biological_csv(file_path):
     return False
 
 def main():
+    parser = argparse.ArgumentParser(
+        description='Import biological observation data from CSV files into the marine database.'
+    )
+    parser.add_argument(
+        '--reprocess',
+        action='store_true',
+        help='Process ALL datasets with biological CSVs, not just empty ones. '
+             'Useful after clearing species_observations table.'
+    )
+    
+    args = parser.parse_args()
+    
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         
-        # Find datasets with 0 biological records
-        print("Finding empty datasets...")
-        cur.execute("""
-            SELECT m.id, m.title, m.dataset_path 
-            FROM metadata m
-            LEFT JOIN measurements mes ON m.id = mes.metadata_id
-            LEFT JOIN spatial_features sf ON m.id = sf.metadata_id
-            LEFT JOIN species_observations bio ON m.id = bio.metadata_id
-            GROUP BY m.id
-            HAVING COUNT(mes.data_id) = 0 
-               AND COUNT(sf.id) = 0
-               AND COUNT(bio.id) = 0
-               AND m.dataset_path IS NOT NULL
-        """)
+        if args.reprocess:
+            # Process ALL datasets that have a path, ignore existing data
+            print("REPROCESS MODE: Processing all datasets with biological data...")
+            cur.execute("""
+                SELECT m.id, m.title, m.dataset_path 
+                FROM metadata m
+                WHERE m.dataset_path IS NOT NULL
+                ORDER BY m.title
+            """)
+        else:
+            # Original behavior: only process empty datasets
+            print("Finding empty datasets...")
+            cur.execute("""
+                SELECT m.id, m.title, m.dataset_path 
+                FROM metadata m
+                LEFT JOIN measurements mes ON m.id = mes.metadata_id
+                LEFT JOIN spatial_features sf ON m.id = sf.metadata_id
+                LEFT JOIN species_observations bio ON m.id = bio.metadata_id
+                GROUP BY m.id
+                HAVING COUNT(mes.data_id) = 0 
+                   AND COUNT(sf.id) = 0
+                   AND COUNT(bio.id) = 0
+                   AND m.dataset_path IS NOT NULL
+            """)
+        
         datasets = cur.fetchall()
-        print(f"Found {len(datasets)} candidate empty datasets.")
+        print(f"Found {len(datasets)} candidate datasets.")
         
         for ds in datasets:
             meta_id, title, path = ds
             if not os.path.exists(path):
                 continue
             
-            print(f"Scanning '{title}'...")
+            print(f"\nScanning '{title}'...")
             
             # Walk directory
             found_bio = False
