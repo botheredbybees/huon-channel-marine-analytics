@@ -5,6 +5,7 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 import numpy as np
+import re
 
 # DB Config
 DB_CONFIG = {
@@ -17,6 +18,22 @@ DB_CONFIG = {
 
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
+
+def parse_wkt_point(wkt_string):
+    """Extract lon, lat from WKT POINT string like 'POINT (147.338943481 -43.038341522)'"""
+    if pd.isna(wkt_string):
+        return None, None
+    
+    try:
+        match = re.search(r'POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)', str(wkt_string))
+        if match:
+            lon = float(match.group(1))
+            lat = float(match.group(2))
+            return lat, lon
+    except:
+        pass
+    
+    return None, None
 
 def get_or_create_location(cur, lat, lon, metadata_id, name=None):
     """Get or create location by lat/lon"""
@@ -365,7 +382,7 @@ def process_redmap_format(df, metadata_id, cur, conn):
     return records_inserted
 
 def process_standard_format(df, metadata_id, cur, conn):
-    """Process standard observation format (original logic)"""
+    """Process standard observation format with support for WKT GEOM column"""
     print("  Format: Standard")
     
     # Try to find species column
@@ -378,27 +395,73 @@ def process_standard_format(df, metadata_id, cur, conn):
     if not species_col:
         return 0
     
-    # Find location columns
-    lat_col = lon_col = None
+    # Find location columns - check for GEOM first, then lat/lon
+    lat_col = lon_col = geom_col = None
+    
     for col in df.columns:
-        if col.upper() in ['LATITUDE', 'LAT']:
+        col_upper = col.upper()
+        if col_upper == 'GEOM':
+            geom_col = col
+        elif col_upper in ['LATITUDE', 'LAT']:
             lat_col = col
-        if col.upper() in ['LONGITUDE', 'LON', 'LONG']:
+        elif col_upper in ['LONGITUDE', 'LON', 'LONG']:
             lon_col = col
     
-    if not (lat_col and lon_col):
+    # Need either GEOM or both lat/lon
+    has_location = geom_col or (lat_col and lon_col)
+    if not has_location:
+        print("  Warning: No location columns found (need GEOM or LATITUDE/LONGITUDE)")
         return 0
+    
+    # Find date column
+    date_col = None
+    for col in df.columns:
+        col_upper = col.upper()
+        if 'DATE' in col_upper or 'SURVEY_DATE' in col_upper:
+            date_col = col
+            break
+    
+    # Find count/abundance columns
+    count_col = None
+    for col in df.columns:
+        col_upper = col.upper()
+        if 'TOTAL_NUMBER' in col_upper or 'COUNT' in col_upper or 'ABUNDANCE' in col_upper:
+            count_col = col
+            break
     
     records_inserted = 0
     for idx, row in df.iterrows():
         species = row.get(species_col)
-        if pd.isna(species):
+        if pd.isna(species) or str(species).strip() == '':
             continue
         
-        lat = row.get(lat_col)
-        lon = row.get(lon_col)
+        # Extract lat/lon from GEOM or separate columns
+        if geom_col:
+            geom_value = row.get(geom_col)
+            lat, lon = parse_wkt_point(geom_value)
+            # Fallback to separate columns if WKT parsing failed
+            if lat is None and lat_col and lon_col:
+                lat = row.get(lat_col)
+                lon = row.get(lon_col)
+        else:
+            lat = row.get(lat_col)
+            lon = row.get(lon_col)
+        
         if pd.isna(lat) or pd.isna(lon):
             continue
+        
+        # Get observation date
+        obs_date = row.get(date_col) if date_col else None
+        
+        # Get count value
+        count = None
+        if count_col:
+            count_val = row.get(count_col)
+            if pd.notna(count_val):
+                try:
+                    count = float(count_val)
+                except:
+                    count = 1  # Default to presence if count can't be parsed
         
         location_id = get_or_create_location(cur, lat, lon, metadata_id)
         if not location_id:
@@ -411,9 +474,9 @@ def process_standard_format(df, metadata_id, cur, conn):
         try:
             cur.execute("""
                 INSERT INTO species_observations 
-                (metadata_id, location_id, taxonomy_id, geom)
-                VALUES (%s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-            """, (metadata_id, location_id, taxonomy_id, lon, lat))
+                (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
+                VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
             records_inserted += 1
         except:
             conn.rollback()
@@ -421,6 +484,7 @@ def process_standard_format(df, metadata_id, cur, conn):
         
         if idx % 1000 == 0 and idx > 0:
             conn.commit()
+            print(f"  Processed {idx} observations...")
     
     conn.commit()
     return records_inserted
