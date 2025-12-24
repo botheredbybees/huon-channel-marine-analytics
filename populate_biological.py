@@ -1,4 +1,3 @@
-
 import os
 import pandas as pd
 import psycopg2
@@ -17,172 +16,384 @@ DB_CONFIG = {
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-def normalize_location(conn, cur, row, metadata_id):
-    """Ensure location exists and return ID"""
-    name = row.get('SITE_CODE') or row.get('site_code') or row.get('SITE_DESCRIPTION') or row.get('site_name') or f"Site at {row.get('LATITUDE', 'Unknown')},{row.get('LONGITUDE', 'Unknown')}"
+def get_or_create_location(cur, lat, lon, metadata_id, name=None):
+    """Get or create location by lat/lon"""
+    if pd.isna(lat) or pd.isna(lon):
+        return None
     
-    # Cast to string to avoid comparison errors with Integers in DB text fields
-    name = str(name).strip() if pd.notna(name) else "Unknown Site"
-    desc = str(row.get('SITE_DESCRIPTION') or row.get('site_name') or "").strip()
+    lat, lon = float(lat), float(lon)
+    if name is None:
+        name = f"Site at {lat:.4f},{lon:.4f}"
     
-    geom_wkt = row.get('GEOM') or row.get('geom')
-    lat = row.get('LATITUDE') or row.get('latitude') or row.get('lat')
-    lon = row.get('LONGITUDE') or row.get('longitude') or row.get('lon')
-    
-    if geom_wkt and isinstance(geom_wkt, str) and 'POINT' in geom_wkt:
-        geom_sql = f"ST_GeomFromText('{geom_wkt}', 4326)"
-    elif pd.notna(lat) and pd.notna(lon):
-        geom_sql = f"ST_SetSRID(ST_MakePoint({lon}, {lat}), 4326)"
-    else:
-        geom_sql = "NULL"
-
-    cur.execute("SELECT id FROM locations WHERE location_name = %s", (name,))
+    cur.execute("""
+        SELECT id FROM locations 
+        WHERE ABS(latitude - %s) < 0.0001 AND ABS(longitude - %s) < 0.0001
+    """, (lat, lon))
     res = cur.fetchone()
     if res:
         return res[0]
-        
-    try:
-        sql = f"""
-        INSERT INTO locations (location_name, description, location_geom, latitude, longitude)
-        VALUES (%s, %s, {geom_sql}, %s, %s)
-        ON CONFLICT (latitude, longitude) DO UPDATE SET location_name = EXCLUDED.location_name
-        RETURNING id
-        """
-        l = float(lat) if pd.notna(lat) else None
-        o = float(lon) if pd.notna(lon) else None
-        
-        cur.execute(sql, (name, desc, l, o))
-        return cur.fetchone()[0]
-    except Exception as e:
-        # print(f"Error inserting location {name}: {e}")
-        conn.rollback()
-        return None
-
-def normalize_taxonomy(conn, cur, row):
-    sp_name = row.get('SPECIES_NAME') or row.get('species_name') or row.get('SPECIES')
-    if pd.isna(sp_name) or str(sp_name).lower() == 'nan':
-        return None
-    sp_name = str(sp_name).strip()
-        
-    cur.execute("SELECT id FROM taxonomy WHERE species_name = %s", (sp_name,))
-    res = cur.fetchone()
-    if res:
-        return res[0]
-        
-    common = str(row.get('COMMON_NAME') or row.get('reporting_name') or "")
-    family = str(row.get('FAMILY') or row.get('family') or "")
-    phylum = str(row.get('PHYLUM') or row.get('phylum') or "")
-    cls = str(row.get('CLASS') or row.get('class') or "")
-    order = str(row.get('ORDER') or row.get('order') or "")
-    genus = str(row.get('GENUS') or row.get('genus') or "")
-    auth = str(row.get('AUTHORITY') or "")
     
     try:
         cur.execute("""
-        INSERT INTO taxonomy (species_name, common_name, family, phylum, class, "order", genus, authority)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (species_name) DO NOTHING
-        RETURNING id
-        """, (sp_name, common, family, phylum, cls, order, genus, auth))
+            INSERT INTO locations (location_name, latitude, longitude, location_geom)
+            VALUES (%s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+            RETURNING id
+        """, (name, lat, lon, lon, lat))
+        return cur.fetchone()[0]
+    except:
+        return None
+
+def get_or_create_taxonomy(cur, species_name, common_name=''):
+    """Get or create taxonomy entry"""
+    if pd.isna(species_name) or str(species_name).strip() == '':
+        return None
+    
+    species_name = str(species_name).strip()
+    
+    cur.execute("SELECT id FROM taxonomy WHERE species_name = %s", (species_name,))
+    res = cur.fetchone()
+    if res:
+        return res[0]
+    
+    try:
+        cur.execute("""
+            INSERT INTO taxonomy (species_name, common_name)
+            VALUES (%s, %s)
+            ON CONFLICT (species_name) DO NOTHING
+            RETURNING id
+        """, (species_name, common_name))
         res = cur.fetchone()
-        return res[0] if res else None 
-    except Exception as e:
-        conn.rollback()
-        cur.execute("SELECT id FROM taxonomy WHERE species_name = %s", (sp_name,))
-        res = cur.fetchone()
-        return res[0] if res else None
+        if res:
+            return res[0]
+        # If conflict occurred, fetch the existing ID
+        cur.execute("SELECT id FROM taxonomy WHERE species_name = %s", (species_name,))
+        return cur.fetchone()[0]
+    except:
+        return None
+
+def detect_csv_format(df):
+    """Detect the format type of biological CSV"""
+    cols = df.columns.tolist()
+    cols_lower = [c.lower() for c in cols]
+    
+    # Check for matrix format (species as columns with family_genus_species_id pattern)
+    species_cols = [c for c in cols if '_' in c and c.count('_') >= 2 and not c.startswith('Sample')]
+    if len(species_cols) > 50:  # Larval fish has 200+ species columns
+        return 'matrix'
+    
+    # Check for phytoplankton format
+    if 'genus_species' in cols_lower or ('taxon' in cols_lower and 'biovolume' in cols_lower):
+        return 'phytoplankton'
+    
+    # Check for Redmap format
+    if 'species' in cols_lower and 'sighting_date' in cols_lower and 'common_name' in cols_lower:
+        return 'redmap'
+    
+    # Check for standard observation format
+    if 'species_name' in cols_lower or 'scientific_name' in cols_lower:
+        return 'standard'
+    
+    return 'unknown'
+
+def process_matrix_format(df, metadata_id, cur, conn):
+    """Process larval fish matrix format where species are columns"""
+    print("  Format: Matrix (species as columns)")
+    
+    # Find species columns (family_genus_species_id format)
+    species_cols = [c for c in df.columns if '_' in c and c.count('_') >= 2 and not c.startswith('Sample')]
+    
+    if 'Latitude' not in df.columns or 'Longitude' not in df.columns:
+        print("  Warning: No Latitude/Longitude columns found")
+        return 0
+    
+    date_col = 'SampleTime_Local' if 'SampleTime_Local' in df.columns else 'SampleTime_UTC'
+    
+    records_inserted = 0
+    for idx, row in df.iterrows():
+        if pd.isna(row.get('Latitude')) or pd.isna(row.get('Longitude')):
+            continue
+            
+        lat, lon = row['Latitude'], row['Longitude']
+        obs_date = row.get(date_col) if date_col in row else None
+        
+        # Get or create location
+        location_id = get_or_create_location(cur, lat, lon, metadata_id)
+        if not location_id:
+            continue
+        
+        # Process each species column
+        for species_col in species_cols:
+            count = row[species_col]
+            if pd.notna(count) and count > 0:
+                # Parse species name from column (format: Family_Genus.species_ID)
+                parts = species_col.split('_')
+                if len(parts) >= 2:
+                    genus_species = parts[1].replace('.', ' ')
+                else:
+                    genus_species = parts[0]
+                
+                # Get or create taxonomy
+                taxonomy_id = get_or_create_taxonomy(cur, genus_species, '')
+                if not taxonomy_id:
+                    continue
+                
+                # Insert observation
+                try:
+                    cur.execute("""
+                        INSERT INTO species_observations 
+                        (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
+                        VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+                    """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
+                    records_inserted += 1
+                except Exception as e:
+                    conn.rollback()
+                    continue
+        
+        if idx % 100 == 0 and idx > 0:
+            conn.commit()
+            print(f"  Processed {idx} sampling events, {records_inserted} observations...")
+    
+    conn.commit()
+    return records_inserted
+
+def process_phytoplankton_format(df, metadata_id, cur, conn):
+    """Process phytoplankton format with GENUS_SPECIES or TAXON column"""
+    print("  Format: Phytoplankton")
+    
+    # Map column names (case insensitive)
+    col_map = {c.upper(): c for c in df.columns}
+    
+    species_col = col_map.get('GENUS_SPECIES') or col_map.get('TAXON')
+    lat_col = col_map.get('LATITUDE')
+    lon_col = col_map.get('LONGITUDE')
+    date_col = col_map.get('DATE_TRIP') or col_map.get('DATE')
+    count_col = col_map.get('NUMBER_CELLS_COUNTED') or col_map.get('CORRECTED_CELL_CONCENTRATION_CELLS_PER_MILLILITRE')
+    
+    if not all([species_col, lat_col, lon_col]):
+        print(f"  Warning: Missing required columns (need species, lat, lon)")
+        return 0
+    
+    records_inserted = 0
+    for idx, row in df.iterrows():
+        if pd.isna(row.get(lat_col)) or pd.isna(row.get(lon_col)):
+            continue
+        
+        species = row.get(species_col)
+        if pd.isna(species) or str(species).strip() == '':
+            continue
+            
+        lat, lon = row[lat_col], row[lon_col]
+        obs_date = row.get(date_col) if date_col else None
+        count = row.get(count_col, 1) if count_col else 1
+        
+        location_id = get_or_create_location(cur, lat, lon, metadata_id)
+        if not location_id:
+            continue
+        
+        taxonomy_id = get_or_create_taxonomy(cur, species, '')
+        if not taxonomy_id:
+            continue
+        
+        try:
+            cur.execute("""
+                INSERT INTO species_observations 
+                (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
+                VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
+            records_inserted += 1
+        except Exception as e:
+            conn.rollback()
+            continue
+        
+        if idx % 1000 == 0 and idx > 0:
+            conn.commit()
+            print(f"  Processed {idx} observations...")
+    
+    conn.commit()
+    return records_inserted
+
+def process_redmap_format(df, metadata_id, cur, conn):
+    """Process Redmap citizen science sightings format"""
+    print("  Format: Redmap sightings")
+    
+    # Map column names
+    col_map = {c.upper(): c for c in df.columns}
+    
+    species_col = col_map.get('SPECIES')
+    common_col = col_map.get('COMMON_NAME')
+    lat_col = col_map.get('LATITUDE')
+    lon_col = col_map.get('LONGITUDE')
+    date_col = col_map.get('SIGHTING_DATE')
+    
+    if not all([species_col, lat_col, lon_col]):
+        print(f"  Warning: Missing required columns")
+        return 0
+    
+    records_inserted = 0
+    for idx, row in df.iterrows():
+        if pd.isna(row.get(lat_col)) or pd.isna(row.get(lon_col)):
+            continue
+        
+        species = row.get(species_col)
+        common_name = row.get(common_col, '') if common_col else ''
+        
+        if pd.isna(species) or str(species).strip() == '':
+            continue
+            
+        lat, lon = row[lat_col], row[lon_col]
+        obs_date = row.get(date_col) if date_col else None
+        
+        location_id = get_or_create_location(cur, lat, lon, metadata_id)
+        if not location_id:
+            continue
+        
+        taxonomy_id = get_or_create_taxonomy(cur, species, common_name)
+        if not taxonomy_id:
+            continue
+        
+        try:
+            cur.execute("""
+                INSERT INTO species_observations 
+                (metadata_id, location_id, taxonomy_id, observation_date, geom)
+                VALUES (%s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+            """, (metadata_id, location_id, taxonomy_id, obs_date, lon, lat))
+            records_inserted += 1
+        except Exception as e:
+            conn.rollback()
+            continue
+        
+        if idx % 500 == 0 and idx > 0:
+            conn.commit()
+            print(f"  Processed {idx} sightings...")
+    
+    conn.commit()
+    return records_inserted
+
+def process_standard_format(df, metadata_id, cur, conn):
+    """Process standard observation format (original logic)"""
+    print("  Format: Standard")
+    
+    # Try to find species column
+    species_col = None
+    for col in df.columns:
+        if col.upper() in ['SPECIES_NAME', 'SPECIES', 'SCIENTIFIC_NAME', 'TAXON']:
+            species_col = col
+            break
+    
+    if not species_col:
+        return 0
+    
+    # Find location columns
+    lat_col = lon_col = None
+    for col in df.columns:
+        if col.upper() in ['LATITUDE', 'LAT']:
+            lat_col = col
+        if col.upper() in ['LONGITUDE', 'LON', 'LONG']:
+            lon_col = col
+    
+    if not (lat_col and lon_col):
+        return 0
+    
+    records_inserted = 0
+    for idx, row in df.iterrows():
+        species = row.get(species_col)
+        if pd.isna(species):
+            continue
+        
+        lat = row.get(lat_col)
+        lon = row.get(lon_col)
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        
+        location_id = get_or_create_location(cur, lat, lon, metadata_id)
+        if not location_id:
+            continue
+        
+        taxonomy_id = get_or_create_taxonomy(cur, species, '')
+        if not taxonomy_id:
+            continue
+        
+        try:
+            cur.execute("""
+                INSERT INTO species_observations 
+                (metadata_id, location_id, taxonomy_id, geom)
+                VALUES (%s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+            """, (metadata_id, location_id, taxonomy_id, lon, lat))
+            records_inserted += 1
+        except:
+            conn.rollback()
+            continue
+        
+        if idx % 1000 == 0 and idx > 0:
+            conn.commit()
+    
+    conn.commit()
+    return records_inserted
 
 def ingest_dataset(conn, file_path, metadata_id):
+    """Main ingestion function with format detection"""
     print(f"Ingesting {os.path.basename(file_path)}...")
     try:
-        # Read CSV with flexible encoding, skipping comments
+        # Read CSV with flexible encoding
+        df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', comment='#')
+    except:
         try:
-            df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', comment='#')
-        except:
-            try:
-                df = pd.read_csv(file_path, encoding='latin1', on_bad_lines='skip', comment='#')
-            except TypeError:
-                # Older pandas/different arg?
-                df = pd.read_csv(file_path, encoding='latin1', error_bad_lines=False, comment='#')
-
-        cur = conn.cursor()
-        
-        inserted_count = 0
-        for idx, row in df.iterrows():
-            loc_id = normalize_location(conn, cur, row, metadata_id)
-            tax_id = normalize_taxonomy(conn, cur, row)
-            
-            if not tax_id:
-                continue
-
-            # Values
-            count_val = row.get('TOTAL_NUMBER') or row.get('total') or row.get('count_code') # Redmap uses code?
-            count_cat = row.get('COUNT_DESCRIPTION') if 'COUNT_DESCRIPTION' in row else None
-            
-            # Handle numeric count safely
-            try:
-                numeric_count = float(str(count_val).replace('>','').replace('<','')) if count_val else None
-            except:
-                numeric_count = None
-                count_cat = str(count_val) # treat as category if not number
-                
-            obs_date = row.get('SURVEY_DATE') or row.get('survey_date') or row.get('SIGHTING_DATE')
-            depth = row.get('DEPTH') or row.get('depth')
-            
-            # Geom for observation (denormalized)
-            lat = row.get('LATITUDE') or row.get('latitude') or row.get('LATITUDE')
-            lon = row.get('LONGITUDE') or row.get('longitude') or row.get('LONGITUDE')
-            geom_sql = "NULL"
-            if lat and lon:
-                geom_sql = f"ST_SetSRID(ST_MakePoint({lon}, {lat}), 4326)"
-
-            sql = f"""
-            INSERT INTO species_observations 
-            (metadata_id, location_id, taxonomy_id, observation_date, count_value, count_category, depth_m, geom)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, {geom_sql})
-            """
-            
-            cur.execute(sql, (
-                metadata_id, loc_id, tax_id, obs_date, numeric_count, count_cat, depth
-            ))
-            
-            if idx % 1000 == 0:
-                conn.commit()
-        
-        conn.commit()
-        print(f"Finished {file_path}")
-        
-    except Exception as e:
-        print(f"Failed to ingest {file_path}: {e}")
-        conn.rollback()
+            df = pd.read_csv(file_path, encoding='latin1', on_bad_lines='skip', comment='#')
+        except Exception as e:
+            print(f"  Error reading CSV: {e}")
+            return
+    
+    cur = conn.cursor()
+    
+    # Detect format
+    csv_format = detect_csv_format(df)
+    
+    if csv_format == 'matrix':
+        records = process_matrix_format(df, metadata_id, cur, conn)
+    elif csv_format == 'phytoplankton':
+        records = process_phytoplankton_format(df, metadata_id, cur, conn)
+    elif csv_format == 'redmap':
+        records = process_redmap_format(df, metadata_id, cur, conn)
+    elif csv_format == 'standard':
+        records = process_standard_format(df, metadata_id, cur, conn)
+    else:
+        print(f"  Unknown CSV format, skipping")
+        return
+    
+    print(f"  Inserted {records} observations")
+    print(f"Finished {os.path.basename(file_path)}")
 
 def is_biological_csv(file_path):
     """Peek at CSV header to see if it looks biological"""
     try:
-        # Read just the header (first few lines)
+        df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', comment='#', nrows=5)
+    except:
         try:
-            df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', comment='#', nrows=5)
-        except:
             df = pd.read_csv(file_path, encoding='latin1', on_bad_lines='skip', comment='#', nrows=5)
-            
-        cols = [c.upper() for c in df.columns]
-        bio_keywords = ['SPECIES', 'TAXON', 'SCIENTIFIC_NAME', 'GENUS', 'PHYLUM', 'FAMILY']
-        
-        # Check if any keyword matches any column substring
-        for k in bio_keywords:
-            if any(k in c for c in cols):
-                return True
-        return False
-    except Exception as e:
-        # print(f"Skipping non-CSV or unreadable {file_path}: {e}")
-        return False
+        except:
+            return False
+    
+    cols = [c.upper() for c in df.columns]
+    bio_keywords = ['SPECIES', 'TAXON', 'SCIENTIFIC_NAME', 'GENUS', 'PHYLUM', 'FAMILY', 'GENUS_SPECIES']
+    
+    # Check if any keyword matches
+    for k in bio_keywords:
+        if any(k in c for c in cols):
+            return True
+    
+    # Check for matrix format (many species columns)
+    species_cols = [c for c in df.columns if '_' in c and c.count('_') >= 2]
+    if len(species_cols) > 50:
+        return True
+    
+    return False
 
 def main():
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         
-        # 1. Find datasets with 0 records in ALL tables (measurements, spatial, biological)
+        # Find datasets with 0 biological records
         print("Finding empty datasets...")
         cur.execute("""
             SELECT m.id, m.title, m.dataset_path 
@@ -203,7 +414,7 @@ def main():
             meta_id, title, path = ds
             if not os.path.exists(path):
                 continue
-                
+            
             print(f"Scanning '{title}'...")
             
             # Walk directory
