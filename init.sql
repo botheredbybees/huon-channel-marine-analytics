@@ -121,14 +121,18 @@ CREATE TABLE public.imos_vocab_units (
 CREATE TABLE public.locations (
     id SERIAL PRIMARY KEY,
     location_name text,
-    location_type text,
+    location_type text DEFAULT 'observation_site',
     location_geom public.geometry(Point,4326),
     longitude double precision,
     latitude double precision,
     description text,
-    created_at timestamp without time zone DEFAULT now(),
-    UNIQUE (latitude, longitude)
+    created_at timestamp without time zone DEFAULT now()
 );
+
+-- Partial unique constraint for non-NULL coordinates only
+CREATE UNIQUE INDEX idx_locations_lat_lon_unique 
+ON public.locations (latitude, longitude) 
+WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
 
 CREATE INDEX idx_locations_geom ON public.locations USING gist (location_geom);
 
@@ -185,6 +189,8 @@ CREATE INDEX idx_metadata_bbox ON metadata(west, east, south, north);
 CREATE INDEX idx_metadata_time ON metadata(time_start, time_end);
 CREATE INDEX idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
 CREATE INDEX idx_metadata_dataset_name ON metadata(dataset_name);
+CREATE INDEX idx_metadata_dataset_path ON metadata(dataset_path) 
+WHERE dataset_path IS NOT NULL;
 
 CREATE TABLE public.spatial_ref_system (
     id SERIAL PRIMARY KEY,
@@ -376,7 +382,7 @@ GROUP BY p.parameter_code, p.parameter_label, p.aodn_parameter_uri;
 CREATE TABLE IF NOT EXISTS spatial_features (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
-    uuid UUID,
+    uuid TEXT,
     geom GEOMETRY(Geometry, 4326),
     properties JSONB
 );
