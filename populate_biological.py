@@ -78,6 +78,10 @@ def detect_csv_format(df):
     cols = df.columns.tolist()
     cols_lower = [c.lower() for c in cols]
     
+    # Check for Australian Phytoplankton Database format
+    if 'taxon_name' in cols_lower and 'genus' in cols_lower and 'functional_group' in cols_lower:
+        return 'australian_phyto'
+    
     # Check for matrix format (species as columns with family_genus_species_id pattern)
     species_cols = [c for c in cols if '_' in c and c.count('_') >= 2 and not c.startswith('Sample')]
     if len(species_cols) > 50:  # Larval fish has 200+ species columns
@@ -96,6 +100,95 @@ def detect_csv_format(df):
         return 'standard'
     
     return 'unknown'
+
+def process_australian_phyto_format(df, metadata_id, cur, conn):
+    """Process Australian Phytoplankton Database format"""
+    print("  Format: Australian Phytoplankton Database")
+    
+    # Map column names
+    col_map = {c.upper(): c for c in df.columns}
+    
+    taxon_col = col_map.get('TAXON_NAME')
+    genus_col = col_map.get('GENUS')
+    species_col = col_map.get('SPECIES')
+    lat_col = col_map.get('LATITUDE')
+    lon_col = col_map.get('LONGITUDE')
+    date_col = col_map.get('SAMPLE_TIME_UTC')
+    count_col = col_map.get('CELLS_L')
+    biovolume_col = col_map.get('BIOVOLUME_UM3_L')
+    
+    if not all([lat_col, lon_col]):
+        print(f"  Warning: Missing required location columns")
+        return 0
+    
+    records_inserted = 0
+    for idx, row in df.iterrows():
+        if pd.isna(row.get(lat_col)) or pd.isna(row.get(lon_col)):
+            continue
+        
+        # Build species name: prefer GENUS + SPECIES, fallback to TAXON_NAME
+        species_name = None
+        if genus_col and species_col:
+            genus = row.get(genus_col)
+            species = row.get(species_col)
+            if pd.notna(genus) and pd.notna(species) and str(species).strip() not in ['', 'spp.']:
+                species_name = f"{genus} {species}".strip()
+            elif pd.notna(genus):
+                species_name = f"{genus} spp."
+        
+        # Fallback to TAXON_NAME if species name not built
+        if not species_name and taxon_col:
+            taxon = row.get(taxon_col)
+            if pd.notna(taxon) and str(taxon).strip() != '':
+                species_name = str(taxon).strip()
+        
+        if not species_name:
+            continue
+            
+        lat, lon = row[lat_col], row[lon_col]
+        obs_date = row.get(date_col) if date_col else None
+        
+        # Get count value (prefer CELLS_L, fallback to biovolume presence)
+        count = None
+        if count_col:
+            count_val = row.get(count_col)
+            if pd.notna(count_val):
+                try:
+                    count = float(count_val)
+                except:
+                    pass
+        
+        # If no count, check if biovolume indicates presence
+        if count is None and biovolume_col:
+            biovolume = row.get(biovolume_col)
+            if pd.notna(biovolume):
+                count = 1  # Presence indicator
+        
+        location_id = get_or_create_location(cur, lat, lon, metadata_id)
+        if not location_id:
+            continue
+        
+        taxonomy_id = get_or_create_taxonomy(cur, species_name, '')
+        if not taxonomy_id:
+            continue
+        
+        try:
+            cur.execute("""
+                INSERT INTO species_observations 
+                (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
+                VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
+            records_inserted += 1
+        except Exception as e:
+            conn.rollback()
+            continue
+        
+        if idx % 1000 == 0 and idx > 0:
+            conn.commit()
+            print(f"  Processed {idx} observations...")
+    
+    conn.commit()
+    return records_inserted
 
 def process_matrix_format(df, metadata_id, cur, conn):
     """Process larval fish matrix format where species are columns"""
@@ -335,22 +428,34 @@ def process_standard_format(df, metadata_id, cur, conn):
 def ingest_dataset(conn, file_path, metadata_id):
     """Main ingestion function with format detection"""
     print(f"Ingesting {os.path.basename(file_path)}...")
-    try:
-        # Read CSV with flexible encoding
-        df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', comment='#')
-    except:
+    
+    # Special handling for Australian Phytoplankton Database (has mixed types)
+    if 'Australian_Phytoplankton_Database' in file_path:
         try:
-            df = pd.read_csv(file_path, encoding='latin1', on_bad_lines='skip', comment='#')
+            df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', 
+                           comment='#', low_memory=False, dtype=str)
         except Exception as e:
-            print(f"  Error reading CSV: {e}")
+            print(f"  Error reading Australian Phyto CSV: {e}")
             return
+    else:
+        try:
+            # Read CSV with flexible encoding
+            df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', comment='#')
+        except:
+            try:
+                df = pd.read_csv(file_path, encoding='latin1', on_bad_lines='skip', comment='#')
+            except Exception as e:
+                print(f"  Error reading CSV: {e}")
+                return
     
     cur = conn.cursor()
     
     # Detect format
     csv_format = detect_csv_format(df)
     
-    if csv_format == 'matrix':
+    if csv_format == 'australian_phyto':
+        records = process_australian_phyto_format(df, metadata_id, cur, conn)
+    elif csv_format == 'matrix':
         records = process_matrix_format(df, metadata_id, cur, conn)
     elif csv_format == 'phytoplankton':
         records = process_phytoplankton_format(df, metadata_id, cur, conn)
