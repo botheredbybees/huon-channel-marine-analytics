@@ -32,20 +32,46 @@ python populate_metadata.py
 
 ### 2. populate_parameter_mappings.py
 
-**Purpose:** Loads standardized parameter mappings from configuration files into the database.
+**Purpose:** Loads standardized parameter mappings from `config_parameter_mapping.json` into the database.
+
+**Why Two Components?** This script works in conjunction with `config_parameter_mapping.json` to provide both:
+- **Configuration Management** (JSON file): Human-editable, version-controlled parameter definitions
+- **Performance Optimization** (Database table): Fast indexed lookups during ETL operations
+
+The JSON file serves as the authoritative source for parameter mappings, while the database table enables millisecond-level lookups during data processing. This architecture separates configuration from execution, making mappings easy to maintain while keeping ETL operations performant.
 
 **Key Functions:**
 - Reads parameter mappings from `config_parameter_mapping.json`
-- Maps raw parameter names to standardized codes
-- Defines measurement units and namespaces (CF, NERC, IMOS)
-- Creates lookup table for measurement standardization
+- Maps raw parameter names to standardized codes (CF, BODC, custom)
+- Defines measurement units and namespaces
+- Creates indexed lookup table for measurement standardization
+- Populates `parameter_mappings` database table
+- Validates mapping structure and reports statistics
+- Idempotent operation (safe to run multiple times)
+
+**Configuration File:** `config_parameter_mapping.json`
+- Contains 80+ parameter mappings
+- Defines standard codes, namespaces, and units
+- Includes time format hints and spatial column hints
+- Version controlled with codebase
+- Easy to extend with new mappings
 
 **Usage:**
 ```bash
 python populate_parameter_mappings.py
 ```
 
-**Configuration:** Edit `config_parameter_mapping.json` to add new parameter mappings.
+**When to Run:**
+- After database initialization
+- When adding new parameter mappings to config
+- When setting up new environment
+- Safe to re-run anytime (uses ON CONFLICT DO NOTHING)
+
+**Example Mapping Flow:**
+```
+Raw Data:     "TEMPERATURE" → Config File → Database → ETL Scripts
+Standardized: "TEMP" (BODC, Degrees Celsius)
+```
 
 [Detailed Documentation →](populate_parameter_mappings_detail.md)
 
@@ -62,6 +88,7 @@ python populate_parameter_mappings.py
 - Converts cftime objects to standard datetime
 - Extracts and patches location data from file headers
 - Applies coordinate validation and correction
+- **Uses parameter_mappings table for standardization** (fast database lookups)
 - Links measurements to locations and metadata
 - Handles large datasets with batch processing
 
@@ -197,13 +224,13 @@ docker-compose up -d
 # 2. Load metadata
 python populate_metadata.py
 
-# 3. Load parameter mappings
+# 3. Load parameter mappings (creates lookup table)
 python populate_parameter_mappings.py
 
 # 4. Load spatial features (optional)
 python populate_spatial.py
 
-# 5. Load measurements (includes location patching)
+# 5. Load measurements (uses parameter_mappings for standardization)
 python populate_measurements.py
 
 # 6. Load biological observations
@@ -212,6 +239,8 @@ python populate_biological.py
 # 7. Verify data
 python example_data_access.py
 ```
+
+**Important:** `populate_parameter_mappings.py` must run **before** `populate_measurements.py` because measurements script queries the `parameter_mappings` table for standardization.
 
 ## Common Command-Line Options
 
@@ -225,7 +254,12 @@ Most ETL scripts support the following options:
 
 ## Configuration Files
 
-- **config_parameter_mapping.json** - Parameter standardization mappings
+- **config_parameter_mapping.json** - Parameter standardization mappings (80+ definitions)
+  - Raw parameter names → Standard codes
+  - Namespace definitions (BODC, CF, custom)
+  - Unit specifications
+  - Time format hints
+  - Quality flag definitions
 - **init.sql** - Database schema initialization
 - **docker-compose.yml** - Database service configuration
 - **.env** - Database credentials (not in repo)
@@ -282,8 +316,9 @@ Scripts apply quality control flags:
 
 - **Batch Processing:** Scripts use batch inserts (default 1000 rows)
 - **Indexing:** Database tables have appropriate indexes
+- **Parameter Lookups:** Database queries (~10µs) vs. JSON file reads (~1ms)
 - **Memory:** Large files processed incrementally
-- **Parallelization:** Scripts can run independently after metadata load
+- **Parallelization:** Scripts can run independently after metadata and parameter mappings load
 
 ## Troubleshooting
 
@@ -296,6 +331,7 @@ Common issues and solutions:
 2. **File not found**
    - Ensure `AODN_data/` directory exists
    - Check file paths in error messages
+   - Verify `config_parameter_mapping.json` exists
 
 3. **Encoding errors**
    - CSV files tried with utf-8, latin1, iso-8859-1
@@ -305,6 +341,11 @@ Common issues and solutions:
    - Use `--limit` flag for testing
    - Process datasets individually
 
+5. **Parameter mapping errors**
+   - Run `populate_parameter_mappings.py` first
+   - Verify `parameter_mappings` table exists
+   - Check `config_parameter_mapping.json` is valid JSON
+
 ## Contributing
 
 When modifying ETL scripts:
@@ -312,8 +353,9 @@ When modifying ETL scripts:
 1. Maintain upsert-safe patterns (`ON CONFLICT DO NOTHING`)
 2. Add comprehensive logging
 3. Update this documentation
-4. Test with diagnostic_etl.py
-5. Verify data integrity with example_data_access.py
+4. Update `config_parameter_mapping.json` for new parameters
+5. Test with diagnostic_etl.py
+6. Verify data integrity with example_data_access.py
 
 ## Additional Resources
 
@@ -321,6 +363,7 @@ When modifying ETL scripts:
 - [Data Ingestion Guide](data_ingestion.md)
 - [ETL Guide](ETL_GUIDE.md)
 - [Project README](../README.md)
+- [Parameter Mapping Configuration](../config_parameter_mapping.json)
 
 ---
 
