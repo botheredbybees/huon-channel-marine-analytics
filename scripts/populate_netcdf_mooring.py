@@ -17,13 +17,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 
-# Database connection parameters
+# Database connection parameters (from docker-compose.yml)
 DB_CONFIG = {
-    'dbname': 'huon_data',
-    'user': 'postgres',
-    'password': 'your_password',
+    'dbname': 'marine_db',
+    'user': 'marine_user',
+    'password': 'marine_pass123',
     'host': 'localhost',
-    'port': 5432
+    'port': 5433
 }
 
 # IMOS QC flag interpretations
