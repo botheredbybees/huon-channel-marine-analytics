@@ -93,18 +93,21 @@ python populate_measurements.py --dataset "Chlorophyll"
 **Purpose:** Loads spatial reference data (marine regions, boundaries) from shapefiles.
 
 **Key Functions:**
-- Reads ESRI Shapefiles (`.shp`) using GeoPandas
+- Reads ESRI Shapefiles (`.shp`) using ogr2ogr conversion
 - Extracts polygon geometries for marine regions
 - Converts to PostGIS-compatible geometry format
 - Populates `spatial_features` table with region boundaries
 - Supports Tasmania marine bioregions, MPAs, and other spatial features
+- Preserves shapefile attributes as JSONB properties
 
 **Usage:**
 ```bash
 python populate_spatial.py
 ```
 
-**Requirements:** Shapefiles must be in `AODN_data/` subdirectories.
+**Requirements:** 
+- GDAL/OGR tools installed
+- Shapefiles must be in `AODN_data/` subdirectories
 
 [Detailed Documentation →](populate_spatial_detail.md)
 
@@ -120,7 +123,8 @@ python populate_spatial.py
 - Extracts observation counts and abundance data
 - Links observations to locations and timestamps
 - Handles Redmap sightings, larval fish surveys, phytoplankton data
-- Applies taxonomic validation
+- Normalizes taxonomic classifications
+- Creates entries in `taxonomy` and `species_observations` tables
 
 **Usage:**
 ```bash
