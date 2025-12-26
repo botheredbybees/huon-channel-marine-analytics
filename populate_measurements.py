@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
 """
-Enhanced Measurements ETL v3.0 - Multi-Parameter CSV Support
+Enhanced Measurements ETL v3.1 - Multi-Parameter CSV + 3D Gridded NetCDF Support
 
-This version extends v2.1 to handle CSVs where each row contains multiple
-measurement parameters (e.g., one row = timestamp + TEMP + SALINITY + PH + DO).
+NEW in v3.1:
+- 3D gridded NetCDF extraction (time × lat × lon)
+- Spatial bounding box filtering (only extract cells within study area)
+- Grid cell location creation (each grid cell gets a location record)
+- Support for single-point grids (lat=1, lon=1) as station timeseries
 
-NEW FEATURES:
+v3.0 features:
 - Multi-parameter extraction: 1 CSV row → N measurement records
 - Improved column detection for IMOS/AODN water quality datasets
 - Unit inference from column names (e.g., TEMP_C → celsius)
@@ -17,14 +20,6 @@ GUARDRAILS (unchanged):
 ✓ Audit trail: location_qc_flag, extracted_at
 ✓ Validation: schema checks, failures logged
 ✓ Additive: no data loss
-
-PRIORITY DATASETS:
-- Nearshore temperature monitoring (343k records)
-- Oceanography sampling SE Tasmania (39k records)
-- Nutrient sampling SE Tasmania (965 records)
-- Estuarine Health water quality (186 records)
-- Chlorophyll sampling (1,568 records)
-- Baseline coastal assessment (186 records)
 
 Usage:
   python populate_measurements.py [--limit 5000] [--dataset "Title"]
@@ -79,6 +74,22 @@ DB_CONFIG = {
 DATA_ROOT = "AODN_data"
 
 # ============================================================================
+# SPATIAL BOUNDING BOX (Huon Estuary and D'Entrecasteaux Channel)
+# ============================================================================
+
+STUDY_AREA = {
+    'lat_min': -43.558,
+    'lat_max': -42.777,
+    'lon_min': 146.844,
+    'lon_max': 147.783
+}
+
+def is_within_study_area(lat: float, lon: float) -> bool:
+    """Check if coordinates fall within study area"""
+    return (STUDY_AREA['lat_min'] <= lat <= STUDY_AREA['lat_max'] and
+            STUDY_AREA['lon_min'] <= lon <= STUDY_AREA['lon_max'])
+
+# ============================================================================
 # UNIT INFERENCE
 # ============================================================================
 
@@ -87,18 +98,18 @@ UNIT_PATTERNS = {
     r'(?i)temp.*(_c|celsius)': 'degrees_celsius',
     r'(?i)temp.*(_k|kelvin)': 'kelvin',
     r'(?i)temp.*(_f|fahrenheit)': 'degrees_fahrenheit',
-    r'(?i)temperature': 'degrees_celsius',  # default
+    r'(?i)temperature': 'degrees_celsius',
     
     # Salinity
     r'(?i)sal.*(_psu|psu)': 'PSU',
     r'(?i)sal.*(_ppt|ppt)': 'PPT',
-    r'(?i)salinity': 'PSU',  # default
+    r'(?i)salinity': 'PSU',
     
     # Dissolved oxygen
     r'(?i)(do|dissolved.*oxygen).*(_mg|mg/l)': 'mg/L',
     r'(?i)(do|dissolved.*oxygen).*(_ml|ml/l)': 'mL/L',
     r'(?i)(do|dissolved.*oxygen).*(%|sat|saturation)': 'percent',
-    r'(?i)dissolved.*oxygen': 'mg/L',  # default
+    r'(?i)dissolved.*oxygen': 'mg/L',
     
     # Nutrients
     r'(?i)(nitrate|no3).*(_um|umol)': 'umol/L',
@@ -111,20 +122,20 @@ UNIT_PATTERNS = {
     # Chlorophyll
     r'(?i)chl.*(_a|a\b).*(_ug|ug/l)': 'ug/L',
     r'(?i)chl.*(_a|a\b).*(_mg|mg/l)': 'mg/L',
-    r'(?i)chl.*(_a|a\b)': 'ug/L',  # default
+    r'(?i)chl.*(_a|a\b)': 'ug/L',
     
     # Turbidity
     r'(?i)turb.*(_ntu|ntu)': 'NTU',
     r'(?i)turb.*(_ftu|ftu)': 'FTU',
-    r'(?i)turbidity': 'NTU',  # default
+    r'(?i)turbidity': 'NTU',
     
-    # pH (dimensionless)
+    # pH
     r'(?i)ph': 'pH',
     
     # Pressure
     r'(?i)pres.*(_dbar|dbar)': 'dbar',
     r'(?i)pres.*(_mbar|mbar)': 'mbar',
-    r'(?i)pressure': 'dbar',  # default
+    r'(?i)pressure': 'dbar',
 }
 
 def infer_unit_from_column_name(col_name: str) -> str:
@@ -139,17 +150,12 @@ def infer_unit_from_column_name(col_name: str) -> str:
 # ============================================================================
 
 PARAMETER_KEYWORDS = {
-    # Core physical parameters
     'temperature': ['temp', 'temperature', 'sst', 'sbt', 't_deg', 'water_temp'],
     'salinity': ['sal', 'salinity', 'psal', 'salin'],
     'pressure': ['pres', 'pressure', 'depth', 'z'],
     'depth': ['depth', 'z', 'level', 'depth_m'],
-    
-    # Dissolved gases
-    'dissolved_oxygen': ['do', 'oxygen', 'doxy', 'o2', 'dissolved_oxygen', 'disolved_oxygen'],  # note typo in real data
+    'dissolved_oxygen': ['do', 'oxygen', 'doxy', 'o2', 'dissolved_oxygen', 'disolved_oxygen'],
     'oxygen_saturation': ['do_sat', 'o2_sat', 'oxygen_saturation', 'disolved_oxygen_saturation'],
-    
-    # Nutrients
     'nitrate': ['no3', 'nitrate', 'nox'],
     'nitrite': ['no2', 'nitrite'],
     'ammonia': ['nh3', 'nh4', 'ammonia', 'ammonium'],
@@ -157,33 +163,25 @@ PARAMETER_KEYWORDS = {
     'silicate': ['sio4', 'silicate', 'silica'],
     'total_nitrogen': ['total_n', 'tn', 'total_nitrogen'],
     'total_phosphorus': ['total_p', 'tp', 'total_phosphorus'],
-    
-    # Biogeochemistry
     'chlorophyll_a': ['chl_a', 'chla', 'chlorophyll', 'chlorophyll_a'],
     'fluorescence': ['fluor', 'fluorescence', 'chlf'],
     'turbidity': ['turb', 'turbidity', 'ntu'],
     'doc': ['doc', 'dissolved_organic_carbon'],
-    
-    # Water quality
     'ph': ['ph'],
     'conductivity': ['cond', 'conductivity'],
 }
 
 def detect_parameter_columns(df: pd.DataFrame) -> Dict[str, str]:
-    """
-    Detect which columns are measurement parameters.
-    
-    Returns:
-        {col_name: standard_parameter_name}
-    """
+    """Detect which columns are measurement parameters"""
     param_cols = {}
     cols_upper = {c: c.upper().replace(' ', '_') for c in df.columns}
     
     for col_orig, col_clean in cols_upper.items():
-        # Skip known metadata columns
+        # Skip known metadata/QC columns
         if any(skip in col_clean for skip in ['FID', 'ID', 'DATE', 'TIME', 'LATITUDE', 
                                                 'LONGITUDE', 'STATION', 'SITE', 'TRIP',
-                                                'LOCATION', 'GEOM', 'SAMPLE', 'ESTUARY']):
+                                                'LOCATION', 'GEOM', 'SAMPLE', 'ESTUARY',
+                                                'QUALITY_CONTROL', 'QC', '_FLAG']):
             continue
         
         # Try to match parameter keywords
@@ -205,7 +203,6 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
     """Extract station name, latitude, longitude from CSV or NetCDF"""
     logger.debug(f"  📍 Extracting location from: {file_path}")
     
-    # --- NETCDF HANDLING ---
     if file_path.endswith(".nc"):
         try:
             ds = netCDF4.Dataset(file_path)
@@ -240,7 +237,6 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
             logger.debug(f"  ❌ NetCDF read failed: {e}")
             return None, None, None
     
-    # --- CSV HANDLING ---
     elif file_path.endswith(".csv"):
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -278,13 +274,11 @@ def patch_location_coordinates(lat: Optional[float], lon: Optional[float]) -> Tu
     if lat is None or lon is None:
         return lat, lon, 'missing_coordinates'
     
-    # Fix positive latitudes (Tasmania should be negative)
     if lat > 0 and lat < 90:
         logger.debug(f"  🔄 Fixed positive latitude: {lat} -> {-lat}")
         lat = -lat
         qc_flag = 'lat_sign_flipped'
     
-    # Normalize longitude to -180..180
     if lon > 180:
         lon = lon - 360
         qc_flag = 'lon_normalized'
@@ -292,11 +286,9 @@ def patch_location_coordinates(lat: Optional[float], lon: Optional[float]) -> Tu
         lon = lon + 360
         qc_flag = 'lon_normalized'
     
-    # Flag obvious outliers
     if abs(lat) > 90 or abs(lon) > 180:
         qc_flag = 'outlier_flagged'
     
-    # Tasmania bounds check
     if not (-45 < lat < -40 and 144 < lon < 150):
         if qc_flag == 'clean':
             qc_flag = 'outside_tasmania'
@@ -402,32 +394,26 @@ class TimeFormatDetector:
     def _from_numeric(val: float) -> Optional[datetime]:
         """Parse numeric time representations"""
         
-        # Decimal year (2000.5 = July 2000)
         if 1900 < val < 2100 and val % 1 != 0:
             year = int(val)
             frac = val - year
             return datetime(year, 1, 1) + timedelta(days=365.25 * frac)
         
-        # Year as integer
         if 1900 < val < 2100 and val % 1 == 0:
             return datetime(int(val), 1, 1)
         
-        # Months since 1900-01-01
         if 1000 < val < 2000:
             base = datetime(1900, 1, 1)
             return base + timedelta(days=val * 30.4)
         
-        # Days since 1900-01-01
         if 40000 < val < 50000:
             base = datetime(1900, 1, 1)
             return base + timedelta(days=val)
         
-        # Days since 1970-01-01
         if 15000 < val < 25000:
             base = datetime(1970, 1, 1)
             return base + timedelta(days=val)
         
-        # Seconds since unix epoch
         if val > 1e8:
             try:
                 return datetime.utcfromtimestamp(val)
@@ -453,7 +439,6 @@ class CSVMeasurementExtractor:
         rows = []
         
         try:
-            # Read CSV with flexible encoding
             for encoding in ['utf-8', 'latin1', 'iso-8859-1']:
                 try:
                     df = pd.read_csv(file_path, encoding=encoding,
@@ -468,10 +453,8 @@ class CSVMeasurementExtractor:
             if df.empty:
                 return rows
             
-            # Normalize column names
             cols_upper = {c: c.upper().strip().replace(' ', '_') for c in df.columns}
             
-            # Identify time column
             time_col = self._find_column(df, cols_upper, 
                                         ['TIME', 'DATE', 'DATETIME', 'TIMESTAMP', 'SAMPLE_DATE'])
             
@@ -479,7 +462,6 @@ class CSVMeasurementExtractor:
                 logger.warning(f"No time column found in {file_path}")
                 return rows
             
-            # Detect parameter columns (multi-parameter extraction)
             param_cols = detect_parameter_columns(df)
             
             if not param_cols:
@@ -488,18 +470,14 @@ class CSVMeasurementExtractor:
             
             logger.info(f"  ✓ Detected {len(param_cols)} parameter columns: {list(param_cols.values())[:5]}...")
             
-            # Optional depth column
             depth_col = self._find_column(df, cols_upper, ['DEPTH', 'Z', 'LEVEL', 'DEPTH_M'])
             
-            # Extract measurements
             for idx, row in df.iterrows():
-                # Parse timestamp
                 ts = TimeFormatDetector.detect_and_convert(row.get(time_col))
                 if not ts:
                     self.failed_count += 1
                     continue
                 
-                # Extract depth (if available)
                 depth = None
                 if depth_col:
                     try:
@@ -507,19 +485,15 @@ class CSVMeasurementExtractor:
                     except (ValueError, TypeError):
                         pass
                 
-                # Extract each parameter from this row
                 for col_name, param_standard in param_cols.items():
                     try:
                         value = float(row.get(col_name))
                         
-                        # Skip NaN/None
                         if pd.isna(value):
                             continue
                         
-                        # Get parameter code from mapping (or use standard name)
                         param_code, namespace, uom = self.param_mapping.get_standard_param(param_standard)
                         
-                        # If unit unknown, try to infer from column name
                         if uom == 'unknown':
                             uom = infer_unit_from_column_name(col_name)
                         
@@ -560,16 +534,18 @@ class CSVMeasurementExtractor:
         return None
 
 # ============================================================================
-# NETCDF MEASUREMENT EXTRACTOR
+# NETCDF MEASUREMENT EXTRACTOR (1D, 2D, 3D GRIDS)
 # ============================================================================
 
 class NetCDFMeasurementExtractor:
-    """Extracts measurements from NetCDF files"""
+    """Extracts measurements from NetCDF files - supports 1D/2D/3D grids"""
     
-    def __init__(self, param_mapping: ParameterMapping):
+    def __init__(self, param_mapping: ParameterMapping, db_config: dict):
         self.param_mapping = param_mapping
+        self.db_config = db_config
         self.extracted_count = 0
         self.failed_count = 0
+        self.grid_locations = {}  # Cache for grid cell locations
     
     def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
         """Extract measurements from NetCDF"""
@@ -582,7 +558,6 @@ class NetCDFMeasurementExtractor:
         try:
             ds = netCDF4.Dataset(file_path, 'r')
             
-            # Find time variable
             time_var = self._find_time_variable(ds)
             if not time_var:
                 logger.warning(f"No time variable in {file_path}")
@@ -592,80 +567,53 @@ class NetCDFMeasurementExtractor:
             time_data = ds.variables[time_var][:]
             time_attrs = ds.variables[time_var].__dict__
             
+            # Find lat/lon variables (for 3D grids)
+            lat_var = self._find_variable(ds, ['LATITUDE', 'latitude', 'lat'])
+            lon_var = self._find_variable(ds, ['LONGITUDE', 'longitude', 'lon'])
+            
+            lat_data = ds.variables[lat_var][:] if lat_var else None
+            lon_data = ds.variables[lon_var][:] if lon_var else None
+            
             # Extract each data variable
             for var_name in ds.variables:
                 if var_name in ds.dimensions:
                     continue
-                if var_name == time_var:
+                if var_name == time_var or var_name == lat_var or var_name == lon_var:
                     continue
                 
                 var = ds.variables[var_name]
                 
-                # Skip coordinate variables
                 if hasattr(var, 'axis') or len(var.dimensions) == 0:
                     continue
                 
-                # Map to standard parameter
                 param_code, namespace, uom = self.param_mapping.get_standard_param(var_name)
                 
-                # Extract data
+                # Get unit from NetCDF attributes if not in mapping
+                if uom == 'unknown' and hasattr(var, 'units'):
+                    uom = str(var.units)
+                
                 try:
                     data = var[:]
                     
+                    # 1D timeseries
                     if data.ndim == 1:
-                        for t_idx in range(len(data)):
-                            if pd.isna(data[t_idx]):
-                                continue
-                            
-                            ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
-                            if not ts:
-                                continue
-                            
-                            rows.append({
-                                'time': ts,
-                                'uuid': metadata['uuid'],
-                                'metadata_id': metadata['id'],
-                                'parameter_code': param_code,
-                                'namespace': namespace,
-                                'value': float(data[t_idx]),
-                                'uom': uom,
-                                'depth_m': None,
-                                'quality_flag': 1,
-                                'location_id': None,
-                                'location_qc_flag': 'unknown'
-                            })
-                            
-                            self.extracted_count += 1
-                            if limit and self.extracted_count >= limit:
-                                raise StopIteration
+                        rows.extend(self._extract_1d(data, time_data, time_attrs, 
+                                                     param_code, namespace, uom, metadata, limit))
                     
+                    # 2D time×depth
                     elif data.ndim == 2:
-                        for t_idx in range(min(len(data), 1000)):
-                            ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
-                            if not ts:
-                                continue
-                            
-                            for s_idx in range(data.shape[1]):
-                                if pd.isna(data[t_idx, s_idx]):
-                                    continue
-                                
-                                rows.append({
-                                    'time': ts,
-                                    'uuid': metadata['uuid'],
-                                    'metadata_id': metadata['id'],
-                                    'parameter_code': param_code,
-                                    'namespace': namespace,
-                                    'value': float(data[t_idx, s_idx]),
-                                    'uom': uom,
-                                    'depth_m': None,
-                                    'quality_flag': 1,
-                                    'location_id': None,
-                                    'location_qc_flag': 'unknown'
-                                })
-                                
-                                self.extracted_count += 1
-                                if limit and self.extracted_count >= limit:
-                                    raise StopIteration
+                        rows.extend(self._extract_2d(data, time_data, time_attrs,
+                                                     param_code, namespace, uom, metadata, limit))
+                    
+                    # 3D time×lat×lon (GRIDDED DATA)
+                    elif data.ndim == 3 and lat_data is not None and lon_data is not None:
+                        rows.extend(self._extract_3d_grid(data, time_data, time_attrs,
+                                                         lat_data, lon_data,
+                                                         param_code, namespace, uom, 
+                                                         metadata, limit))
+                    
+                    if limit and self.extracted_count >= limit:
+                        break
                 
                 except StopIteration:
                     break
@@ -680,9 +628,154 @@ class NetCDFMeasurementExtractor:
         
         return rows
     
+    def _extract_1d(self, data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
+        """Extract 1D timeseries"""
+        rows = []
+        for t_idx in range(len(data)):
+            if pd.isna(data[t_idx]):
+                continue
+            
+            ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
+            if not ts:
+                continue
+            
+            rows.append({
+                'time': ts,
+                'uuid': metadata['uuid'],
+                'metadata_id': metadata['id'],
+                'parameter_code': param_code,
+                'namespace': namespace,
+                'value': float(data[t_idx]),
+                'uom': uom,
+                'depth_m': None,
+                'quality_flag': 1,
+                'location_id': None,
+                'location_qc_flag': 'unknown'
+            })
+            
+            self.extracted_count += 1
+            if limit and self.extracted_count >= limit:
+                raise StopIteration
+        
+        return rows
+    
+    def _extract_2d(self, data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
+        """Extract 2D time×depth"""
+        rows = []
+        for t_idx in range(min(len(data), 1000)):
+            ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
+            if not ts:
+                continue
+            
+            for s_idx in range(data.shape[1]):
+                if pd.isna(data[t_idx, s_idx]):
+                    continue
+                
+                rows.append({
+                    'time': ts,
+                    'uuid': metadata['uuid'],
+                    'metadata_id': metadata['id'],
+                    'parameter_code': param_code,
+                    'namespace': namespace,
+                    'value': float(data[t_idx, s_idx]),
+                    'uom': uom,
+                    'depth_m': None,
+                    'quality_flag': 1,
+                    'location_id': None,
+                    'location_qc_flag': 'unknown'
+                })
+                
+                self.extracted_count += 1
+                if limit and self.extracted_count >= limit:
+                    raise StopIteration
+        
+        return rows
+    
+    def _extract_3d_grid(self, data, time_data, time_attrs, lat_data, lon_data,
+                         param_code, namespace, uom, metadata, limit):
+        """Extract 3D gridded data (time×lat×lon) with spatial filtering"""
+        rows = []
+        
+        # Check grid size
+        n_time, n_lat, n_lon = data.shape
+        total_cells = n_lat * n_lon
+        
+        logger.info(f"  📊 3D Grid: {n_time} timesteps × {n_lat} lats × {n_lon} lons = {n_time * total_cells:,} potential measurements")
+        
+        # Filter grid cells within study area
+        valid_cells = []
+        for lat_idx in range(n_lat):
+            for lon_idx in range(n_lon):
+                lat = float(lat_data[lat_idx])
+                lon = float(lon_data[lon_idx])
+                
+                if is_within_study_area(lat, lon):
+                    valid_cells.append((lat_idx, lon_idx, lat, lon))
+        
+        if not valid_cells:
+            logger.warning(f"  ⚠ No grid cells within study area")
+            return rows
+        
+        logger.info(f"  ✓ Found {len(valid_cells)} grid cells within study area")
+        
+        # Create/get location for each grid cell
+        conn = psycopg2.connect(**self.db_config)
+        
+        for lat_idx, lon_idx, lat, lon in valid_cells:
+            # Get or create location for this grid cell
+            cell_key = (round(lat, 4), round(lon, 4))
+            
+            if cell_key not in self.grid_locations:
+                location_name = f"{metadata['title'][:50]} - Grid ({lat:.3f}, {lon:.3f})"
+                location_id = get_or_insert_location(conn, location_name, lat, lon)
+                self.grid_locations[cell_key] = location_id
+            else:
+                location_id = self.grid_locations[cell_key]
+            
+            # Extract timeseries for this grid cell
+            for t_idx in range(n_time):
+                value = data[t_idx, lat_idx, lon_idx]
+                
+                if pd.isna(value) or value == -999 or value == -1e34:
+                    continue
+                
+                ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
+                if not ts:
+                    continue
+                
+                rows.append({
+                    'time': ts,
+                    'uuid': metadata['uuid'],
+                    'metadata_id': metadata['id'],
+                    'parameter_code': param_code,
+                    'namespace': namespace,
+                    'value': float(value),
+                    'uom': uom,
+                    'depth_m': None,
+                    'quality_flag': 1,
+                    'location_id': location_id,
+                    'location_qc_flag': 'clean'
+                })
+                
+                self.extracted_count += 1
+                
+                if limit and self.extracted_count >= limit:
+                    conn.close()
+                    raise StopIteration
+        
+        conn.close()
+        return rows
+    
     @staticmethod
     def _find_time_variable(ds) -> Optional[str]:
         for name in ['time', 'TIME', 'Time', 'datetime', 'DATETIME']:
+            if name in ds.variables:
+                return name
+        return None
+    
+    @staticmethod
+    def _find_variable(ds, names: List[str]) -> Optional[str]:
+        for name in names:
             if name in ds.variables:
                 return name
         return None
@@ -787,7 +880,7 @@ class MeasurementBatchInserter:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.0 - Multi-Parameter CSV Support')
+    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.1 - Multi-Parameter CSV + 3D Gridded NetCDF')
     parser.add_argument('--limit', type=int, help='Max rows per dataset', default=None)
     parser.add_argument('--dataset', help='Specific dataset to process')
     args = parser.parse_args()
@@ -795,8 +888,10 @@ def main():
     # Initialize
     param_mapping = ParameterMapping(DB_CONFIG)
     csv_extractor = CSVMeasurementExtractor(param_mapping)
-    nc_extractor = NetCDFMeasurementExtractor(param_mapping)
+    nc_extractor = NetCDFMeasurementExtractor(param_mapping, DB_CONFIG)
     inserter = MeasurementBatchInserter(DB_CONFIG)
+    
+    logger.info(f"Study area: Lat {STUDY_AREA['lat_min']} to {STUDY_AREA['lat_max']}, Lon {STUDY_AREA['lon_min']} to {STUDY_AREA['lon_max']}")
     
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -827,7 +922,7 @@ def main():
             logger.info(f"📊 Processing: {title}")
             logger.info(f"{'='*70}")
             
-            metadata = {'id': ds_id, 'uuid': uuid}
+            metadata = {'id': ds_id, 'uuid': uuid, 'title': title}
             dataset_rows = []
             
             # ===== LOCATION PATCHING STEP =====
@@ -837,7 +932,6 @@ def main():
             location_id = None
             location_qc_flag = 'not_found'
             
-            # Try to find a data file in this dataset
             found_file = None
             for root, dirs, files in os.walk(rel_path):
                 if 'metadata' in root:
@@ -850,17 +944,14 @@ def main():
                         
                         file_path = os.path.join(root, file)
                         
-                        # Extract location metadata
                         station_name, lat, lon = extract_station_info_from_file(file_path, title)
                         
                         if lat is not None and lon is not None:
-                            # Patch coordinates
                             patched_lat, patched_lon, location_qc_flag = patch_location_coordinates(lat, lon)
                             
                             if patched_lat is not None and patched_lon is not None:
                                 logger.info(f"  ✓ Location: {station_name} ({patched_lat:.4f}, {patched_lon:.4f}) [{location_qc_flag}]")
                                 
-                                # Insert/link location
                                 location_id = get_or_insert_location(conn, station_name, patched_lat, patched_lon)
                                 
                                 if location_id:
@@ -899,12 +990,17 @@ def main():
                     except Exception as e:
                         logger.error(f"  ❌ Error processing {file}: {e}")
             
-            # ===== APPLY LOCATION PATCH TO ALL ROWS =====
+            # ===== APPLY LOCATION PATCH TO NON-GRIDDED ROWS =====
             if location_id is not None:
+                patched_count = 0
                 for row in dataset_rows:
-                    row['location_id'] = location_id
-                    row['location_qc_flag'] = location_qc_flag
-                logger.info(f"  ✓ Patched {len(dataset_rows)} rows with location_id={location_id}")
+                    if row['location_id'] is None:
+                        row['location_id'] = location_id
+                        row['location_qc_flag'] = location_qc_flag
+                        patched_count += 1
+                
+                if patched_count > 0:
+                    logger.info(f"  ✓ Patched {patched_count} rows with location_id={location_id}")
             
             # ===== INSERT BATCH =====
             if dataset_rows:
