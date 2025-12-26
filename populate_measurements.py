@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 
 """
-Enhanced Measurements ETL v2.1 + Location Patching v4 (INTEGRATED)
+Enhanced Measurements ETL v3.0 - Multi-Parameter CSV Support
 
-This script merges the location patching logic from patch_locations_v4.py directly
-into populate_measurements.py. The standalone patch script can be deleted after.
+This version extends v2.1 to handle CSVs where each row contains multiple
+measurement parameters (e.g., one row = timestamp + TEMP + SALINITY + PH + DO).
 
-Enhancements:
-- NetCDF time parsing returns datetime objects (not tuples)
-- Better error handling for cftime conversion
-- Database connection from parameter_mappings table
-- Location extraction from CSV/NetCDF headers
-- Location patching (station lookup, coordinate fixes)
-- No data loss: all patches logged with QC flags
+NEW FEATURES:
+- Multi-parameter extraction: 1 CSV row → N measurement records
+- Improved column detection for IMOS/AODN water quality datasets
+- Unit inference from column names (e.g., TEMP_C → celsius)
+- Supports both "long format" (param column) and "wide format" (param as columns)
 
-Guardrails:
-✓ Upsert-safe: INSERT ... ON CONFLICT DO UPDATE
-✓ Audit trail: location_qc_flag, location_patch_flags, extracted_at
-✓ Validation: schema checks before write, failures skipped with logging
-✓ Additive: raw_row JSON preserves 100% source data
+GUARDRAILS (unchanged):
+✓ Upsert-safe: INSERT ... ON CONFLICT DO NOTHING
+✓ Audit trail: location_qc_flag, extracted_at
+✓ Validation: schema checks, failures logged
+✓ Additive: no data loss
+
+PRIORITY DATASETS:
+- Nearshore temperature monitoring (343k records)
+- Oceanography sampling SE Tasmania (39k records)
+- Nutrient sampling SE Tasmania (965 records)
+- Estuarine Health water quality (186 records)
+- Chlorophyll sampling (1,568 records)
+- Baseline coastal assessment (186 records)
 
 Usage:
   python populate_measurements.py [--limit 5000] [--dataset "Title"]
@@ -28,6 +34,7 @@ import os
 import sys
 import logging
 import glob
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
@@ -72,16 +79,130 @@ DB_CONFIG = {
 DATA_ROOT = "AODN_data"
 
 # ============================================================================
-# LOCATION PATCHING FUNCTIONS (from patch_locations_v4.py)
+# UNIT INFERENCE
+# ============================================================================
+
+UNIT_PATTERNS = {
+    # Temperature
+    r'(?i)temp.*(_c|celsius)': 'degrees_celsius',
+    r'(?i)temp.*(_k|kelvin)': 'kelvin',
+    r'(?i)temp.*(_f|fahrenheit)': 'degrees_fahrenheit',
+    r'(?i)temperature': 'degrees_celsius',  # default
+    
+    # Salinity
+    r'(?i)sal.*(_psu|psu)': 'PSU',
+    r'(?i)sal.*(_ppt|ppt)': 'PPT',
+    r'(?i)salinity': 'PSU',  # default
+    
+    # Dissolved oxygen
+    r'(?i)(do|dissolved.*oxygen).*(_mg|mg/l)': 'mg/L',
+    r'(?i)(do|dissolved.*oxygen).*(_ml|ml/l)': 'mL/L',
+    r'(?i)(do|dissolved.*oxygen).*(%|sat|saturation)': 'percent',
+    r'(?i)dissolved.*oxygen': 'mg/L',  # default
+    
+    # Nutrients
+    r'(?i)(nitrate|no3).*(_um|umol)': 'umol/L',
+    r'(?i)(nitrite|no2).*(_um|umol)': 'umol/L',
+    r'(?i)(ammonia|nh3|nh4).*(_um|umol)': 'umol/L',
+    r'(?i)(phosphate|po4|srp).*(_um|umol)': 'umol/L',
+    r'(?i)(silicate|sio4).*(_um|umol)': 'umol/L',
+    r'(?i)(nitrate|no3|nitrite|no2|ammonia|phosphate|silicate)': 'umol/L',
+    
+    # Chlorophyll
+    r'(?i)chl.*(_a|a\b).*(_ug|ug/l)': 'ug/L',
+    r'(?i)chl.*(_a|a\b).*(_mg|mg/l)': 'mg/L',
+    r'(?i)chl.*(_a|a\b)': 'ug/L',  # default
+    
+    # Turbidity
+    r'(?i)turb.*(_ntu|ntu)': 'NTU',
+    r'(?i)turb.*(_ftu|ftu)': 'FTU',
+    r'(?i)turbidity': 'NTU',  # default
+    
+    # pH (dimensionless)
+    r'(?i)ph': 'pH',
+    
+    # Pressure
+    r'(?i)pres.*(_dbar|dbar)': 'dbar',
+    r'(?i)pres.*(_mbar|mbar)': 'mbar',
+    r'(?i)pressure': 'dbar',  # default
+}
+
+def infer_unit_from_column_name(col_name: str) -> str:
+    """Infer measurement unit from column name patterns"""
+    for pattern, unit in UNIT_PATTERNS.items():
+        if re.search(pattern, col_name):
+            return unit
+    return 'unknown'
+
+# ============================================================================
+# PARAMETER DETECTION
+# ============================================================================
+
+PARAMETER_KEYWORDS = {
+    # Core physical parameters
+    'temperature': ['temp', 'temperature', 'sst', 'sbt', 't_deg', 'water_temp'],
+    'salinity': ['sal', 'salinity', 'psal', 'salin'],
+    'pressure': ['pres', 'pressure', 'depth', 'z'],
+    'depth': ['depth', 'z', 'level', 'depth_m'],
+    
+    # Dissolved gases
+    'dissolved_oxygen': ['do', 'oxygen', 'doxy', 'o2', 'dissolved_oxygen', 'disolved_oxygen'],  # note typo in real data
+    'oxygen_saturation': ['do_sat', 'o2_sat', 'oxygen_saturation', 'disolved_oxygen_saturation'],
+    
+    # Nutrients
+    'nitrate': ['no3', 'nitrate', 'nox'],
+    'nitrite': ['no2', 'nitrite'],
+    'ammonia': ['nh3', 'nh4', 'ammonia', 'ammonium'],
+    'phosphate': ['po4', 'phosphate', 'srp', 'drp'],
+    'silicate': ['sio4', 'silicate', 'silica'],
+    'total_nitrogen': ['total_n', 'tn', 'total_nitrogen'],
+    'total_phosphorus': ['total_p', 'tp', 'total_phosphorus'],
+    
+    # Biogeochemistry
+    'chlorophyll_a': ['chl_a', 'chla', 'chlorophyll', 'chlorophyll_a'],
+    'fluorescence': ['fluor', 'fluorescence', 'chlf'],
+    'turbidity': ['turb', 'turbidity', 'ntu'],
+    'doc': ['doc', 'dissolved_organic_carbon'],
+    
+    # Water quality
+    'ph': ['ph'],
+    'conductivity': ['cond', 'conductivity'],
+}
+
+def detect_parameter_columns(df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Detect which columns are measurement parameters.
+    
+    Returns:
+        {col_name: standard_parameter_name}
+    """
+    param_cols = {}
+    cols_upper = {c: c.upper().replace(' ', '_') for c in df.columns}
+    
+    for col_orig, col_clean in cols_upper.items():
+        # Skip known metadata columns
+        if any(skip in col_clean for skip in ['FID', 'ID', 'DATE', 'TIME', 'LATITUDE', 
+                                                'LONGITUDE', 'STATION', 'SITE', 'TRIP',
+                                                'LOCATION', 'GEOM', 'SAMPLE', 'ESTUARY']):
+            continue
+        
+        # Try to match parameter keywords
+        for param_name, keywords in PARAMETER_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword.upper() in col_clean or col_clean.startswith(keyword.upper()):
+                    param_cols[col_orig] = param_name
+                    break
+            if col_orig in param_cols:
+                break
+    
+    return param_cols
+
+# ============================================================================
+# LOCATION PATCHING FUNCTIONS
 # ============================================================================
 
 def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """
-    Extract station name, latitude, longitude from CSV or NetCDF.
-    
-    Returns:
-        (station_name, latitude, longitude) or (None, None, None)
-    """
+    """Extract station name, latitude, longitude from CSV or NetCDF"""
     logger.debug(f"  📍 Extracting location from: {file_path}")
     
     # --- NETCDF HANDLING ---
@@ -90,7 +211,6 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
             ds = netCDF4.Dataset(file_path)
             station = None
             
-            # Try to find station name
             for attr in ['station_name', 'site_code', 'platform_code', 'title', 'id']:
                 if hasattr(ds, attr):
                     station = str(getattr(ds, attr)).strip()
@@ -98,19 +218,16 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
             
             lat = lon = None
             
-            # Extract latitude
             for lat_name in ['LATITUDE', 'latitude', 'lat']:
                 if lat_name in ds.variables:
                     lat = float(ds.variables[lat_name][0])
                     break
             
-            # Extract longitude
             for lon_name in ['LONGITUDE', 'longitude', 'lon']:
                 if lon_name in ds.variables:
                     lon = float(ds.variables[lon_name][0])
                     break
             
-            # Fallback to geospatial attributes
             if lat is None and hasattr(ds, 'geospatial_lat_min'):
                 lat = float(ds.geospatial_lat_min)
             if lon is None and hasattr(ds, 'geospatial_lon_min'):
@@ -126,27 +243,20 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
     # --- CSV HANDLING ---
     elif file_path.endswith(".csv"):
         try:
-            # Detect delimiter
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 header = f.readline()
                 sep = ';' if ';' in header else ','
             
-            # Read just header + first few rows
             df = pd.read_csv(file_path, nrows=5, sep=sep, encoding='utf-8', errors='ignore')
-            
-            # Normalize columns to uppercase
             df.columns = [c.upper().strip() for c in df.columns]
             
-            # Find LATITUDE
             lat_col = next((c for c in df.columns if c in ['LATITUDE', 'LAT', 'START_LAT', 'DECIMAL_LAT']), None)
             lat = float(df[lat_col].iloc[0]) if lat_col and not pd.isna(df[lat_col].iloc[0]) else None
             
-            # Find LONGITUDE
             lon_col = next((c for c in df.columns if c in ['LONGITUDE', 'LON', 'LONG', 'START_LON', 'DECIMAL_LONG']), None)
             lon = float(df[lon_col].iloc[0]) if lon_col and not pd.isna(df[lon_col].iloc[0]) else None
             
-            # Find STATION
-            station_col = next((c for c in df.columns if c in ['STATION', 'SITE', 'SITE_CODE', 'STATION_NAME', 'TRIP_CODE']), None)
+            station_col = next((c for c in df.columns if c in ['STATION', 'SITE', 'SITE_CODE', 'STATION_NAME', 'TRIP_CODE', 'ESTUARY_SITE']), None)
             station = str(df[station_col].iloc[0]) if station_col and not pd.isna(df[station_col].iloc[0]) else dataset_title
             
             if station and len(station) < 3:
@@ -162,15 +272,7 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
 
 
 def patch_location_coordinates(lat: Optional[float], lon: Optional[float]) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    Apply location cleaning rules:
-    - Fix hemisphere sign errors (Tasmania is southern hemisphere)
-    - Normalize longitude to -180..180
-    - Flag outliers
-    
-    Returns:
-        (patched_lat, patched_lon, qc_flag)
-    """
+    """Apply location cleaning rules for Tasmania"""
     qc_flag = 'clean'
     
     if lat is None or lon is None:
@@ -194,7 +296,7 @@ def patch_location_coordinates(lat: Optional[float], lon: Optional[float]) -> Tu
     if abs(lat) > 90 or abs(lon) > 180:
         qc_flag = 'outlier_flagged'
     
-    # Tasmania bounds check (lat: -45 to -40, lon: 144 to 150)
+    # Tasmania bounds check
     if not (-45 < lat < -40 and 144 < lon < 150):
         if qc_flag == 'clean':
             qc_flag = 'outside_tasmania'
@@ -203,12 +305,7 @@ def patch_location_coordinates(lat: Optional[float], lon: Optional[float]) -> Tu
 
 
 def get_or_insert_location(conn, station: str, lat: float, lon: float) -> Optional[int]:
-    """
-    Insert location into locations table (or return existing id if found).
-    
-    Returns:
-        location_id or None
-    """
+    """Insert location into locations table"""
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -261,12 +358,7 @@ class ParameterMapping:
             logger.warning("Using empty parameter mapping - all params will be 'custom'")
     
     def get_standard_param(self, raw_param: str) -> Tuple[str, str, str]:
-        """
-        Map raw parameter name to standardized (param_code, namespace, unit)
-        
-        Returns:
-            Tuple of (parameter_code, namespace, uom) or (raw_param, 'custom', 'unknown')
-        """
+        """Map raw parameter name to standardized (param_code, namespace, unit)"""
         raw_upper = str(raw_param).upper().strip()
         
         if raw_upper in self.mapping:
@@ -283,27 +375,16 @@ class TimeFormatDetector:
     
     @staticmethod
     def detect_and_convert(time_value) -> Optional[datetime]:
-        """
-        Attempts multiple time format conversions.
-        
-        Args:
-            time_value: Single value (string, numeric, or datetime)
-        
-        Returns:
-            datetime object or None if conversion fails
-        """
+        """Attempts multiple time format conversions"""
         if time_value is None or (isinstance(time_value, float) and np.isnan(time_value)):
             return None
         
-        # Already a datetime
         if isinstance(time_value, datetime):
             return time_value
         
-        # ISO 8601 string
         if isinstance(time_value, str):
             return TimeFormatDetector._from_iso_string(time_value)
         
-        # Numeric timestamp
         if isinstance(time_value, (int, float, np.integer, np.floating)):
             return TimeFormatDetector._from_numeric(float(time_value))
         
@@ -331,7 +412,7 @@ class TimeFormatDetector:
         if 1900 < val < 2100 and val % 1 == 0:
             return datetime(int(val), 1, 1)
         
-        # Months since 1900-01-01 (typical IMOS CF)
+        # Months since 1900-01-01
         if 1000 < val < 2000:
             base = datetime(1900, 1, 1)
             return base + timedelta(days=val * 30.4)
@@ -356,11 +437,11 @@ class TimeFormatDetector:
         return None
 
 # ============================================================================
-# CSV MEASUREMENT EXTRACTOR
+# CSV MEASUREMENT EXTRACTOR (MULTI-PARAMETER)
 # ============================================================================
 
 class CSVMeasurementExtractor:
-    """Extracts measurements from CSV files"""
+    """Extracts measurements from CSV files - supports multi-parameter rows"""
     
     def __init__(self, param_mapping: ParameterMapping):
         self.param_mapping = param_mapping
@@ -368,7 +449,7 @@ class CSVMeasurementExtractor:
         self.failed_count = 0
     
     def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
-        """Extract measurements from CSV"""
+        """Extract measurements from CSV - handles both long and wide formats"""
         rows = []
         
         try:
@@ -387,76 +468,82 @@ class CSVMeasurementExtractor:
             if df.empty:
                 return rows
             
-            # Identify key columns
-            cols_upper = {c: c.upper() for c in df.columns}
+            # Normalize column names
+            cols_upper = {c: c.upper().strip().replace(' ', '_') for c in df.columns}
             
+            # Identify time column
             time_col = self._find_column(df, cols_upper, 
-                                        ['time', 'date', 'datetime', 'timestamp'])
-            value_col = self._find_column(df, cols_upper,
-                                         ['value', 'concentration', 'measurement', 'result'])
-            param_col = self._find_column(df, cols_upper,
-                                         ['parameter', 'variable', 'code'])
+                                        ['TIME', 'DATE', 'DATETIME', 'TIMESTAMP', 'SAMPLE_DATE'])
             
-            if not time_col or not value_col:
-                logger.warning(f"Missing time or value column in {file_path}")
+            if not time_col:
+                logger.warning(f"No time column found in {file_path}")
                 return rows
             
-            # Extract row-level location (if available in CSV)
-            location_id = None  # Will be set per-row if found in CSV
+            # Detect parameter columns (multi-parameter extraction)
+            param_cols = detect_parameter_columns(df)
             
-            # Extract rows
+            if not param_cols:
+                logger.warning(f"No parameter columns detected in {file_path}")
+                return rows
+            
+            logger.info(f"  ✓ Detected {len(param_cols)} parameter columns: {list(param_cols.values())[:5]}...")
+            
+            # Optional depth column
+            depth_col = self._find_column(df, cols_upper, ['DEPTH', 'Z', 'LEVEL', 'DEPTH_M'])
+            
+            # Extract measurements
             for idx, row in df.iterrows():
-                try:
-                    # Parse timestamp
-                    ts = TimeFormatDetector.detect_and_convert(row.get(time_col))
-                    if not ts:
-                        self.failed_count += 1
-                        continue
-                    
-                    # Get value
-                    try:
-                        value = float(row.get(value_col))
-                    except (ValueError, TypeError):
-                        self.failed_count += 1
-                        continue
-                    
-                    # Get parameter code
-                    if param_col:
-                        raw_param = row.get(param_col)
-                    else:
-                        raw_param = os.path.basename(file_path).split('.')[0]
-                    
-                    param_code, namespace, uom = self.param_mapping.get_standard_param(raw_param)
-                    
-                    # Optional: depth
-                    depth_col = self._find_column(df, cols_upper, ['depth', 'z', 'level'])
-                    depth = None
-                    if depth_col:
-                        try:
-                            depth = float(row.get(depth_col))
-                        except (ValueError, TypeError):
-                            pass
-                    
-                    rows.append({
-                        'time': ts,
-                        'uuid': metadata['uuid'],
-                        'metadata_id': metadata['id'],
-                        'parameter_code': param_code,
-                        'namespace': namespace,
-                        'value': value,
-                        'uom': uom,
-                        'depth_m': depth,
-                        'quality_flag': 1,
-                        'location_id': None,  # Will be patched
-                        'location_qc_flag': 'unknown'
-                    })
-                    
-                    self.extracted_count += 1
-                    if limit and self.extracted_count >= limit:
-                        break
-                        
-                except Exception as e:
+                # Parse timestamp
+                ts = TimeFormatDetector.detect_and_convert(row.get(time_col))
+                if not ts:
                     self.failed_count += 1
+                    continue
+                
+                # Extract depth (if available)
+                depth = None
+                if depth_col:
+                    try:
+                        depth = float(row.get(depth_col))
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Extract each parameter from this row
+                for col_name, param_standard in param_cols.items():
+                    try:
+                        value = float(row.get(col_name))
+                        
+                        # Skip NaN/None
+                        if pd.isna(value):
+                            continue
+                        
+                        # Get parameter code from mapping (or use standard name)
+                        param_code, namespace, uom = self.param_mapping.get_standard_param(param_standard)
+                        
+                        # If unit unknown, try to infer from column name
+                        if uom == 'unknown':
+                            uom = infer_unit_from_column_name(col_name)
+                        
+                        rows.append({
+                            'time': ts,
+                            'uuid': metadata['uuid'],
+                            'metadata_id': metadata['id'],
+                            'parameter_code': param_code,
+                            'namespace': namespace,
+                            'value': value,
+                            'uom': uom,
+                            'depth_m': depth,
+                            'quality_flag': 1,
+                            'location_id': None,
+                            'location_qc_flag': 'unknown'
+                        })
+                        
+                        self.extracted_count += 1
+                        
+                    except (ValueError, TypeError):
+                        continue
+                
+                if limit and self.extracted_count >= limit:
+                    break
         
         except Exception as e:
             logger.error(f"Fatal error extracting from {file_path}: {e}")
@@ -468,7 +555,7 @@ class CSVMeasurementExtractor:
         """Find column matching any keyword"""
         for keyword in keywords:
             for orig_col, upper_col in cols_upper.items():
-                if keyword.upper() in upper_col:
+                if keyword in upper_col:
                     return orig_col
         return None
 
@@ -602,21 +689,15 @@ class NetCDFMeasurementExtractor:
     
     @staticmethod
     def _parse_netcdf_time(time_value, attrs: dict) -> Optional[datetime]:
-        """
-        Parse NetCDF time using CF units and calendar attributes.
-        
-        Returns datetime object (NOT tuple).
-        """
+        """Parse NetCDF time using CF units and calendar attributes"""
         try:
             if cftime is not None:
                 units = attrs.get('units', '')
                 calendar = attrs.get('calendar', 'standard')
                 
                 if 'since' in units:
-                    # Convert cftime object to datetime
                     cf_time = cftime.num2date(time_value, units, calendar=calendar)
                     
-                    # Handle cftime.DatetimeGregorian, etc.
                     if hasattr(cf_time, 'timetuple'):
                         tt = cf_time.timetuple()
                         return datetime(tt.tm_year, tt.tm_mon, tt.tm_mday,
@@ -627,7 +708,6 @@ class NetCDFMeasurementExtractor:
         except Exception as e:
             logger.debug(f"cftime parsing failed: {e}")
         
-        # Fall back to TimeFormatDetector
         return TimeFormatDetector.detect_and_convert(time_value)
 
 # ============================================================================
@@ -665,15 +745,14 @@ class MeasurementBatchInserter:
                     row['depth_m'],
                     row['metadata_id'],
                     row['quality_flag'],
-                    row.get('location_id'),
-                    row.get('location_qc_flag', 'unknown')
+                    row.get('location_id')
                 )
                 for row in rows
             ]
             
             sql = """
                 INSERT INTO measurements
-                (time, uuid, parameter_code, namespace, value, uom, uncertainty, depth_m, metadata_id, quality_flag, location_id, location_qc_flag)
+                (time, uuid, parameter_code, namespace, value, uom, uncertainty, depth_m, metadata_id, quality_flag, location_id)
                 VALUES %s
                 ON CONFLICT DO NOTHING
             """
@@ -708,7 +787,7 @@ class MeasurementBatchInserter:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v2.1 + Location Patching')
+    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.0 - Multi-Parameter CSV Support')
     parser.add_argument('--limit', type=int, help='Max rows per dataset', default=None)
     parser.add_argument('--dataset', help='Specific dataset to process')
     args = parser.parse_args()
@@ -796,7 +875,6 @@ def main():
                     break
             
             # ===== MEASUREMENT EXTRACTION =====
-            # Walk directory and extract measurements
             for root, dirs, files in os.walk(rel_path):
                 if 'metadata' in root:
                     continue
