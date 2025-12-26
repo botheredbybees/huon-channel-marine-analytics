@@ -126,15 +126,19 @@ CREATE TABLE public.locations (
     longitude double precision,
     latitude double precision,
     description text,
-    created_at timestamp without time zone DEFAULT now()
+    created_at timestamp without time zone DEFAULT now(),
+    
+    -- Explicit UNIQUE constraint for ON CONFLICT support
+    CONSTRAINT unique_lat_lon UNIQUE (latitude, longitude)
 );
 
--- Partial unique constraint for non-NULL coordinates only
-CREATE UNIQUE INDEX idx_locations_lat_lon_unique 
+-- Performance index for spatial queries
+CREATE INDEX idx_locations_geom ON public.locations USING gist (location_geom);
+
+-- Partial index for non-NULL coordinates (additional performance optimization)
+CREATE INDEX idx_locations_lat_lon_partial 
 ON public.locations (latitude, longitude) 
 WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
-
-CREATE INDEX idx_locations_geom ON public.locations USING gist (location_geom);
 
 -- =============================================================================
 -- METADATA TABLES (normalized structure for 38+ IMAS datasets)
