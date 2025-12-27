@@ -2,9 +2,9 @@
 
 ## Overview
 
-`populate_measurements.py` is the core ETL script that extracts oceanographic measurements from CSV and NetCDF files, standardizes parameters, validates locations, and loads data into the `measurements` table. This is the most complex script in the pipeline, integrating parameter mapping, time parsing, spatial validation, and **multi-parameter row extraction**.
+`populate_measurements.py` is the core ETL script that extracts oceanographic measurements from CSV and NetCDF files, standardizes parameters, validates locations, and loads data into the `measurements` table. This is the most complex script in the pipeline, integrating parameter mapping, time parsing, spatial validation, **multi-parameter row extraction**, and **3D gridded NetCDF support**.
 
-**Script Version:** 3.0 (Multi-Parameter CSV Support)  
+**Script Version:** 3.1 (3D Gridded NetCDF + QC Filtering)  
 **Dependencies:** `psycopg2`, `pandas`, `numpy`, `netCDF4`, `cftime`  
 **Estimated Runtime:** 5-30 minutes per dataset (varies by file size)
 
@@ -12,7 +12,15 @@
 
 ## Key Features
 
-### v3.0 Enhancements (December 2025)
+### v3.1 Enhancements (December 2025)
+
+- **3D Gridded NetCDF Extraction** - Extract from satellite/model data (time×lat×lon grids)
+- **Spatial Bounding Box Filtering** - Only ingest grid cells within study area
+- **Grid Cell Location Records** - Each grid cell gets a unique location
+- **QC Column Filtering** - Quality control columns (e.g., `TEMP_QUALITY_CONTROL`) are **NOT** stored as separate measurements
+- **Bad Data Removal** - Measurements with QC flag = 4 are excluded during ETL
+
+### v3.0 Features (Preserved)
 
 - **Multi-Parameter CSV Extraction** - One row with TEMP, SALINITY, PH → Multiple measurement records
 - **Intelligent Parameter Detection** - Auto-detects ~25 common marine parameters by column name
@@ -27,7 +35,6 @@
 - **Parameter Mapping** - Loads from `parameter_mappings` table
 - **Location Extraction** - Reads station info from CSV/NetCDF headers
 - **Audit Trail** - `location_qc_flag`, `extracted_at`
-- **Zero Data Loss** - All rows logged, failures tracked
 
 ### Guardrails
 
@@ -35,6 +42,88 @@
 ✓ **Audit Trail** - QC flags track all modifications  
 ✓ **Schema Validation** - Type checking before database write  
 ✓ **Error Recovery** - Failed rows skipped with logging, no transaction rollback
+✓ **QC Column Filtering** - Quality control columns excluded from measurements table
+✓ **Bad Data Removal** - Measurements with QC flag = 4 (bad) are not ingested
+
+---
+
+## Quality Control (QC) Flag Handling
+
+### Important: QC Columns Are NOT Stored
+
+**IMOS datasets contain quality control columns** (e.g., `TEMP_QUALITY_CONTROL`, `PSAL_QUALITY_CONTROL`) with QC flag values:
+
+| QC Flag | Meaning |
+|---------|----------|
+| 1 | Good data (passed all QC tests) |
+| 2 | Probably good data |
+| 3 | Probably bad data (failed some QC tests) |
+| 4 | Bad data (failed critical QC tests) |
+| 9 | Missing data |
+
+### ETL Behavior (v3.1+)
+
+**QC columns are filtered during extraction:**
+```python
+# In detect_parameter_columns()
+if any(skip in col_clean for skip in [..., 'QUALITY_CONTROL', 'QC', '_FLAG']):
+    continue  # Skip QC columns
+```
+
+**This means:**
+- ✅ `TEMP` measurements are extracted and stored
+- ❌ `TEMP_QUALITY_CONTROL` columns are **NOT** stored as separate measurements
+- ✅ Only quality-controlled data (QC flag 1-2) is ingested
+- ❌ Bad measurements (QC flag = 4) are excluded before ingestion
+
+### Historical Cleanup (December 2025)
+
+**Pre-v3.1 versions stored QC columns as measurements**. A one-time cleanup was performed:
+
+1. **Deleted 8,276,395 QC flag records** (42.5% of original database)
+2. **Deleted 54,325 bad wave measurements** (where QC flag = 4)
+3. **Final clean database:** 12,028,987 quality-controlled measurements
+
+See `init.sql` header comments for details.
+
+---
+
+## What's New in v3.1
+
+### 3D Gridded NetCDF Extraction
+
+**Problem:** Satellite and model data (e.g., SST, chlorophyll) are stored as 3D grids (time × latitude × longitude) with thousands of grid cells. Previous versions couldn't extract these.
+
+**Solution:** v3.1 adds `_extract_3d_grid()` method with:
+- Grid cell iteration
+- Spatial bounding box filtering (only extract cells within study area)
+- Automatic location creation for each grid cell
+- Fill value handling (`NaN`, `-999`, `-1e34`)
+
+**Example:**
+```python
+# Ocean Acidification dataset
+n_time=1716, n_lat=1, n_lon=1 (single point)
+→ Extracts 7 parameters × 1,716 timesteps = ~12,000 measurements
+
+# SST GAMSSA dataset
+n_time=6213, n_lat=3, n_lon=4 (small regional grid)
+→ Filters to 4 grid cells within study area
+→ Extracts 1 parameter × 6,213 timesteps × 4 cells = ~25,000 measurements
+```
+
+### Spatial Bounding Box (Huon Estuary)
+
+```python
+STUDY_AREA = {
+    'lat_min': -43.558,
+    'lat_max': -42.777,
+    'lon_min': 146.844,
+    'lon_max': 147.783
+}
+```
+
+**Prevents data explosion:** Without filtering, MODIS chlorophyll would create **67 million measurements** from a global grid. With filtering, only ~200k relevant cells are extracted.
 
 ---
 
@@ -69,27 +158,14 @@ The script auto-detects parameters using these keywords:
 | **Salinity** | sal, salinity, psal | SALINITY_PSU, PSAL, SAL |
 | **Dissolved Oxygen** | do, oxygen, doxy, o2 | DO_MG_L, DISSOLVED_OXYGEN, O2_SAT |
 | **Nitrate** | no3, nitrate, nox | NITRATE, NO3, NOX_UMOL |
-| **Nitrite** | no2, nitrite | NITRITE, NO2 |
-| **Ammonia** | nh3, nh4, ammonia | AMMONIA, NH4, AMMONIUM |
-| **Phosphate** | po4, phosphate, srp | SRP, PHOSPHATE, PO4 |
-| **Silicate** | sio4, silicate, silica | SILICATE, SIO4 |
 | **Chlorophyll-a** | chl_a, chla, chlorophyll | CHL_A, CHLOROPHYLL_A |
 | **Turbidity** | turb, turbidity, ntu | TURBIDITY_NTU, TURB |
 | **pH** | ph | PH, PH_INSITU |
-| **Fluorescence** | fluor, fluorescence, chlf | FLUORESCENCE, CHLF |
 
-### Unit Inference Patterns
-
-Units are automatically extracted from column names using regex:
-
-```python
-TEMP_C → degrees_celsius
-SALINITY_PSU → PSU
-DO_SAT_% → percent
-NITRATE_UMOL → umol/L
-CHL_A_UG_L → ug/L
-TURBIDITY_NTU → NTU
-```
+**QC columns are automatically excluded:**
+- `TEMP_QUALITY_CONTROL` → Skipped
+- `PSAL_QC` → Skipped
+- `DO_FLAG` → Skipped
 
 ---
 
@@ -100,7 +176,8 @@ TURBIDITY_NTU → NTU
 ```
 AODN_data/Dataset/
   ├── water_quality.csv (wide format: multiple param columns)
-  └── ctd_profile.nc (standard NetCDF)
+  ├── ctd_profile.nc (2D: time×depth)
+  └── satellite_sst.nc (3D: time×lat×lon)
        ↓
   [File Type Detection]
        ↓
@@ -109,10 +186,13 @@ AODN_data/Dataset/
   [Coordinate Patching]
        ↓
   [Parameter Detection] ← Keyword matching
+       │                  ← QC column filtering (NEW v3.1)
        ↓
   [Unit Inference] ← Regex patterns
        ↓
   [Multi-Parameter Extraction] ← 1 row → N records
+       │  OR
+  [3D Grid Extraction] ← Spatial filtering (NEW v3.1)
        ↓
   [Parameter Mapping] ← parameter_mappings table
        ↓
@@ -120,15 +200,15 @@ AODN_data/Dataset/
        ↓
   [Batch Insertion]
        ↓
-  measurements table
+  measurements table (QC-filtered data only)
 ```
 
 ### Core Components
 
 1. **ParameterMapping** - Standardizes parameter names using database
 2. **TimeFormatDetector** - Auto-detects time formats (ISO, numeric, epoch)
-3. **CSVMeasurementExtractor** - **NEW: Multi-parameter row extraction**
-4. **NetCDFMeasurementExtractor** - Extracts from NetCDF files
+3. **CSVMeasurementExtractor** - Multi-parameter row extraction + QC filtering
+4. **NetCDFMeasurementExtractor** - Extracts from 1D/2D/3D NetCDF files
 5. **Location Patchers** - Validates and fixes coordinates
 6. **MeasurementBatchInserter** - Bulk database writes
 
@@ -136,7 +216,43 @@ AODN_data/Dataset/
 
 ## Function Reference
 
-### NEW: Parameter Detection
+### NEW (v3.1): 3D Grid Extraction
+
+#### `_extract_3d_grid(data, time_data, time_attrs, lat_data, lon_data, ...)`
+
+**Purpose:** Extract measurements from 3D gridded NetCDF data (time×lat×lon).
+
+**Parameters:**
+- `data` (np.ndarray): 3D array of measurement values
+- `time_data` (np.ndarray): Time coordinate values
+- `time_attrs` (dict): Time variable attributes (units, calendar)
+- `lat_data` (np.ndarray): Latitude coordinates
+- `lon_data` (np.ndarray): Longitude coordinates
+- `param_code`, `namespace`, `uom`: Parameter metadata
+- `metadata` (dict): Dataset metadata
+- `limit` (int): Max measurements to extract
+
+**Returns:** List of measurement dicts
+
+**Logic:**
+1. Filter grid cells to study area bounding box
+2. For each valid grid cell:
+   - Create/get location record (cached)
+   - Extract timeseries for that cell
+   - Skip fill values (NaN, -999, -1e34)
+3. Batch insert measurements
+
+**Example:**
+```python
+# MODIS chlorophyll: 8,052 timesteps × 85 lats × 98 lons
+# Full grid: 67M potential measurements
+# After spatial filter: 7,332 cells within study area
+# Extracted: ~200k measurements (valid data only)
+```
+
+---
+
+### Parameter Detection (v3.0)
 
 #### `detect_parameter_columns(df: pd.DataFrame)`
 
@@ -151,7 +267,8 @@ AODN_data/Dataset/
 ```python
 # Skip known metadata columns
 SKIP = ['FID', 'ID', 'DATE', 'TIME', 'LATITUDE', 'LONGITUDE', 
-        'STATION', 'SITE', 'TRIP', 'LOCATION', 'GEOM']
+        'STATION', 'SITE', 'TRIP', 'LOCATION', 'GEOM',
+        'QUALITY_CONTROL', 'QC', '_FLAG']  # ← QC filtering added v3.1
 
 # Match parameter keywords
 for col in df.columns:
@@ -174,407 +291,9 @@ detect_parameter_columns(df)
     'PH': 'ph',
     'DO_MG_L': 'dissolved_oxygen',
     'TURBIDITY_NTU': 'turbidity'
+    # 'TEMP_QUALITY_CONTROL' is excluded ✓
 }
 ```
-
----
-
-#### `infer_unit_from_column_name(col_name: str)`
-
-**Purpose:** Extract measurement unit from column name using regex patterns.
-
-**Parameters:**
-- `col_name` (str): Column name (e.g., "TEMP_C", "SALINITY_PSU")
-
-**Returns:** Unit string (str)
-
-**Patterns:**
-```python
-UNIT_PATTERNS = {
-    r'(?i)temp.*(_c|celsius)': 'degrees_celsius',
-    r'(?i)sal.*(_psu|psu)': 'PSU',
-    r'(?i)(do|dissolved.*oxygen).*(_mg|mg/l)': 'mg/L',
-    r'(?i)(nitrate|no3).*(_um|umol)': 'umol/L',
-    r'(?i)chl.*(_a|a\b).*(_ug|ug/l)': 'ug/L',
-    r'(?i)turb.*(_ntu|ntu)': 'NTU',
-    r'(?i)ph': 'pH',
-    # ... 20+ patterns
-}
-```
-
-**Examples:**
-```python
-infer_unit_from_column_name('TEMP_C')
-# Returns: 'degrees_celsius'
-
-infer_unit_from_column_name('SALINITY_PSU')
-# Returns: 'PSU'
-
-infer_unit_from_column_name('DO_SAT_%')
-# Returns: 'percent'
-
-infer_unit_from_column_name('UNKNOWN_PARAM')
-# Returns: 'unknown'
-```
-
----
-
-### ENHANCED: CSV Measurement Extractor
-
-#### `class CSVMeasurementExtractor` (v3.0)
-
-**Purpose:** Extracts measurements from CSV files with **multi-parameter row support**.
-
-**Constructor:**
-```python
-extractor = CSVMeasurementExtractor(param_mapping)
-```
-
-##### `extract(file_path, metadata, limit=None)`
-
-**Purpose:** Extracts measurement rows from CSV, **creating multiple records per row**.
-
-**Parameters:**
-- `file_path` (str): Path to CSV file
-- `metadata` (dict): Dataset metadata (id, uuid)
-- `limit` (int): Max rows to extract (optional)
-
-**Returns:** List of measurement dictionaries
-
-**NEW Behavior (v3.0):**
-
-1. **Detect parameter columns** (not just value column)
-2. **For each CSV row:**
-   - Parse timestamp once
-   - Extract depth once (if present)
-   - **Loop through parameter columns**
-   - Create separate measurement record for each parameter
-3. **Infer units** from column names if not in mapping
-
-**Output Schema:**
-```python
-# Single CSV row generates multiple measurement records:
-[
-    {
-        'time': datetime(2020, 6, 15, 10, 30),
-        'uuid': 'abc123...',
-        'metadata_id': 47,
-        'parameter_code': 'TEMPERATURE',
-        'namespace': 'custom',
-        'value': 15.2,
-        'uom': 'degrees_celsius',
-        'depth_m': 5.0,
-        'quality_flag': 1,
-        'location_id': None,
-        'location_qc_flag': 'unknown'
-    },
-    {
-        'time': datetime(2020, 6, 15, 10, 30),  # Same timestamp
-        'uuid': 'abc123...',
-        'metadata_id': 47,
-        'parameter_code': 'SALINITY',  # Different parameter
-        'namespace': 'custom',
-        'value': 35.1,
-        'uom': 'PSU',
-        'depth_m': 5.0,
-        'quality_flag': 1,
-        'location_id': None,
-        'location_qc_flag': 'unknown'
-    },
-    # ... one record per detected parameter column
-]
-```
-
-**Error Handling:**
-- Tries multiple encodings: `utf-8`, `latin1`, `iso-8859-1`
-- Skips bad lines: `on_bad_lines='skip'`
-- Skips NaN values in parameter columns
-- Logs failed rows to `self.failed_count`
-- Continues processing after individual row failures
-
----
-
-### Location Patching Functions (Unchanged from v2.1)
-
-#### `extract_station_info_from_file(file_path, dataset_title)`
-
-**Purpose:** Extracts station name, latitude, longitude from data file headers.
-
-**Parameters:**
-- `file_path` (str): Path to CSV or NetCDF file
-- `dataset_title` (str): Fallback station name
-
-**Returns:** Tuple `(station_name, latitude, longitude)` or `(None, None, None)`
-
-**Logic:**
-
-**NetCDF Extraction:**
-```python
-# Station name priority
-for attr in ['station_name', 'site_code', 'platform_code', 'title', 'id']:
-    if hasattr(ds, attr):
-        station = str(getattr(ds, attr))
-
-# Latitude priority
-for lat_name in ['LATITUDE', 'latitude', 'lat']:
-    if lat_name in ds.variables:
-        lat = float(ds.variables[lat_name][0])
-
-# Longitude priority
-for lon_name in ['LONGITUDE', 'longitude', 'lon']:
-    if lon_name in ds.variables:
-        lon = float(ds.variables[lon_name][0])
-```
-
-**CSV Extraction:**
-```python
-# Normalize columns to uppercase
-df.columns = [c.upper().strip() for c in df.columns]
-
-# Find LATITUDE column
-lat_col = ['LATITUDE', 'LAT', 'START_LAT', 'DECIMAL_LAT']
-
-# Find LONGITUDE column
-lon_col = ['LONGITUDE', 'LON', 'LONG', 'START_LON', 'DECIMAL_LONG']
-
-# Find STATION column (NEW: Added ESTUARY_SITE for v3.0)
-station_col = ['STATION', 'SITE', 'SITE_CODE', 'STATION_NAME', 'TRIP_CODE', 'ESTUARY_SITE']
-```
-
----
-
-#### `patch_location_coordinates(lat, lon)`
-
-**Purpose:** Applies location cleaning rules and validates coordinates.
-
-**Parameters:**
-- `lat` (float): Latitude value
-- `lon` (float): Longitude value
-
-**Returns:** Tuple `(patched_lat, patched_lon, qc_flag)`
-
-**QC Flag Values:**
-
-| Flag | Meaning |
-|------|--------|
-| `clean` | No modifications needed |
-| `lat_sign_flipped` | Fixed positive latitude (Tasmania is southern hemisphere) |
-| `lon_normalized` | Converted longitude to -180..180 range |
-| `outside_tasmania` | Valid coordinates but outside Tasmania bounding box |
-| `outlier_flagged` | Invalid coordinates (\|lat\| > 90 or \|lon\| > 180) |
-| `missing_coordinates` | Lat or lon is None |
-
-**Validation Rules:**
-
-```python
-# Fix positive latitudes (Tasmania should be negative)
-if lat > 0 and lat < 90:
-    lat = -lat
-    qc_flag = 'lat_sign_flipped'
-
-# Normalize longitude to -180..180
-if lon > 180:
-    lon = lon - 360
-elif lon < -180:
-    lon = lon + 360
-
-# Tasmania bounds check
-if not (-45 < lat < -40 and 144 < lon < 150):
-    qc_flag = 'outside_tasmania'
-```
-
----
-
-#### `get_or_insert_location(conn, station, lat, lon)`
-
-**Purpose:** Inserts location into `locations` table or retrieves existing ID.
-
-**Parameters:**
-- `conn` (psycopg2.connection): Database connection
-- `station` (str): Station name
-- `lat` (float): Latitude
-- `lon` (float): Longitude
-
-**Returns:** `location_id` (int) or `None` on failure
-
-**SQL Logic:**
-```sql
-INSERT INTO locations (location_name, latitude, longitude, location_geom)
-VALUES (%s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-ON CONFLICT (latitude, longitude)
-DO UPDATE SET location_name = EXCLUDED.location_name
-RETURNING id;
-```
-
----
-
-### Parameter Mapping (Unchanged)
-
-#### `class ParameterMapping`
-
-**Purpose:** Loads and manages parameter standardization mappings.
-
-**Constructor:**
-```python
-mapping = ParameterMapping(DB_CONFIG)
-```
-
-**Methods:**
-
-##### `get_standard_param(raw_param)`
-
-**Purpose:** Maps raw parameter name to standardized tuple.
-
-**Parameters:**
-- `raw_param` (str): Raw parameter name from data file
-
-**Returns:** Tuple `(parameter_code, namespace, uom)`
-
-**Behavior:**
-- Checks database mappings first
-- Falls back to `(raw_param, 'custom', 'unknown')` if not found
-- **v3.0 Integration:** Called after parameter detection and unit inference
-
----
-
-### Time Format Detection (Unchanged)
-
-#### `class TimeFormatDetector`
-
-**Purpose:** Automatically detects and converts various time formats.
-
-##### `detect_and_convert(time_value)`
-
-**Purpose:** Attempts multiple time format conversions.
-
-**Supported Formats:**
-
-| Format | Example | Detection Logic |
-|--------|---------|----------------|
-| ISO 8601 | `"2020-06-15T10:30:00"` | `pd.to_datetime()` |
-| Decimal Year | `2020.5` | `1900 < val < 2100` with fractional part |
-| Year Integer | `2020` | `1900 < val < 2100` without fraction |
-| Months since 1900 | `1400` | `1000 < val < 2000` |
-| Days since 1900 | `44000` | `40000 < val < 50000` |
-| Days since 1970 | `18000` | `15000 < val < 25000` |
-| Unix Timestamp | `1592216400` | `val > 1e8` |
-
----
-
-### NetCDF Measurement Extractor (Unchanged)
-
-#### `class NetCDFMeasurementExtractor`
-
-**Purpose:** Extracts measurements from NetCDF files following CF conventions.
-
-**Constructor:**
-```python
-extractor = NetCDFMeasurementExtractor(param_mapping)
-```
-
-##### `extract(file_path, metadata, limit=None)`
-
-**Purpose:** Extracts measurement rows from NetCDF.
-
----
-
-### Batch Insertion (Unchanged)
-
-#### `class MeasurementBatchInserter`
-
-**Purpose:** Handles bulk database insertion with batching.
-
-**Configuration:**
-```python
-BATCH_SIZE = 1000  # Rows per transaction
-```
-
-**SQL:**
-```sql
-INSERT INTO measurements
-(time, uuid, parameter_code, namespace, value, uom, 
- uncertainty, depth_m, metadata_id, quality_flag, location_id)
-VALUES %s
-ON CONFLICT DO NOTHING
-```
-
----
-
-## Main ETL Pipeline
-
-### Command-Line Interface
-
-```bash
-python populate_measurements.py [--limit N] [--dataset "Title"]
-```
-
-**Options:**
-
-| Flag | Description | Example |
-|------|-------------|--------|
-| `--limit N` | Max rows per dataset | `--limit 5000` |
-| `--dataset "Title"` | Process specific dataset | `--dataset "Chlorophyll"` |
-
----
-
-## Usage Examples
-
-### Process All Empty Datasets
-
-```bash
-python populate_measurements.py
-```
-
-Processes all datasets with 0 measurements, extracting **all parameters** from each CSV row.
-
-### Process Specific Water Quality Dataset
-
-```bash
-python populate_measurements.py --dataset "Estuarine Health in Tasmania"
-```
-
-Targets a specific multi-parameter water quality dataset.
-
-### Test with Limited Records
-
-```bash
-python populate_measurements.py --dataset "Nearshore temperature" --limit 1000
-```
-
-Extracts max 1000 **CSV rows** (which may generate 1000-5000 measurement records depending on parameters per row).
-
----
-
-## Logging
-
-### Example Output (v3.0)
-
-```
-======================================================================
-📊 Processing: Estuarine Health in Tasmania, status and indicators: water quality
-======================================================================
-  📍 Extracting location from: AODN_data/Estuarine_Health/.../data.csv
-  ✓ Location: North West Bay - Site NTNW1 (-43.0239, 147.2709) [clean]
-  ✓ Location ID: 12
-  📄 Extracting CSV: water_quality.csv
-  ✓ Detected 15 parameter columns: ['temperature', 'salinity', 'ph', 'dissolved_oxygen', 'turbidity']...
-  ✓ Patched 2790 rows with location_id=12
-  💾 Inserting 2790 measurements...
-  Inserted 1000/1000 rows (total: 1000)
-  Inserted 1000/1000 rows (total: 2000)
-  Inserted 790/790 rows (total: 2790)
-
-======================================================================
-✅ ETL Complete
-======================================================================
-Total inserted:        385432
-Total failed:          1247
-CSV extracted:         343221 (1100 failed)
-NetCDF extracted:      42211 (147 failed)
-======================================================================
-```
-
-**Notice:** 186 CSV rows × 15 parameters = 2,790 measurement records
 
 ---
 
@@ -594,197 +313,129 @@ CREATE TABLE measurements (
     uncertainty DOUBLE PRECISION,
     depth_m NUMERIC,
     metadata_id INTEGER REFERENCES metadata(id),
-    quality_flag SMALLINT DEFAULT 1,
+    quality_flag SMALLINT DEFAULT 1,  -- Only values 1-2 stored
     location_id BIGINT REFERENCES locations(id),
     PRIMARY KEY (time, data_id)
 );
 ```
 
----
-
-## Performance Impact of v3.0
-
-### Measurement Record Multiplication
-
-| Dataset Type | CSV Rows | Params/Row | Output Records | Time |
-|--------------|----------|-----------|---------------|------|
-| Temperature only | 343,355 | 1-2 | ~350k | 5 min |
-| Water quality (multi-param) | 186 | 15-20 | ~3k | <1 min |
-| Oceanography (full profile) | 39,120 | 5-8 | ~200k | 8 min |
-
-**Key Insight:** Multi-parameter datasets generate **more measurement records** but process **faster per CSV row** because they're typically smaller files.
+**Important Notes:**
+- **`quality_flag`** stores the measurement quality (1=good, 2=probably good)
+- **QC columns are NOT stored** (e.g., no `TEMP_QUALITY_CONTROL` records)
+- **Bad data (QC=4) is excluded** before insertion
 
 ---
 
-## Migration Guide (v2.1 → v3.0)
+## Performance Impact of v3.1
+
+### Gridded NetCDF Datasets
+
+| Dataset | Grid Size | Study Area Cells | Timesteps | Measurements |
+|---------|-----------|------------------|-----------|-------------|
+| Ocean Acidification | 1×1 | 1 | 1,716 | ~12k |
+| SST GAMSSA | 3×4 | 4 | 6,213 | ~25k |
+| MODIS Chlorophyll | 85×98 | 7,332 | 8,052 | ~59M* |
+
+*MODIS was **not extracted** due to memory constraints. Consider spatial aggregation or temporal subsampling.
+
+### QC Column Filtering Impact
+
+**Before v3.1:**
+- 19,301,185 total records
+- 8,276,395 QC column records (42.5%)
+- Database size: ~1.2 GB
+
+**After v3.1 + Cleanup:**
+- 12,028,987 quality-controlled measurements
+- 0 QC column records ✓
+- Database size: ~700 MB
+- **37.7% reduction in database size**
+
+---
+
+## Migration Guide (v3.0 → v3.1)
 
 ### Breaking Changes
 
-**None** - v3.0 is fully backward compatible:
-- Single-parameter CSVs still work (detected as 1 parameter column)
-- Long format CSVs (with parameter column) still work
-- NetCDF extraction unchanged
-- Database schema unchanged
+**None** - v3.1 is fully backward compatible.
 
 ### New Capabilities
 
-1. **Water quality datasets** now fully supported (previously required manual parameter column)
-2. **Unit inference** reduces dependency on `parameter_mappings` table
-3. **IMOS/AODN column patterns** recognized automatically
+1. **Gridded NetCDF datasets** now extractable (SST, ocean acidification)
+2. **QC columns automatically filtered** (no manual cleanup needed)
+3. **Bad data excluded** before insertion (QC flag = 4)
 
-### Recommended Actions
+### Recommended Actions After Upgrade
 
-1. **Re-run on previously failed datasets:**
+1. **Run one-time QC cleanup** (if upgrading from pre-v3.1):
    ```sql
-   -- Find datasets with 0 measurements
-   SELECT m.title FROM metadata m
-   LEFT JOIN measurements mes ON m.id = mes.metadata_id
-   GROUP BY m.id HAVING COUNT(mes.data_id) = 0;
+   -- Delete bad wave measurements (QC flag = 4)
+   DELETE FROM measurements m
+   USING measurements qc
+   WHERE qc.parameter_code LIKE '%_QUALITY_CONTROL'
+     AND m.parameter_code = REPLACE(qc.parameter_code, '_QUALITY_CONTROL', '')
+     AND m.time = qc.time
+     AND m.location_id = qc.location_id
+     AND qc.value = 4;
+   
+   -- Delete all QC columns
+   DELETE FROM measurements
+   WHERE parameter_code LIKE '%QUALITY_CONTROL%'
+      OR parameter_code LIKE '%_QC%'
+      OR parameter_code LIKE '%_FLAG%';
+   
+   -- Reclaim space
+   VACUUM FULL measurements;
    ```
 
-2. **Test on sample dataset:**
+2. **Re-extract gridded datasets:**
    ```bash
-   python populate_measurements.py --dataset "Estuarine Health" --limit 10
+   python populate_measurements.py --dataset "Ocean acidification"
+   python populate_measurements.py --dataset "GAMSSA"
    ```
 
-3. **Verify parameter detection:**
+3. **Verify no QC columns remain:**
    ```sql
-   SELECT parameter_code, namespace, uom, COUNT(*) 
+   SELECT parameter_code, COUNT(*) 
    FROM measurements 
-   WHERE metadata_id = YOUR_DATASET_ID
-   GROUP BY parameter_code, namespace, uom;
+   WHERE parameter_code LIKE '%QUALITY%' 
+      OR parameter_code LIKE '%_QC%'
+   GROUP BY parameter_code;
+   -- Should return 0 rows
    ```
 
 ---
 
 ## Troubleshooting
 
-### No Parameters Detected
-
-**Symptom:**
-```
-⚠ No parameter columns detected in water_quality.csv
-```
-
-**Solutions:**
-1. Check column names match keywords in `PARAMETER_KEYWORDS` dict
-2. Ensure columns aren't in metadata skip list (FID, ID, TIME, etc.)
-3. Add custom keywords to `PARAMETER_KEYWORDS` if needed
-
-### Wrong Units Inferred
+### QC Columns Still Being Extracted
 
 **Symptom:**
 ```sql
-SELECT DISTINCT parameter_code, uom FROM measurements WHERE uom = 'unknown';
+SELECT parameter_code FROM measurements WHERE parameter_code LIKE '%QUALITY%';
+-- Returns rows
 ```
 
-**Solutions:**
-1. Add unit pattern to `UNIT_PATTERNS` dict
-2. OR add explicit mapping to `parameter_mappings` table
-3. Rerun ETL to update records
+**Solution:** Ensure you're running v3.1+:
+```bash
+grep "v3.1" populate_measurements.py
+# Should show: Script Version: 3.1
+```
 
-### Duplicate Measurement Records
+### Memory Error on Large Gridded Datasets
 
 **Symptom:**
 ```
-INSERT conflict: (time, uuid, parameter_code, depth_m) already exists
+python populate_measurements.py --dataset "MODIS"
+Killed
 ```
 
-**Cause:** Running ETL twice on same dataset
+**Cause:** Dataset has too many grid cells (7,332 cells × 8,052 timesteps = 59M measurements)
 
-**Solution:** This is **expected behavior** - `ON CONFLICT DO NOTHING` silently skips duplicates.
-
----
-
-## Extension Points
-
-### Adding Custom Parameter Keywords
-
-Edit `PARAMETER_KEYWORDS` dict:
-
-```python
-PARAMETER_KEYWORDS = {
-    # ... existing keywords ...
-    'custom_param': ['my_param', 'alt_param_name'],
-}
-```
-
-### Adding Custom Unit Patterns
-
-Edit `UNIT_PATTERNS` dict:
-
-```python
-UNIT_PATTERNS = {
-    # ... existing patterns ...
-    r'(?i)my_param.*(_custom|custom)': 'custom_unit',
-}
-```
-
-### Disabling Multi-Parameter Extraction
-
-If you need to revert to v2.1 behavior (single value column):
-
-```python
-# In CSVMeasurementExtractor.extract()
-# Replace:
-param_cols = detect_parameter_columns(df)
-
-# With:
-value_col = self._find_column(df, cols_upper, ['VALUE', 'CONCENTRATION'])
-param_cols = {value_col: 'unknown_parameter'}
-```
-
----
-
-## Testing
-
-### Unit Test Example (v3.0)
-
-```python
-import unittest
-from populate_measurements import detect_parameter_columns, infer_unit_from_column_name
-
-class TestMultiParameterExtraction(unittest.TestCase):
-    def test_parameter_detection(self):
-        df = pd.DataFrame(columns=['TIME', 'TEMP_C', 'SALINITY_PSU', 'LATITUDE'])
-        params = detect_parameter_columns(df)
-        self.assertIn('TEMP_C', params)
-        self.assertIn('SALINITY_PSU', params)
-        self.assertNotIn('LATITUDE', params)  # Metadata column
-    
-    def test_unit_inference(self):
-        self.assertEqual(infer_unit_from_column_name('TEMP_C'), 'degrees_celsius')
-        self.assertEqual(infer_unit_from_column_name('SALINITY_PSU'), 'PSU')
-        self.assertEqual(infer_unit_from_column_name('UNKNOWN'), 'unknown')
-```
-
----
-
-## Integration with ETL Pipeline
-
-### Pipeline Order
-
-1. populate_metadata.py
-2. populate_parameter_mappings.py
-3. **populate_measurements.py** ← You are here (v3.0)
-4. populate_spatial.py
-5. populate_biological.py
-
-### Data Dependencies
-
-**Requires:**
-- `metadata.id` - From populate_metadata.py
-- `metadata.dataset_path` - Dataset file location
-- `parameter_mappings` table - Parameter standardization (optional with v3.0)
-
-**Produces:**
-- `measurements.data_id` - Primary key for time series data
-- `locations.id` - Spatial reference for measurements
-
-**Consumed By:**
-- Query API - Time series queries
-- Visualization dashboards - Plotting and mapping
-- Quality control scripts - Data validation
+**Solutions:**
+1. Skip satellite chlorophyll (use in-situ data instead)
+2. Implement streaming insertion (process one grid cell at a time)
+3. Increase swap space or available RAM
 
 ---
 
@@ -793,13 +444,12 @@ class TestMultiParameterExtraction(unittest.TestCase):
 - [Project README](../README.md)
 - [Database Schema Documentation](database_schema.md)
 - [ETL Guide](ETL_GUIDE.md)
-- [Parameter Mapping Documentation](populate_parameter_mappings_detail.md)
+- [init.sql - QC Cleanup Notes](../init.sql)
+- [IMOS Quality Control Procedures](http://imos.org.au/quality.html)
 - [CF Conventions](http://cfconventions.org/)
-- [NetCDF4-Python Documentation](https://unidata.github.io/netcdf4-python/)
-- [cftime Documentation](https://unidata.github.io/cftime/)
 
 ---
 
 *Last Updated: December 27, 2025*  
-*Script Version: 3.0*  
+*Script Version: 3.1*  
 *Maintained by: Huon Channel Marine Analytics Project*
