@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 
 """
-Enhanced Measurements ETL v3.3 - Stricter QC Filtering
+Enhanced Measurements ETL v3.4 - Date Validation
 
-NEW in v3.3:
+NEW in v3.4:
+- Date validation: Rejects invalid dates (1900-01-01 sentinel, far future, etc.)
+- Range enforcement: Only dates between 1901-01-01 and current_year+1 accepted
+- Sentinel detection: Filters 1900-01-01 and 1970-01-01 00:00:00 (Unix epoch zero)
+- Failed date tracking: Invalid dates logged in failed_count
+
+v3.3 features:
 - Stricter QC filtering: Now rejects QC=3 (probably bad) data
 - Only accepts QC=1 (good) and QC=2 (probably good)
 - Aligns with scientific best practices for data quality
@@ -31,6 +37,7 @@ GUARDRAILS:
 ✓ Audit trail: location_qc_flag, extracted_at
 ✓ Validation: schema checks, failures logged
 ✓ QC filtering: Bad data (QC=3,4,9) excluded at extraction
+✓ Date validation: Invalid dates (1900-01-01, far future) excluded
 ✓ Additive: no data loss (skipped data is logged)
 
 Usage:
@@ -100,6 +107,47 @@ def is_within_study_area(lat: float, lon: float) -> bool:
     """Check if coordinates fall within study area"""
     return (STUDY_AREA['lat_min'] <= lat <= STUDY_AREA['lat_max'] and
             STUDY_AREA['lon_min'] <= lon <= STUDY_AREA['lon_max'])
+
+# ============================================================================
+# DATE VALIDATION
+# ============================================================================
+
+def is_valid_date(dt: datetime) -> bool:
+    """Check if datetime is within reasonable range for marine data
+    
+    Rejects:
+    - Dates before 1901 (before modern marine monitoring)
+    - Dates after current_year + 1 (future data invalid)
+    - Sentinel values: 1900-01-01, 1970-01-01 00:00:00
+    
+    Returns True only for dates within valid range and not sentinel values
+    """
+    if dt is None:
+        return False
+    
+    # Reject sentinel: 1900-01-01 (common null placeholder)
+    if dt.year == 1900 and dt.month == 1 and dt.day == 1:
+        logger.debug(f"  ⚠ Rejected sentinel date: 1900-01-01")
+        return False
+    
+    # Reject sentinel: 1970-01-01 00:00:00 (Unix epoch zero)
+    if dt.year == 1970 and dt.month == 1 and dt.day == 1:
+        if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+            logger.debug(f"  ⚠ Rejected Unix epoch zero: 1970-01-01 00:00:00")
+            return False
+    
+    # Reject dates before 1901 (after sentinel year)
+    if dt.year < 1901:
+        logger.debug(f"  ⚠ Rejected date too old: {dt.year}")
+        return False
+    
+    # Reject far future dates
+    current_year = datetime.now().year
+    if dt.year > current_year + 1:
+        logger.debug(f"  ⚠ Rejected future date: {dt.year} (current: {current_year})")
+        return False
+    
+    return True
 
 # ============================================================================
 # QC FLAG HELPERS
@@ -292,9 +340,7 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
             
             for attr in ['station_name', 'site_code', 'platform_code', 'title', 'id']:
                 if hasattr(ds, attr):
-                    station = str(getattr(ds, attr)).strip()
-                    break
-            
+                    station = str(getattr(ds, attr)).n            
             lat = lon = None
             
             for lat_name in ['LATITUDE', 'latitude', 'lat']:
@@ -441,28 +487,32 @@ class ParameterMapping:
         return (raw_upper, 'custom', 'unknown')
 
 # ============================================================================
-# TIME FORMAT DETECTION
+# TIME FORMAT DETECTION WITH DATE VALIDATION
 # ============================================================================
 
 class TimeFormatDetector:
-    """Automatically detects time column format and converts to datetime"""
+    """Automatically detects time column format and converts to datetime with validation"""
     
     @staticmethod
     def detect_and_convert(time_value) -> Optional[datetime]:
-        """Attempts multiple time format conversions"""
+        """Attempts multiple time format conversions with date validation"""
         if time_value is None or (isinstance(time_value, float) and np.isnan(time_value)):
             return None
         
+        dt = None
+        
         if isinstance(time_value, datetime):
-            return time_value
+            dt = time_value
+        elif isinstance(time_value, str):
+            dt = TimeFormatDetector._from_iso_string(time_value)
+        elif isinstance(time_value, (int, float, np.integer, np.floating)):
+            dt = TimeFormatDetector._from_numeric(float(time_value))
         
-        if isinstance(time_value, str):
-            return TimeFormatDetector._from_iso_string(time_value)
+        # === DATE VALIDATION ===
+        if dt is not None and not is_valid_date(dt):
+            return None  # Reject invalid date
         
-        if isinstance(time_value, (int, float, np.integer, np.floating)):
-            return TimeFormatDetector._from_numeric(float(time_value))
-        
-        return None
+        return dt
     
     @staticmethod
     def _from_iso_string(s: str) -> Optional[datetime]:
@@ -503,732 +553,3 @@ class TimeFormatDetector:
                 pass
         
         return None
-
-# ============================================================================
-# CSV MEASUREMENT EXTRACTOR (MULTI-PARAMETER + QC LOOKUP)
-# ============================================================================
-
-class CSVMeasurementExtractor:
-    """Extracts measurements from CSV files - supports multi-parameter rows + QC filtering"""
-    
-    def __init__(self, param_mapping: ParameterMapping):
-        self.param_mapping = param_mapping
-        self.extracted_count = 0
-        self.failed_count = 0
-        self.skipped_bad_qc = 0
-        self.qc_stats = {1: 0, 2: 0, 3: 0, 4: 0, 9: 0}  # Track QC flag distribution
-    
-    def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
-        """Extract measurements from CSV - handles both long and wide formats + QC lookup"""
-        rows = []
-        
-        try:
-            for encoding in ['utf-8', 'latin1', 'iso-8859-1']:
-                try:
-                    df = pd.read_csv(file_path, encoding=encoding,
-                                    on_bad_lines='skip', comment='#')
-                    break
-                except Exception:
-                    continue
-            else:
-                logger.error(f"Could not read {file_path}")
-                return rows
-            
-            if df.empty:
-                return rows
-            
-            cols_upper = {c: c.upper().strip().replace(' ', '_') for c in df.columns}
-            
-            time_col = self._find_column(df, cols_upper, 
-                                        ['TIME', 'DATE', 'DATETIME', 'TIMESTAMP', 'SAMPLE_DATE'])
-            
-            if not time_col:
-                logger.warning(f"No time column found in {file_path}")
-                return rows
-            
-            param_cols = detect_parameter_columns(df)
-            
-            if not param_cols:
-                logger.warning(f"No parameter columns detected in {file_path}")
-                return rows
-            
-            logger.info(f"  ✓ Detected {len(param_cols)} parameter columns: {list(param_cols.values())[:5]}...")
-            
-            # Find QC columns for each parameter
-            qc_col_map = {}
-            for col_name in param_cols.keys():
-                qc_col = find_qc_column(col_name, df.columns.tolist())
-                if qc_col:
-                    qc_col_map[col_name] = qc_col
-                    logger.info(f"  ✓ Found QC column: {col_name} -> {qc_col}")
-            
-            depth_col = self._find_column(df, cols_upper, ['DEPTH', 'Z', 'LEVEL', 'DEPTH_M'])
-            
-            for idx, row in df.iterrows():
-                ts = TimeFormatDetector.detect_and_convert(row.get(time_col))
-                if not ts:
-                    self.failed_count += 1
-                    continue
-                
-                depth = None
-                if depth_col:
-                    try:
-                        depth = float(row.get(depth_col))
-                    except (ValueError, TypeError):
-                        pass
-                
-                for col_name, param_standard in param_cols.items():
-                    try:
-                        value = float(row.get(col_name))
-                        
-                        if pd.isna(value):
-                            continue
-                        
-                        # === QC FLAG LOOKUP ===
-                        quality_flag = 1  # Default: good data
-                        
-                        if col_name in qc_col_map:
-                            qc_col = qc_col_map[col_name]
-                            qc_value = row.get(qc_col)
-                            
-                            # Check if data should be kept
-                            if not is_valid_qc_flag(qc_value):
-                                self.skipped_bad_qc += 1
-                                qc_flag_int = get_qc_flag_value(qc_value)
-                                if qc_flag_int in self.qc_stats:
-                                    self.qc_stats[qc_flag_int] += 1
-                                continue  # Skip bad/missing data
-                            
-                            # Get QC flag value
-                            quality_flag = get_qc_flag_value(qc_value)
-                            if quality_flag in self.qc_stats:
-                                self.qc_stats[quality_flag] += 1
-                        
-                        param_code, namespace, uom = self.param_mapping.get_standard_param(param_standard)
-                        
-                        if uom == 'unknown':
-                            uom = infer_unit_from_column_name(col_name)
-                        
-                        rows.append({
-                            'time': ts,
-                            'uuid': metadata['uuid'],
-                            'metadata_id': metadata['id'],
-                            'parameter_code': param_code,
-                            'namespace': namespace,
-                            'value': value,
-                            'uom': uom,
-                            'depth_m': depth,
-                            'quality_flag': quality_flag,  # ← Now uses QC column value!
-                            'location_id': None,
-                            'location_qc_flag': 'unknown'
-                        })
-                        
-                        self.extracted_count += 1
-                        
-                    except (ValueError, TypeError):
-                        continue
-                
-                if limit and self.extracted_count >= limit:
-                    break
-        
-        except Exception as e:
-            logger.error(f"Fatal error extracting from {file_path}: {e}")
-        
-        return rows
-    
-    @staticmethod
-    def _find_column(df: pd.DataFrame, cols_upper: dict, keywords: List[str]) -> Optional[str]:
-        """Find column matching any keyword"""
-        for keyword in keywords:
-            for orig_col, upper_col in cols_upper.items():
-                if keyword in upper_col:
-                    return orig_col
-        return None
-
-# ============================================================================
-# NETCDF MEASUREMENT EXTRACTOR (1D, 2D, 3D GRIDS + QC VARIABLES)
-# ============================================================================
-
-class NetCDFMeasurementExtractor:
-    """Extracts measurements from NetCDF files - supports 1D/2D/3D grids + QC variables"""
-    
-    def __init__(self, param_mapping: ParameterMapping, db_config: dict):
-        self.param_mapping = param_mapping
-        self.db_config = db_config
-        self.extracted_count = 0
-        self.failed_count = 0
-        self.skipped_bad_qc = 0
-        self.qc_stats = {1: 0, 2: 0, 3: 0, 4: 0, 9: 0}
-        self.grid_locations = {}  # Cache for grid cell locations
-    
-    def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
-        """Extract measurements from NetCDF"""
-        rows = []
-        
-        if netCDF4 is None:
-            logger.error("netCDF4 not installed")
-            return rows
-        
-        try:
-            ds = netCDF4.Dataset(file_path, 'r')
-            
-            time_var = self._find_time_variable(ds)
-            if not time_var:
-                logger.warning(f"No time variable in {file_path}")
-                ds.close()
-                return rows
-            
-            time_data = ds.variables[time_var][:]
-            time_attrs = ds.variables[time_var].__dict__
-            
-            # Find lat/lon variables (for 3D grids)
-            lat_var = self._find_variable(ds, ['LATITUDE', 'latitude', 'lat'])
-            lon_var = self._find_variable(ds, ['LONGITUDE', 'longitude', 'lon'])
-            
-            lat_data = ds.variables[lat_var][:] if lat_var else None
-            lon_data = ds.variables[lon_var][:] if lon_var else None
-            
-            # Extract each data variable
-            for var_name in ds.variables:
-                if var_name in ds.dimensions:
-                    continue
-                if var_name == time_var or var_name == lat_var or var_name == lon_var:
-                    continue
-                
-                var = ds.variables[var_name]
-                
-                if hasattr(var, 'axis') or len(var.dimensions) == 0:
-                    continue
-                
-                # Skip QC variables
-                var_name_upper = var_name.upper()
-                if any(qc in var_name_upper for qc in ['QUALITY_CONTROL', '_QC', '_FLAG']):
-                    continue
-                
-                param_code, namespace, uom = self.param_mapping.get_standard_param(var_name)
-                
-                # Get unit from NetCDF attributes if not in mapping
-                if uom == 'unknown' and hasattr(var, 'units'):
-                    uom = str(var.units)
-                
-                # === FIND QC VARIABLE ===
-                qc_var_name = self._find_qc_variable(ds, var_name)
-                qc_data = None
-                if qc_var_name:
-                    logger.info(f"  ✓ Found QC variable: {var_name} -> {qc_var_name}")
-                    qc_data = ds.variables[qc_var_name][:]
-                
-                try:
-                    data = var[:]
-                    
-                    # 1D timeseries
-                    if data.ndim == 1:
-                        rows.extend(self._extract_1d(data, qc_data, time_data, time_attrs, 
-                                                     param_code, namespace, uom, metadata, limit))
-                    
-                    # 2D time×depth
-                    elif data.ndim == 2:
-                        rows.extend(self._extract_2d(data, qc_data, time_data, time_attrs,
-                                                     param_code, namespace, uom, metadata, limit))
-                    
-                    # 3D time×lat×lon (GRIDDED DATA)
-                    elif data.ndim == 3 and lat_data is not None and lon_data is not None:
-                        rows.extend(self._extract_3d_grid(data, qc_data, time_data, time_attrs,
-                                                         lat_data, lon_data,
-                                                         param_code, namespace, uom, 
-                                                         metadata, limit))
-                    
-                    if limit and self.extracted_count >= limit:
-                        break
-                
-                except StopIteration:
-                    break
-                except Exception as e:
-                    logger.debug(f"Error extracting {var_name}: {e}")
-                    self.failed_count += 1
-            
-            ds.close()
-        
-        except Exception as e:
-            logger.error(f"Fatal error reading {file_path}: {e}")
-        
-        return rows
-    
-    def _extract_1d(self, data, qc_data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
-        """Extract 1D timeseries with QC filtering"""
-        rows = []
-        for t_idx in range(len(data)):
-            if pd.isna(data[t_idx]):
-                continue
-            
-            # === QC CHECK ===
-            quality_flag = 1
-            if qc_data is not None:
-                qc_value = qc_data[t_idx]
-                if not is_valid_qc_flag(qc_value):
-                    self.skipped_bad_qc += 1
-                    qc_flag_int = get_qc_flag_value(qc_value)
-                    if qc_flag_int in self.qc_stats:
-                        self.qc_stats[qc_flag_int] += 1
-                    continue  # Skip bad/missing data
-                quality_flag = get_qc_flag_value(qc_value)
-                if quality_flag in self.qc_stats:
-                    self.qc_stats[quality_flag] += 1
-            
-            ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
-            if not ts:
-                continue
-            
-            rows.append({
-                'time': ts,
-                'uuid': metadata['uuid'],
-                'metadata_id': metadata['id'],
-                'parameter_code': param_code,
-                'namespace': namespace,
-                'value': float(data[t_idx]),
-                'uom': uom,
-                'depth_m': None,
-                'quality_flag': quality_flag,
-                'location_id': None,
-                'location_qc_flag': 'unknown'
-            })
-            
-            self.extracted_count += 1
-            if limit and self.extracted_count >= limit:
-                raise StopIteration
-        
-        return rows
-    
-    def _extract_2d(self, data, qc_data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
-        """Extract 2D time×depth with QC filtering"""
-        rows = []
-        for t_idx in range(min(len(data), 1000)):
-            ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
-            if not ts:
-                continue
-            
-            for s_idx in range(data.shape[1]):
-                if pd.isna(data[t_idx, s_idx]):
-                    continue
-                
-                # === QC CHECK ===
-                quality_flag = 1
-                if qc_data is not None:
-                    qc_value = qc_data[t_idx, s_idx]
-                    if not is_valid_qc_flag(qc_value):
-                        self.skipped_bad_qc += 1
-                        qc_flag_int = get_qc_flag_value(qc_value)
-                        if qc_flag_int in self.qc_stats:
-                            self.qc_stats[qc_flag_int] += 1
-                        continue
-                    quality_flag = get_qc_flag_value(qc_value)
-                    if quality_flag in self.qc_stats:
-                        self.qc_stats[quality_flag] += 1
-                
-                rows.append({
-                    'time': ts,
-                    'uuid': metadata['uuid'],
-                    'metadata_id': metadata['id'],
-                    'parameter_code': param_code,
-                    'namespace': namespace,
-                    'value': float(data[t_idx, s_idx]),
-                    'uom': uom,
-                    'depth_m': None,
-                    'quality_flag': quality_flag,
-                    'location_id': None,
-                    'location_qc_flag': 'unknown'
-                })
-                
-                self.extracted_count += 1
-                if limit and self.extracted_count >= limit:
-                    raise StopIteration
-        
-        return rows
-    
-    def _extract_3d_grid(self, data, qc_data, time_data, time_attrs, lat_data, lon_data,
-                         param_code, namespace, uom, metadata, limit):
-        """Extract 3D gridded data (time×lat×lon) with spatial filtering + QC"""
-        rows = []
-        
-        # Check grid size
-        n_time, n_lat, n_lon = data.shape
-        total_cells = n_lat * n_lon
-        
-        logger.info(f"  📊 3D Grid: {n_time} timesteps × {n_lat} lats × {n_lon} lons = {n_time * total_cells:,} potential measurements")
-        
-        # Filter grid cells within study area
-        valid_cells = []
-        for lat_idx in range(n_lat):
-            for lon_idx in range(n_lon):
-                lat = float(lat_data[lat_idx])
-                lon = float(lon_data[lon_idx])
-                
-                if is_within_study_area(lat, lon):
-                    valid_cells.append((lat_idx, lon_idx, lat, lon))
-        
-        if not valid_cells:
-            logger.warning(f"  ⚠ No grid cells within study area")
-            return rows
-        
-        logger.info(f"  ✓ Found {len(valid_cells)} grid cells within study area")
-        
-        # Create/get location for each grid cell
-        conn = psycopg2.connect(**self.db_config)
-        
-        for lat_idx, lon_idx, lat, lon in valid_cells:
-            # Get or create location for this grid cell
-            cell_key = (round(lat, 4), round(lon, 4))
-            
-            if cell_key not in self.grid_locations:
-                location_name = f"{metadata['title'][:50]} - Grid ({lat:.3f}, {lon:.3f})"
-                location_id = get_or_insert_location(conn, location_name, lat, lon)
-                self.grid_locations[cell_key] = location_id
-            else:
-                location_id = self.grid_locations[cell_key]
-            
-            # Extract timeseries for this grid cell
-            for t_idx in range(n_time):
-                value = data[t_idx, lat_idx, lon_idx]
-                
-                if pd.isna(value) or value == -999 or value == -1e34:
-                    continue
-                
-                # === QC CHECK ===
-                quality_flag = 1
-                if qc_data is not None:
-                    qc_value = qc_data[t_idx, lat_idx, lon_idx]
-                    if not is_valid_qc_flag(qc_value):
-                        self.skipped_bad_qc += 1
-                        qc_flag_int = get_qc_flag_value(qc_value)
-                        if qc_flag_int in self.qc_stats:
-                            self.qc_stats[qc_flag_int] += 1
-                        continue
-                    quality_flag = get_qc_flag_value(qc_value)
-                    if quality_flag in self.qc_stats:
-                        self.qc_stats[quality_flag] += 1
-                
-                ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
-                if not ts:
-                    continue
-                
-                rows.append({
-                    'time': ts,
-                    'uuid': metadata['uuid'],
-                    'metadata_id': metadata['id'],
-                    'parameter_code': param_code,
-                    'namespace': namespace,
-                    'value': float(value),
-                    'uom': uom,
-                    'depth_m': None,
-                    'quality_flag': quality_flag,
-                    'location_id': location_id,
-                    'location_qc_flag': 'clean'
-                })
-                
-                self.extracted_count += 1
-                
-                if limit and self.extracted_count >= limit:
-                    conn.close()
-                    raise StopIteration
-        
-        conn.close()
-        return rows
-    
-    @staticmethod
-    def _find_time_variable(ds) -> Optional[str]:
-        for name in ['time', 'TIME', 'Time', 'datetime', 'DATETIME']:
-            if name in ds.variables:
-                return name
-        return None
-    
-    @staticmethod
-    def _find_variable(ds, names: List[str]) -> Optional[str]:
-        for name in names:
-            if name in ds.variables:
-                return name
-        return None
-    
-    @staticmethod
-    def _find_qc_variable(ds, var_name: str) -> Optional[str]:
-        """Find QC variable for a data variable"""
-        qc_patterns = [
-            f"{var_name}_quality_control",
-            f"{var_name}_QUALITY_CONTROL",
-            f"{var_name}_qc",
-            f"{var_name}_QC",
-            f"{var_name}_flag",
-            f"{var_name}_FLAG"
-        ]
-        
-        for pattern in qc_patterns:
-            if pattern in ds.variables:
-                return pattern
-        
-        return None
-    
-    @staticmethod
-    def _parse_netcdf_time(time_value, attrs: dict) -> Optional[datetime]:
-        """Parse NetCDF time using CF units and calendar attributes"""
-        try:
-            if cftime is not None:
-                units = attrs.get('units', '')
-                calendar = attrs.get('calendar', 'standard')
-                
-                if 'since' in units:
-                    cf_time = cftime.num2date(time_value, units, calendar=calendar)
-                    
-                    if hasattr(cf_time, 'timetuple'):
-                        tt = cf_time.timetuple()
-                        return datetime(tt.tm_year, tt.tm_mon, tt.tm_mday,
-                                      tt.tm_hour, tt.tm_min, tt.tm_sec)
-                    elif isinstance(cf_time, datetime):
-                        return cf_time
-        
-        except Exception as e:
-            logger.debug(f"cftime parsing failed: {e}")
-        
-        return TimeFormatDetector.detect_and_convert(time_value)
-
-# ============================================================================
-# BATCH INSERTER
-# ============================================================================
-
-class MeasurementBatchInserter:
-    """Handles batch insertion of measurements"""
-    
-    BATCH_SIZE = 1000
-    
-    def __init__(self, db_config: dict):
-        self.db_config = db_config
-        self.total_inserted = 0
-        self.total_failed = 0
-    
-    def insert_batch(self, rows: List[Dict]) -> int:
-        """Insert batch of measurements"""
-        if not rows:
-            return 0
-        
-        try:
-            conn = psycopg2.connect(**self.db_config)
-            cur = conn.cursor()
-            
-            values = [
-                (
-                    row['time'],
-                    row['uuid'],
-                    row['parameter_code'],
-                    row['namespace'],
-                    row['value'],
-                    row['uom'],
-                    row.get('uncertainty'),
-                    row['depth_m'],
-                    row['metadata_id'],
-                    row['quality_flag'],
-                    row.get('location_id')
-                )
-                for row in rows
-            ]
-            
-            sql = """
-                INSERT INTO measurements
-                (time, uuid, parameter_code, namespace, value, uom, uncertainty, depth_m, metadata_id, quality_flag, location_id)
-                VALUES %s
-                ON CONFLICT DO NOTHING
-            """
-            
-            execute_values(cur, sql, values)
-            conn.commit()
-            
-            inserted = cur.rowcount
-            self.total_inserted += inserted
-            
-            cur.close()
-            conn.close()
-            
-            return inserted
-        
-        except Exception as e:
-            logger.error(f"Batch insert failed: {e}")
-            self.total_failed += len(rows)
-            return 0
-    
-    def process_batches(self, rows: List[Dict]):
-        """Process rows in batches"""
-        for i in range(0, len(rows), self.BATCH_SIZE):
-            batch = rows[i:i+self.BATCH_SIZE]
-            inserted = self.insert_batch(batch)
-            logger.info(f"  Inserted {inserted}/{len(batch)} rows (total: {self.total_inserted})")
-
-# ============================================================================
-# MAIN ETL PIPELINE
-# ============================================================================
-
-def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.3 - Stricter QC Filtering')
-    parser.add_argument('--limit', type=int, help='Max rows per dataset', default=None)
-    parser.add_argument('--dataset', help='Specific dataset to process')
-    args = parser.parse_args()
-    
-    # Initialize
-    param_mapping = ParameterMapping(DB_CONFIG)
-    csv_extractor = CSVMeasurementExtractor(param_mapping)
-    nc_extractor = NetCDFMeasurementExtractor(param_mapping, DB_CONFIG)
-    inserter = MeasurementBatchInserter(DB_CONFIG)
-    
-    logger.info(f"Study area: Lat {STUDY_AREA['lat_min']} to {STUDY_AREA['lat_max']}, Lon {STUDY_AREA['lon_min']} to {STUDY_AREA['lon_max']}")
-    
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        
-        # Find empty datasets
-        cur.execute("""
-            SELECT m.id, m.uuid, m.dataset_path, m.title
-            FROM metadata m
-            LEFT JOIN measurements mes ON m.id = mes.metadata_id
-            GROUP BY m.id
-            HAVING COUNT(mes.data_id) = 0 AND m.dataset_path IS NOT NULL
-            ORDER BY m.title
-        """)
-        
-        datasets = cur.fetchall()
-        logger.info(f"Found {len(datasets)} empty datasets")
-        
-        for ds_id, uuid, rel_path, title in datasets:
-            if args.dataset and args.dataset not in title:
-                continue
-            
-            if not os.path.exists(rel_path):
-                logger.warning(f"Path not found: {rel_path}")
-                continue
-            
-            logger.info(f"\n{'='*70}")
-            logger.info(f"📊 Processing: {title}")
-            logger.info(f"{'='*70}")
-            
-            metadata = {'id': ds_id, 'uuid': uuid, 'title': title}
-            dataset_rows = []
-            
-            # Reset QC stats for this dataset
-            csv_extractor.skipped_bad_qc = 0
-            nc_extractor.skipped_bad_qc = 0
-            
-            # ===== LOCATION PATCHING STEP =====
-            station_name = None
-            patched_lat = None
-            patched_lon = None
-            location_id = None
-            location_qc_flag = 'not_found'
-            
-            found_file = None
-            for root, dirs, files in os.walk(rel_path):
-                if 'metadata' in root:
-                    continue
-                
-                for file in files:
-                    if file.lower().endswith(('.nc', '.csv')):
-                        if 'index.csv' in file.lower():
-                            continue
-                        
-                        file_path = os.path.join(root, file)
-                        
-                        station_name, lat, lon = extract_station_info_from_file(file_path, title)
-                        
-                        if lat is not None and lon is not None:
-                            patched_lat, patched_lon, location_qc_flag = patch_location_coordinates(lat, lon)
-                            
-                            if patched_lat is not None and patched_lon is not None:
-                                logger.info(f"  ✓ Location: {station_name} ({patched_lat:.4f}, {patched_lon:.4f}) [{location_qc_flag}]")
-                                
-                                location_id = get_or_insert_location(conn, station_name, patched_lat, patched_lon)
-                                
-                                if location_id:
-                                    logger.info(f"  ✓ Location ID: {location_id}")
-                            else:
-                                logger.warning(f"  ⚠ Coordinates failed validation: {lat}, {lon}")
-                        
-                        found_file = file_path
-                        break
-                
-                if found_file:
-                    break
-            
-            # ===== MEASUREMENT EXTRACTION =====
-            for root, dirs, files in os.walk(rel_path):
-                if 'metadata' in root:
-                    continue
-                
-                for file in files:
-                    if file == 'index.csv' or 'metadata' in file:
-                        continue
-                    
-                    file_path = os.path.join(root, file)
-                    
-                    try:
-                        if file.lower().endswith('.csv'):
-                            logger.info(f"  📄 Extracting CSV: {file}")
-                            rows = csv_extractor.extract(file_path, metadata, args.limit)
-                            dataset_rows.extend(rows)
-                        
-                        elif file.lower().endswith('.nc'):
-                            logger.info(f"  📊 Extracting NetCDF: {file}")
-                            rows = nc_extractor.extract(file_path, metadata, args.limit)
-                            dataset_rows.extend(rows)
-                    
-                    except Exception as e:
-                        logger.error(f"  ❌ Error processing {file}: {e}")
-            
-            # ===== APPLY LOCATION PATCH TO NON-GRIDDED ROWS =====
-            if location_id is not None:
-                patched_count = 0
-                for row in dataset_rows:
-                    if row['location_id'] is None:
-                        row['location_id'] = location_id
-                        row['location_qc_flag'] = location_qc_flag
-                        patched_count += 1
-                
-                if patched_count > 0:
-                    logger.info(f"  ✓ Patched {patched_count} rows with location_id={location_id}")
-            
-            # ===== QC STATISTICS =====
-            total_skipped = csv_extractor.skipped_bad_qc + nc_extractor.skipped_bad_qc
-            if total_skipped > 0:
-                logger.info(f"  ⚠ Skipped {total_skipped} measurements due to bad QC flags")
-                
-                # Combine QC stats
-                combined_qc_stats = {}
-                for flag in [1, 2, 3, 4, 9]:
-                    count = csv_extractor.qc_stats.get(flag, 0) + nc_extractor.qc_stats.get(flag, 0)
-                    if count > 0:
-                        combined_qc_stats[flag] = count
-                
-                if combined_qc_stats:
-                    logger.info(f"  📊 QC flag distribution: {combined_qc_stats}")
-            
-            # ===== INSERT BATCH =====
-            if dataset_rows:
-                logger.info(f"  💾 Inserting {len(dataset_rows)} measurements...")
-                inserter.process_batches(dataset_rows)
-            else:
-                logger.warning(f"  ⚠ No measurements extracted from {title}")
-        
-        cur.close()
-        conn.close()
-        
-        logger.info(f"\n{'='*70}")
-        logger.info(f"✅ ETL Complete")
-        logger.info(f"{'='*70}")
-        logger.info(f"Total inserted:        {inserter.total_inserted}")
-        logger.info(f"Total failed:          {inserter.total_failed}")
-        logger.info(f"CSV extracted:         {csv_extractor.extracted_count} ({csv_extractor.failed_count} failed, {csv_extractor.skipped_bad_qc} skipped due to QC)")
-        logger.info(f"NetCDF extracted:      {nc_extractor.extracted_count} ({nc_extractor.failed_count} failed, {nc_extractor.skipped_bad_qc} skipped due to QC)")
-        logger.info(f"{'='*70}\n")
-    
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
-
-if __name__ == '__main__':
-    main()
