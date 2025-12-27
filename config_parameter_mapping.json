@@ -410,6 +410,71 @@
       "LATITUDE",
       "cf",
       "Degrees"
+    ],
+    "ANALYSED_SST": [
+      "SST_ANL",
+      "custom",
+      "kelvin"
+    ],
+    "SWH_KU": [
+      "SWH_KU",
+      "custom",
+      "meters"
+    ],
+    "SIG0_KU": [
+      "SIG0_KU",
+      "custom",
+      "dB"
+    ],
+    "WSPD": [
+      "WSPD",
+      "custom",
+      "m/s"
+    ],
+    "UWND": [
+      "UWND",
+      "custom",
+      "m/s"
+    ],
+    "VWND": [
+      "VWND",
+      "custom",
+      "m/s"
+    ],
+    "BOT_DEPTH": [
+      "DEPTH_BOT",
+      "custom",
+      "meters"
+    ],
+    "DIST2COAST": [
+      "DIST2COAST",
+      "custom",
+      "meters"
+    ],
+    "WSPD_CAL": [
+      "WSPD_CAL",
+      "custom",
+      "m/s"
+    ],
+    "SWH_KU_STD_DEV": [
+      "SWH_KU_STD",
+      "custom",
+      "meters"
+    ],
+    "SIG0_KU_STD_DEV": [
+      "SIG0_KU_STD",
+      "custom",
+      "dB"
+    ],
+    "SWH_KU_NUM_OBS": [
+      "SWH_KU_NOB",
+      "custom",
+      "count"
+    ],
+    "SIG0_KU_NUM_OBS": [
+      "SIG0_KU_NOB",
+      "custom",
+      "count"
     ]
   },
   "time_format_hints": {
@@ -444,5 +509,5 @@
     "4": "Missing data",
     "9": "Unknown"
   },
-  "notes": "Add custom parameter mappings by extending the 'parameter_mapping' object. Keys are uppercase variable names as they appear in source files."
+  "notes": "v3.6: Added Satellite Altimetry Calibration parameters (ANALYSED_SST, SWH_KU, SIG0_KU, etc.) based on 118K records analysis [file:102]. CNDC confirmed correct for SBE37 CTD moorings (Storm Bay satellite validation)."
 }
