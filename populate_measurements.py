@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Enhanced Measurements ETL v3.2 - QC Flag Lookup + Bad Data Filtering
+Enhanced Measurements ETL v3.3 - Stricter QC Filtering
 
-NEW in v3.2:
+NEW in v3.3:
+- Stricter QC filtering: Now rejects QC=3 (probably bad) data
+- Only accepts QC=1 (good) and QC=2 (probably good)
+- Aligns with scientific best practices for data quality
+
+v3.2 features:
 - QC flag lookup: Reads QC column values (e.g., TEMP_QUALITY_CONTROL)
 - Bad data filtering: Skips measurements where QC flag = 4 (bad) or 9 (missing)
 - QC statistics: Tracks skipped measurements and QC flag distribution
@@ -25,7 +30,7 @@ GUARDRAILS:
 ✓ Upsert-safe: INSERT ... ON CONFLICT DO NOTHING
 ✓ Audit trail: location_qc_flag, extracted_at
 ✓ Validation: schema checks, failures logged
-✓ QC filtering: Bad data (QC=4,9) excluded at extraction
+✓ QC filtering: Bad data (QC=3,4,9) excluded at extraction
 ✓ Additive: no data loss (skipped data is logged)
 
 Usage:
@@ -139,20 +144,20 @@ def is_valid_qc_flag(qc_value) -> bool:
     """Check if QC flag indicates good data
     
     IMOS QC flags:
-        1 = Good data
-        2 = Probably good data
-        3 = Probably bad data
+        1 = Good data (ACCEPT)
+        2 = Probably good data (ACCEPT)
+        3 = Probably bad data (REJECT)
         4 = Bad data (REJECT)
         9 = Missing data (REJECT)
     
-    Returns True if data should be kept (QC flag 1, 2, or 3)
+    Returns True if data should be kept (QC flag 1 or 2 only)
     """
     if pd.isna(qc_value):
         return True  # No QC flag = assume good
     
     try:
         qc_int = int(float(qc_value))
-        return qc_int in [1, 2, 3]  # Accept good, probably good, probably bad
+        return qc_int in [1, 2]  # Accept only good and probably good
     except (ValueError, TypeError):
         return True  # Invalid QC value = assume good
 
@@ -1061,7 +1066,7 @@ class MeasurementBatchInserter:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.2 - QC Flag Lookup + Bad Data Filtering')
+    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.3 - Stricter QC Filtering')
     parser.add_argument('--limit', type=int, help='Max rows per dataset', default=None)
     parser.add_argument('--dataset', help='Specific dataset to process')
     args = parser.parse_args()
