@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 
 """
-Enhanced Measurements ETL v3.1 - Multi-Parameter CSV + 3D Gridded NetCDF Support
+Enhanced Measurements ETL v3.2 - QC Flag Lookup + Bad Data Filtering
 
-NEW in v3.1:
+NEW in v3.2:
+- QC flag lookup: Reads QC column values (e.g., TEMP_QUALITY_CONTROL)
+- Bad data filtering: Skips measurements where QC flag = 4 (bad) or 9 (missing)
+- QC statistics: Tracks skipped measurements and QC flag distribution
+- NetCDF QC variables: Reads QC arrays from NetCDF files
+
+v3.1 features:
 - 3D gridded NetCDF extraction (time × lat × lon)
 - Spatial bounding box filtering (only extract cells within study area)
 - Grid cell location creation (each grid cell gets a location record)
@@ -15,11 +21,12 @@ v3.0 features:
 - Unit inference from column names (e.g., TEMP_C → celsius)
 - Supports both "long format" (param column) and "wide format" (param as columns)
 
-GUARDRAILS (unchanged):
+GUARDRAILS:
 ✓ Upsert-safe: INSERT ... ON CONFLICT DO NOTHING
 ✓ Audit trail: location_qc_flag, extracted_at
 ✓ Validation: schema checks, failures logged
-✓ Additive: no data loss
+✓ QC filtering: Bad data (QC=4,9) excluded at extraction
+✓ Additive: no data loss (skipped data is logged)
 
 Usage:
   python populate_measurements.py [--limit 5000] [--dataset "Title"]
@@ -88,6 +95,76 @@ def is_within_study_area(lat: float, lon: float) -> bool:
     """Check if coordinates fall within study area"""
     return (STUDY_AREA['lat_min'] <= lat <= STUDY_AREA['lat_max'] and
             STUDY_AREA['lon_min'] <= lon <= STUDY_AREA['lon_max'])
+
+# ============================================================================
+# QC FLAG HELPERS
+# ============================================================================
+
+def find_qc_column(param_col: str, all_columns: List[str]) -> Optional[str]:
+    """Find QC column for a parameter column
+    
+    Examples:
+        TEMP -> TEMP_QUALITY_CONTROL
+        TEMP -> TEMP_QC
+        TEMP -> TEMP_quality_control
+        PSAL -> PSAL_quality_control
+    """
+    param_upper = param_col.upper().replace(' ', '_')
+    
+    # Try common QC column patterns
+    qc_patterns = [
+        f"{param_col}_quality_control",
+        f"{param_col}_QUALITY_CONTROL",
+        f"{param_col}_qc",
+        f"{param_col}_QC",
+        f"{param_col}_flag",
+        f"{param_col}_FLAG",
+        f"{param_upper}_quality_control",
+        f"{param_upper}_QC"
+    ]
+    
+    for pattern in qc_patterns:
+        if pattern in all_columns:
+            return pattern
+    
+    # Case-insensitive search
+    for col in all_columns:
+        col_upper = col.upper().replace(' ', '_')
+        if param_upper in col_upper and any(qc in col_upper for qc in ['QUALITY_CONTROL', 'QC', 'FLAG']):
+            return col
+    
+    return None
+
+def is_valid_qc_flag(qc_value) -> bool:
+    """Check if QC flag indicates good data
+    
+    IMOS QC flags:
+        1 = Good data
+        2 = Probably good data
+        3 = Probably bad data
+        4 = Bad data (REJECT)
+        9 = Missing data (REJECT)
+    
+    Returns True if data should be kept (QC flag 1, 2, or 3)
+    """
+    if pd.isna(qc_value):
+        return True  # No QC flag = assume good
+    
+    try:
+        qc_int = int(float(qc_value))
+        return qc_int in [1, 2, 3]  # Accept good, probably good, probably bad
+    except (ValueError, TypeError):
+        return True  # Invalid QC value = assume good
+
+def get_qc_flag_value(qc_value) -> int:
+    """Convert QC column value to integer flag (default=1 if missing)"""
+    if pd.isna(qc_value):
+        return 1  # No QC flag = assume good
+    
+    try:
+        return int(float(qc_value))
+    except (ValueError, TypeError):
+        return 1  # Invalid QC value = assume good
 
 # ============================================================================
 # UNIT INFERENCE
@@ -423,19 +500,21 @@ class TimeFormatDetector:
         return None
 
 # ============================================================================
-# CSV MEASUREMENT EXTRACTOR (MULTI-PARAMETER)
+# CSV MEASUREMENT EXTRACTOR (MULTI-PARAMETER + QC LOOKUP)
 # ============================================================================
 
 class CSVMeasurementExtractor:
-    """Extracts measurements from CSV files - supports multi-parameter rows"""
+    """Extracts measurements from CSV files - supports multi-parameter rows + QC filtering"""
     
     def __init__(self, param_mapping: ParameterMapping):
         self.param_mapping = param_mapping
         self.extracted_count = 0
         self.failed_count = 0
+        self.skipped_bad_qc = 0
+        self.qc_stats = {1: 0, 2: 0, 3: 0, 4: 0, 9: 0}  # Track QC flag distribution
     
     def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
-        """Extract measurements from CSV - handles both long and wide formats"""
+        """Extract measurements from CSV - handles both long and wide formats + QC lookup"""
         rows = []
         
         try:
@@ -470,6 +549,14 @@ class CSVMeasurementExtractor:
             
             logger.info(f"  ✓ Detected {len(param_cols)} parameter columns: {list(param_cols.values())[:5]}...")
             
+            # Find QC columns for each parameter
+            qc_col_map = {}
+            for col_name in param_cols.keys():
+                qc_col = find_qc_column(col_name, df.columns.tolist())
+                if qc_col:
+                    qc_col_map[col_name] = qc_col
+                    logger.info(f"  ✓ Found QC column: {col_name} -> {qc_col}")
+            
             depth_col = self._find_column(df, cols_upper, ['DEPTH', 'Z', 'LEVEL', 'DEPTH_M'])
             
             for idx, row in df.iterrows():
@@ -492,6 +579,26 @@ class CSVMeasurementExtractor:
                         if pd.isna(value):
                             continue
                         
+                        # === QC FLAG LOOKUP ===
+                        quality_flag = 1  # Default: good data
+                        
+                        if col_name in qc_col_map:
+                            qc_col = qc_col_map[col_name]
+                            qc_value = row.get(qc_col)
+                            
+                            # Check if data should be kept
+                            if not is_valid_qc_flag(qc_value):
+                                self.skipped_bad_qc += 1
+                                qc_flag_int = get_qc_flag_value(qc_value)
+                                if qc_flag_int in self.qc_stats:
+                                    self.qc_stats[qc_flag_int] += 1
+                                continue  # Skip bad/missing data
+                            
+                            # Get QC flag value
+                            quality_flag = get_qc_flag_value(qc_value)
+                            if quality_flag in self.qc_stats:
+                                self.qc_stats[quality_flag] += 1
+                        
                         param_code, namespace, uom = self.param_mapping.get_standard_param(param_standard)
                         
                         if uom == 'unknown':
@@ -506,7 +613,7 @@ class CSVMeasurementExtractor:
                             'value': value,
                             'uom': uom,
                             'depth_m': depth,
-                            'quality_flag': 1,
+                            'quality_flag': quality_flag,  # ← Now uses QC column value!
                             'location_id': None,
                             'location_qc_flag': 'unknown'
                         })
@@ -534,17 +641,19 @@ class CSVMeasurementExtractor:
         return None
 
 # ============================================================================
-# NETCDF MEASUREMENT EXTRACTOR (1D, 2D, 3D GRIDS)
+# NETCDF MEASUREMENT EXTRACTOR (1D, 2D, 3D GRIDS + QC VARIABLES)
 # ============================================================================
 
 class NetCDFMeasurementExtractor:
-    """Extracts measurements from NetCDF files - supports 1D/2D/3D grids"""
+    """Extracts measurements from NetCDF files - supports 1D/2D/3D grids + QC variables"""
     
     def __init__(self, param_mapping: ParameterMapping, db_config: dict):
         self.param_mapping = param_mapping
         self.db_config = db_config
         self.extracted_count = 0
         self.failed_count = 0
+        self.skipped_bad_qc = 0
+        self.qc_stats = {1: 0, 2: 0, 3: 0, 4: 0, 9: 0}
         self.grid_locations = {}  # Cache for grid cell locations
     
     def extract(self, file_path: str, metadata: dict, limit: int = None) -> List[Dict]:
@@ -586,28 +695,40 @@ class NetCDFMeasurementExtractor:
                 if hasattr(var, 'axis') or len(var.dimensions) == 0:
                     continue
                 
+                # Skip QC variables
+                var_name_upper = var_name.upper()
+                if any(qc in var_name_upper for qc in ['QUALITY_CONTROL', '_QC', '_FLAG']):
+                    continue
+                
                 param_code, namespace, uom = self.param_mapping.get_standard_param(var_name)
                 
                 # Get unit from NetCDF attributes if not in mapping
                 if uom == 'unknown' and hasattr(var, 'units'):
                     uom = str(var.units)
                 
+                # === FIND QC VARIABLE ===
+                qc_var_name = self._find_qc_variable(ds, var_name)
+                qc_data = None
+                if qc_var_name:
+                    logger.info(f"  ✓ Found QC variable: {var_name} -> {qc_var_name}")
+                    qc_data = ds.variables[qc_var_name][:]
+                
                 try:
                     data = var[:]
                     
                     # 1D timeseries
                     if data.ndim == 1:
-                        rows.extend(self._extract_1d(data, time_data, time_attrs, 
+                        rows.extend(self._extract_1d(data, qc_data, time_data, time_attrs, 
                                                      param_code, namespace, uom, metadata, limit))
                     
                     # 2D time×depth
                     elif data.ndim == 2:
-                        rows.extend(self._extract_2d(data, time_data, time_attrs,
+                        rows.extend(self._extract_2d(data, qc_data, time_data, time_attrs,
                                                      param_code, namespace, uom, metadata, limit))
                     
                     # 3D time×lat×lon (GRIDDED DATA)
                     elif data.ndim == 3 and lat_data is not None and lon_data is not None:
-                        rows.extend(self._extract_3d_grid(data, time_data, time_attrs,
+                        rows.extend(self._extract_3d_grid(data, qc_data, time_data, time_attrs,
                                                          lat_data, lon_data,
                                                          param_code, namespace, uom, 
                                                          metadata, limit))
@@ -628,12 +749,26 @@ class NetCDFMeasurementExtractor:
         
         return rows
     
-    def _extract_1d(self, data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
-        """Extract 1D timeseries"""
+    def _extract_1d(self, data, qc_data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
+        """Extract 1D timeseries with QC filtering"""
         rows = []
         for t_idx in range(len(data)):
             if pd.isna(data[t_idx]):
                 continue
+            
+            # === QC CHECK ===
+            quality_flag = 1
+            if qc_data is not None:
+                qc_value = qc_data[t_idx]
+                if not is_valid_qc_flag(qc_value):
+                    self.skipped_bad_qc += 1
+                    qc_flag_int = get_qc_flag_value(qc_value)
+                    if qc_flag_int in self.qc_stats:
+                        self.qc_stats[qc_flag_int] += 1
+                    continue  # Skip bad/missing data
+                quality_flag = get_qc_flag_value(qc_value)
+                if quality_flag in self.qc_stats:
+                    self.qc_stats[quality_flag] += 1
             
             ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
             if not ts:
@@ -648,7 +783,7 @@ class NetCDFMeasurementExtractor:
                 'value': float(data[t_idx]),
                 'uom': uom,
                 'depth_m': None,
-                'quality_flag': 1,
+                'quality_flag': quality_flag,
                 'location_id': None,
                 'location_qc_flag': 'unknown'
             })
@@ -659,8 +794,8 @@ class NetCDFMeasurementExtractor:
         
         return rows
     
-    def _extract_2d(self, data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
-        """Extract 2D time×depth"""
+    def _extract_2d(self, data, qc_data, time_data, time_attrs, param_code, namespace, uom, metadata, limit):
+        """Extract 2D time×depth with QC filtering"""
         rows = []
         for t_idx in range(min(len(data), 1000)):
             ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
@@ -671,6 +806,20 @@ class NetCDFMeasurementExtractor:
                 if pd.isna(data[t_idx, s_idx]):
                     continue
                 
+                # === QC CHECK ===
+                quality_flag = 1
+                if qc_data is not None:
+                    qc_value = qc_data[t_idx, s_idx]
+                    if not is_valid_qc_flag(qc_value):
+                        self.skipped_bad_qc += 1
+                        qc_flag_int = get_qc_flag_value(qc_value)
+                        if qc_flag_int in self.qc_stats:
+                            self.qc_stats[qc_flag_int] += 1
+                        continue
+                    quality_flag = get_qc_flag_value(qc_value)
+                    if quality_flag in self.qc_stats:
+                        self.qc_stats[quality_flag] += 1
+                
                 rows.append({
                     'time': ts,
                     'uuid': metadata['uuid'],
@@ -680,7 +829,7 @@ class NetCDFMeasurementExtractor:
                     'value': float(data[t_idx, s_idx]),
                     'uom': uom,
                     'depth_m': None,
-                    'quality_flag': 1,
+                    'quality_flag': quality_flag,
                     'location_id': None,
                     'location_qc_flag': 'unknown'
                 })
@@ -691,9 +840,9 @@ class NetCDFMeasurementExtractor:
         
         return rows
     
-    def _extract_3d_grid(self, data, time_data, time_attrs, lat_data, lon_data,
+    def _extract_3d_grid(self, data, qc_data, time_data, time_attrs, lat_data, lon_data,
                          param_code, namespace, uom, metadata, limit):
-        """Extract 3D gridded data (time×lat×lon) with spatial filtering"""
+        """Extract 3D gridded data (time×lat×lon) with spatial filtering + QC"""
         rows = []
         
         # Check grid size
@@ -739,6 +888,20 @@ class NetCDFMeasurementExtractor:
                 if pd.isna(value) or value == -999 or value == -1e34:
                     continue
                 
+                # === QC CHECK ===
+                quality_flag = 1
+                if qc_data is not None:
+                    qc_value = qc_data[t_idx, lat_idx, lon_idx]
+                    if not is_valid_qc_flag(qc_value):
+                        self.skipped_bad_qc += 1
+                        qc_flag_int = get_qc_flag_value(qc_value)
+                        if qc_flag_int in self.qc_stats:
+                            self.qc_stats[qc_flag_int] += 1
+                        continue
+                    quality_flag = get_qc_flag_value(qc_value)
+                    if quality_flag in self.qc_stats:
+                        self.qc_stats[quality_flag] += 1
+                
                 ts = self._parse_netcdf_time(time_data[t_idx], time_attrs)
                 if not ts:
                     continue
@@ -752,7 +915,7 @@ class NetCDFMeasurementExtractor:
                     'value': float(value),
                     'uom': uom,
                     'depth_m': None,
-                    'quality_flag': 1,
+                    'quality_flag': quality_flag,
                     'location_id': location_id,
                     'location_qc_flag': 'clean'
                 })
@@ -778,6 +941,24 @@ class NetCDFMeasurementExtractor:
         for name in names:
             if name in ds.variables:
                 return name
+        return None
+    
+    @staticmethod
+    def _find_qc_variable(ds, var_name: str) -> Optional[str]:
+        """Find QC variable for a data variable"""
+        qc_patterns = [
+            f"{var_name}_quality_control",
+            f"{var_name}_QUALITY_CONTROL",
+            f"{var_name}_qc",
+            f"{var_name}_QC",
+            f"{var_name}_flag",
+            f"{var_name}_FLAG"
+        ]
+        
+        for pattern in qc_patterns:
+            if pattern in ds.variables:
+                return pattern
+        
         return None
     
     @staticmethod
@@ -880,7 +1061,7 @@ class MeasurementBatchInserter:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.1 - Multi-Parameter CSV + 3D Gridded NetCDF')
+    parser = argparse.ArgumentParser(description='Enhanced Measurements ETL v3.2 - QC Flag Lookup + Bad Data Filtering')
     parser.add_argument('--limit', type=int, help='Max rows per dataset', default=None)
     parser.add_argument('--dataset', help='Specific dataset to process')
     args = parser.parse_args()
@@ -924,6 +1105,10 @@ def main():
             
             metadata = {'id': ds_id, 'uuid': uuid, 'title': title}
             dataset_rows = []
+            
+            # Reset QC stats for this dataset
+            csv_extractor.skipped_bad_qc = 0
+            nc_extractor.skipped_bad_qc = 0
             
             # ===== LOCATION PATCHING STEP =====
             station_name = None
@@ -1002,6 +1187,21 @@ def main():
                 if patched_count > 0:
                     logger.info(f"  ✓ Patched {patched_count} rows with location_id={location_id}")
             
+            # ===== QC STATISTICS =====
+            total_skipped = csv_extractor.skipped_bad_qc + nc_extractor.skipped_bad_qc
+            if total_skipped > 0:
+                logger.info(f"  ⚠ Skipped {total_skipped} measurements due to bad QC flags")
+                
+                # Combine QC stats
+                combined_qc_stats = {}
+                for flag in [1, 2, 3, 4, 9]:
+                    count = csv_extractor.qc_stats.get(flag, 0) + nc_extractor.qc_stats.get(flag, 0)
+                    if count > 0:
+                        combined_qc_stats[flag] = count
+                
+                if combined_qc_stats:
+                    logger.info(f"  📊 QC flag distribution: {combined_qc_stats}")
+            
             # ===== INSERT BATCH =====
             if dataset_rows:
                 logger.info(f"  💾 Inserting {len(dataset_rows)} measurements...")
@@ -1017,8 +1217,8 @@ def main():
         logger.info(f"{'='*70}")
         logger.info(f"Total inserted:        {inserter.total_inserted}")
         logger.info(f"Total failed:          {inserter.total_failed}")
-        logger.info(f"CSV extracted:         {csv_extractor.extracted_count} ({csv_extractor.failed_count} failed)")
-        logger.info(f"NetCDF extracted:      {nc_extractor.extracted_count} ({nc_extractor.failed_count} failed)")
+        logger.info(f"CSV extracted:         {csv_extractor.extracted_count} ({csv_extractor.failed_count} failed, {csv_extractor.skipped_bad_qc} skipped due to QC)")
+        logger.info(f"NetCDF extracted:      {nc_extractor.extracted_count} ({nc_extractor.failed_count} failed, {nc_extractor.skipped_bad_qc} skipped due to QC)")
         logger.info(f"{'='*70}\n")
     
     except Exception as e:
