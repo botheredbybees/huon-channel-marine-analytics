@@ -403,6 +403,53 @@ FROM parameters p
 JOIN metadata md ON p.metadata_id = md.id
 GROUP BY p.parameter_code, p.parameter_label, p.aodn_parameter_uri;
 
+-- Clean Grafana Parameter Dropdown (no namespace clutter)
+CREATE OR REPLACE VIEW grafana_parameters AS
+SELECT DISTINCT 
+  parameter_code AS value,
+  CASE 
+    WHEN parameter_code = 'TEMP' THEN 'Temperature (°C)'
+    WHEN parameter_code = 'PSAL' THEN 'Salinity (PSS-78)' 
+    WHEN parameter_code = 'SST' THEN 'Sea Surface Temp (°C)'
+    WHEN parameter_code = 'CPHL' THEN 'Chlorophyll-a (mg/m³)'
+    WHEN parameter_code = 'DOXY' THEN 'Dissolved Oxygen (ml/l)'
+    WHEN parameter_code = 'PH' THEN 'pH'
+    WHEN parameter_code = 'NO3' THEN 'Nitrate (mmol/m³)'
+    WHEN parameter_code = 'PO4' THEN 'Phosphate (mmol/m³)'
+    WHEN parameter_code = 'SIO4' THEN 'Silicate (mmol/m³)'
+    WHEN parameter_code = 'FLUO' THEN 'Chlorophyll Fluorescence (mg/m³)'
+    WHEN parameter_code = 'TURB' THEN 'Turbidity (NTU)'
+    WHEN parameter_code IN ('CNDC','PRES') THEN parameter_code || ' (CTD)'
+    ELSE parameter_code || ' (' || uom || ')'
+  END AS text,
+  uom,
+  COUNT(*) as record_count,
+  namespace
+FROM measurements 
+WHERE quality_flag = 1
+GROUP BY parameter_code, namespace, uom
+HAVING COUNT(*) > 500  -- Focus on meaningful datasets
+ORDER BY record_count DESC;
+
+-- Optimized timeseries view
+CREATE OR REPLACE VIEW grafana_timeseries AS
+SELECT 
+  time_bucket('15 minutes', time) AS time,
+  parameter_code,
+  AVG(value) AS value,
+  STDDEV(value) AS stddev,
+  COUNT(*) AS n_points,
+  MIN(quality_flag) AS quality_flag,
+  dataset_title,
+  location_id
+FROM measurements_with_metadata 
+WHERE quality_flag IN (1,2)
+GROUP BY 
+  time_bucket('15 minutes', time), 
+  parameter_code, dataset_title, location_id
+ORDER BY time DESC, parameter_code;
+
+
 -- =============================================================================
 -- SPATIAL & BIOLOGICAL FEATURES
 -- =============================================================================

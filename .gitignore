@@ -9,7 +9,6 @@ env/
 *.egg-info/
 dist/
 build/
-
 # Environment variables
 .env
 *.env
@@ -50,3 +49,5 @@ Thumbs.db
 
 # Tree output
 tree.txt
+llman
+llman.pub
