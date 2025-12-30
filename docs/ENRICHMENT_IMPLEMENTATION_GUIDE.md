@@ -1,5 +1,96 @@
 # Metadata Enrichment Implementation Guide
 
+## Quick Status: First Test Run ✓
+
+Your first enrichment script test completed **successfully**:
+```
+XML files found:     38
+Files processed:     38
+Files failed:        0
+Rows updated:        0
+```
+
+**This is normal!** See the "Understanding Your Test Results" section below.
+
+---
+
+## Understanding Your Test Results
+
+### What Happened
+
+The `enrich_metadata_from_xml.py` script:
+1. ✓ **Connected** to database successfully
+2. ✓ **Found** 38 metadata.xml files in AODN_data
+3. ✓ **Processed** all files without errors
+4. ✗ **Updated** 0 rows in the database
+
+### Why "Rows Updated: 0"?
+
+This doesn't mean failure. The script uses this logic:
+```sql
+UPDATE metadata 
+SET abstract = extracted_abstract, ...
+WHERE uuid = {uuid_from_xml}
+  AND (abstract IS NULL OR lineage IS NULL OR ...)
+```
+
+**Zero updates means one of three things:**
+
+#### Option 1: Fields Already Populated (✅ Success)
+
+Your metadata table already has abstract, credit, lineage, etc. filled in. Enrichment already happened or fields were pre-populated.
+
+**Check with:**
+```bash
+psql -h localhost -p 5433 -U marine_user -d marine_db -c "
+SELECT 
+  COUNT(*) total,
+  COUNT(CASE WHEN abstract IS NOT NULL THEN 1 END) has_abstract,
+  COUNT(CASE WHEN abstract IS NULL THEN 1 END) missing_abstract,
+  COUNT(CASE WHEN lineage IS NOT NULL THEN 1 END) has_lineage,
+  COUNT(CASE WHEN lineage IS NULL THEN 1 END) missing_lineage
+FROM metadata;
+"
+```
+
+**If all fields are populated**: ✅ Enrichment already complete
+
+#### Option 2: UUID Mismatch (⚠ Needs Investigation)
+
+The UUIDs in your XML filenames don't match the UUIDs in your database metadata table.
+
+**Check with:**
+```bash
+# Get sample UUIDs from filesystem
+echo "Sample UUIDs from AODN_data:"
+find /home/peter_sha/tas_climate_data/huon-channel-marine-analytics/AODN_data -maxdepth 2 -type d -name '*-*' | xargs -n1 basename | head -10
+
+# Get sample UUIDs from database
+echo "Sample UUIDs from database:"
+psql -h localhost -p 5433 -U marine_user -d marine_db -c "SELECT uuid FROM metadata LIMIT 10;"
+```
+
+**If UUIDs look different** (format, case, etc.): ⚠ UUID mismatch likely
+
+#### Option 3: No Extractable Metadata (⚠ Needs Investigation)
+
+The XML files exist but don't contain the expected metadata fields (abstract, credit, lineage).
+
+**Check with:**
+```bash
+# Pick a sample metadata.xml and inspect it
+find /home/peter_sha/tas_climate_data/huon-channel-marine-analytics/AODN_data -name metadata.xml -type f | head -1 | xargs head -100
+
+# Look for these tags:
+# <gmd:abstract>
+# <gmd:credit>
+# <gmd:lineage>
+```
+
+**If these tags are missing**: ⚠ No extractable data in XML
+
+---
+
 ## Quick Start
 
 For the impatient: run these commands in order
@@ -7,10 +98,11 @@ For the impatient: run these commands in order
 ```bash
 # 1. Test in dry-run mode first
 export DB_HOST=localhost
-export DB_PORT=5432
-export DB_NAME=marine_data
-export DB_USER=postgres
-export AODN_DATA_PATH=/AODN_data
+export DB_PORT=5433
+export DB_NAME=marine_db
+export DB_USER=marine_user
+export DB_PASSWORD=marine_pass123
+export AODN_DATA_PATH=/home/peter_sha/tas_climate_data/huon-channel-marine-analytics/AODN_data
 
 # Check what would happen
 python scripts/enrich_metadata_from_xml.py
@@ -92,11 +184,11 @@ git pull origin main
 ```bash
 # For bash/zsh - add to ~/.bashrc or ~/.zshrc
 export DB_HOST=localhost
-export DB_PORT=5432
-export DB_NAME=marine_data
-export DB_USER=postgres
-export DB_PASSWORD=your_password  # if needed
-export AODN_DATA_PATH=/AODN_data
+export DB_PORT=5433
+export DB_NAME=marine_db
+export DB_USER=marine_user
+export DB_PASSWORD=marine_pass123
+export AODN_DATA_PATH=/home/peter_sha/tas_climate_data/huon-channel-marine-analytics/AODN_data
 
 # Then reload
 source ~/.bashrc
@@ -104,13 +196,13 @@ source ~/.bashrc
 
 **Or set them inline**:
 ```bash
-DB_HOST=localhost DB_PORT=5432 python scripts/enrich_metadata_from_xml.py
+DB_HOST=localhost DB_PORT=5433 python scripts/enrich_metadata_from_xml.py
 ```
 
 ### 1.3 Verify Database Connection
 
 ```bash
-psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "
+psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "
 SELECT 
   (SELECT COUNT(*) FROM metadata) as metadata_count,
   (SELECT COUNT(*) FROM measurements) as measurements_count,
@@ -192,7 +284,7 @@ Rows updated:        35
 
 **What to look for**:
 - ✓ Files found > 0
-- ✓ Rows updated > 0
+- ✓ Rows updated > 0 (OR fields already populated)
 - ✓ No ERROR messages
 - ⚠ Some files may fail gracefully (fine if most succeed)
 
@@ -516,7 +608,7 @@ psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "SELECT 1"
 
 # If fails, check:
 echo "Trying localhost..."
-psql -h localhost -U postgres -d marine_data
+psql -h localhost -U postgres -d marine_db
 
 # Or check connection string
 echo "DB_HOST=$DB_HOST DB_PORT=$DB_PORT DB_NAME=$DB_NAME DB_USER=$DB_USER"
@@ -548,11 +640,12 @@ find /AODN_data -type d -name "metadata" | head -5
 
 ## Next Steps
 
-1. **Schedule regular runs**: Add to cron for weekly execution
-2. **Monitor for issues**: Check logs regularly
-3. **Document findings**: Keep record of what was fixed
-4. **Plan integration**: Merge into main ETL pipeline
-5. **Continuous improvement**: Update scripts as new data patterns discovered
+1. **Diagnose your test results**: Use the "Understanding Your Test Results" section above
+2. **Run the other enrichment scripts**: Once XML enrichment is understood
+3. **Validate with dry-run**: Always check corrections before applying
+4. **Schedule regular runs**: Add to cron for weekly execution
+5. **Monitor for issues**: Check logs regularly
+6. **Plan integration**: Merge into main ETL pipeline
 
 ---
 
