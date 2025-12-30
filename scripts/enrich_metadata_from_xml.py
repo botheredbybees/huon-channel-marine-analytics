@@ -127,6 +127,9 @@ class MetadataEnricher:
         """
         Find all metadata.xml files in AODN_data directory.
         Searches both {dataset_path}/metadata/metadata.xml and {dataset_path}/metadata.xml
+        
+        Returns:
+            dict: Mapping of dataset_path -> xml_file_path
         """
         xml_files = {}
         
@@ -140,56 +143,60 @@ class MetadataEnricher:
         pattern1 = '**/metadata/metadata.xml'
         for xml_file in self.aodn_data_path.glob(pattern1):
             try:
-                parts = xml_file.parts
-                if len(parts) >= 2:
-                    uuid = xml_file.parent.parent.name
-                    xml_files[uuid] = xml_file
-                    logger.debug(f"Found metadata file: {uuid} -> {xml_file}")
+                # Dataset path is parent of metadata directory
+                dataset_dir = xml_file.parent.parent
+                dataset_path = str(dataset_dir)
+                xml_files[dataset_path] = xml_file
+                logger.debug(f"Found metadata file: {dataset_path} -> {xml_file}")
             except Exception as e:
-                logger.warning(f"Could not extract UUID from {xml_file}: {e}")
+                logger.warning(f"Could not extract dataset path from {xml_file}: {e}")
         
         # Pattern 2: .../metadata.xml (fallback)
         pattern2 = '**/metadata.xml'
         for xml_file in self.aodn_data_path.glob(pattern2):
             if xml_file.parent.name != 'metadata':  # Skip if already found
                 try:
-                    uuid = xml_file.parent.name
-                    if uuid not in xml_files:
-                        xml_files[uuid] = xml_file
-                        logger.debug(f"Found metadata file (alt): {uuid} -> {xml_file}")
+                    dataset_dir = xml_file.parent
+                    dataset_path = str(dataset_dir)
+                    if dataset_path not in xml_files:
+                        xml_files[dataset_path] = xml_file
+                        logger.debug(f"Found metadata file (alt): {dataset_path} -> {xml_file}")
                 except Exception as e:
-                    logger.warning(f"Could not extract UUID from {xml_file}: {e}")
+                    logger.warning(f"Could not extract dataset path from {xml_file}: {e}")
             
         self.stats['files_found'] = len(xml_files)
         logger.info(f"Found {len(xml_files)} metadata.xml files")
         return xml_files
     
-    def find_metadata_record_id(self, directory_uuid: str) -> Optional[Tuple[int, str]]:
+    def find_metadata_record_by_path(self, dataset_path: str) -> Optional[Tuple[int, str]]:
         """
-        Find metadata record ID and dataset_path by directory UUID.
+        Find metadata record ID by dataset_path.
         
+        Args:
+            dataset_path: Full path to dataset directory
+            
         Returns:
             Tuple of (metadata.id, dataset_path) if found, None otherwise
         """
         cursor = self.conn.cursor()
         try:
-            logger.debug(f"Looking up metadata record for directory UUID: {directory_uuid}")
+            logger.debug(f"Looking up metadata record for dataset_path: {dataset_path}")
             cursor.execute(
-                "SELECT id, dataset_path FROM metadata WHERE uuid = %s LIMIT 1",
-                [directory_uuid]
+                "SELECT id, dataset_path FROM metadata WHERE dataset_path = %s LIMIT 1",
+                [dataset_path]
             )
             result = cursor.fetchone()
             
             if result:
-                record_id, dataset_path = result
-                logger.info(f"✓ Found metadata record: directory_uuid={directory_uuid} -> metadata.id={record_id}, dataset_path={dataset_path}")
-                return (record_id, dataset_path)
+                record_id, db_path = result
+                logger.info(f"✓ Found metadata record: dataset_path={dataset_path} -> metadata.id={record_id}")
+                return (record_id, db_path)
             else:
-                logger.warning(f"✗ No metadata record found for directory UUID: {directory_uuid}")
+                logger.warning(f"✗ No metadata record found for dataset_path: {dataset_path}")
                 return None
                 
         except psycopg2.Error as e:
-            logger.error(f"Database error during record lookup for {directory_uuid}: {e}")
+            logger.error(f"Database error during record lookup for {dataset_path}: {e}")
             return None
         finally:
             cursor.close()
@@ -497,13 +504,13 @@ class MetadataEnricher:
         except Exception as e:
             logger.warning(f"Could not extract temporal extent: {e}")
     
-    def update_metadata_table(self, record_id: int, directory_uuid: str, metadata: dict, aodn_uuid: Optional[str] = None) -> int:
+    def update_metadata_table(self, record_id: int, dataset_path: str, metadata: dict, aodn_uuid: Optional[str] = None) -> int:
         """Update metadata table with extracted values."""
         cursor = self.conn.cursor()
         fields_updated = 0
         
         try:
-            logger.info(f"Updating record id={record_id} (directory_uuid={directory_uuid})")
+            logger.info(f"Updating record id={record_id} (dataset_path={dataset_path})")
             
             # Update aodn_uuid if present
             if aodn_uuid:
@@ -636,20 +643,20 @@ class MetadataEnricher:
             
             logger.info(f"\nProcessing {len(xml_files)} metadata files...\n")
             
-            for directory_uuid, xml_path in xml_files.items():
+            for dataset_path, xml_path in xml_files.items():
                 logger.info(f"\n{'='*70}")
-                logger.info(f"PROCESSING: {directory_uuid}")
+                logger.info(f"PROCESSING: {dataset_path}")
                 logger.info(f"File: {xml_path}")
                 logger.info(f"{'='*70}")
                 
-                # Find record by ID and get dataset_path
-                result = self.find_metadata_record_id(directory_uuid)
+                # Find record by dataset_path
+                result = self.find_metadata_record_by_path(dataset_path)
                 if not result:
-                    logger.error(f"Cannot process {directory_uuid}: no metadata record found")
+                    logger.error(f"Cannot process {dataset_path}: no metadata record found")
                     self.stats['files_failed'] += 1
                     continue
                 
-                record_id, dataset_path = result
+                record_id, db_path = result
                 
                 # Parse XML and extract metadata and parameters
                 metadata, aodn_uuid, parameters = self.parse_iso_19115_xml(xml_path)
@@ -661,7 +668,7 @@ class MetadataEnricher:
                     continue
                 
                 # Update metadata table
-                fields_updated = self.update_metadata_table(record_id, directory_uuid, metadata, aodn_uuid)
+                fields_updated = self.update_metadata_table(record_id, dataset_path, metadata, aodn_uuid)
                 
                 # Process parameters if found
                 if parameters:
@@ -670,7 +677,7 @@ class MetadataEnricher:
                     self.update_config_json(parameters)
                 
                 self.stats['files_processed'] += 1
-                logger.info(f"✓ COMPLETED: {directory_uuid}\n")
+                logger.info(f"✓ COMPLETED: {dataset_path}\n")
         
         except Exception as e:
             logger.error(f"✗ FATAL ERROR during enrichment: {e}")
