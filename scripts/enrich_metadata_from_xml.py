@@ -126,7 +126,7 @@ class MetadataEnricher:
     def find_metadata_xml_files(self) -> Dict[str, Path]:
         """
         Find all metadata.xml files in AODN_data directory.
-        Searches both {dataset_path}/metadata/metadata.xml and {dataset_path}/metadata.xml
+        Handles AODN structure: AODN_data/Dataset Name/UUID/metadata/metadata.xml
         
         Returns:
             dict: Mapping of dataset_path -> xml_file_path
@@ -139,19 +139,20 @@ class MetadataEnricher:
         
         logger.info(f"Scanning for metadata.xml files in {self.aodn_data_path}")
         
-        # Pattern 1: .../metadata/metadata.xml
+        # Pattern 1: .../UUID/metadata/metadata.xml (AODN structure)
         pattern1 = '**/metadata/metadata.xml'
         for xml_file in self.aodn_data_path.glob(pattern1):
             try:
-                # Dataset path is parent of metadata directory
-                dataset_dir = xml_file.parent.parent
+                # AODN structure: AODN_data/Dataset Name/UUID/metadata/metadata.xml
+                # Go up 3 levels: metadata -> UUID -> Dataset Name
+                dataset_dir = xml_file.parent.parent.parent
                 dataset_path = str(dataset_dir)
                 xml_files[dataset_path] = xml_file
                 logger.debug(f"Found metadata file: {dataset_path} -> {xml_file}")
             except Exception as e:
                 logger.warning(f"Could not extract dataset path from {xml_file}: {e}")
         
-        # Pattern 2: .../metadata.xml (fallback)
+        # Pattern 2: .../metadata.xml (fallback for non-AODN structure)
         pattern2 = '**/metadata.xml'
         for xml_file in self.aodn_data_path.glob(pattern2):
             if xml_file.parent.name != 'metadata':  # Skip if already found
@@ -576,7 +577,7 @@ class MetadataEnricher:
                          param['unit'], param['description']]
                     )
                     self.stats['parameters_added'] += 1
-                    logger.info(f"  ✓ Added parameter: {param['raw_name']} -> {param['standard_code']} ({param['namespace']})")
+                    logger.info(f"  ✓ Added parameter: {param['raw_name']} -> {param['standard_code']} ({param['namespace']})") 
                 else:
                     logger.debug(f"  - Parameter already exists: {param['raw_name']}")
             
