@@ -1,6 +1,7 @@
 services:
   timescaledb:
-    image: timescale/timescaledb-ha:pg18.1-ts2.23.1-all-oss
+    # image: timescale/timescaledb-ha:pg18.1-ts2.23.1-all-oss
+    image: timescale/timescaledb:latest-pg18  # Community license + full features
     container_name: marine_timescaledb
     restart: always
     environment:

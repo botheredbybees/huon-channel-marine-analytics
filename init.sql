@@ -21,7 +21,7 @@
 
 -- Enable extensions
 CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
-CREATE EXTENSION IF NOT EXISTS postgis;
+-- CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 
 
@@ -141,7 +141,6 @@ CREATE TABLE IF NOT EXISTS public.locations (
     id SERIAL PRIMARY KEY,
     location_name text,
     location_type text DEFAULT 'observation_site',
-    location_geom public.geometry(Point,4326),
     longitude double precision,
     latitude double precision,
     description text,
@@ -151,8 +150,6 @@ CREATE TABLE IF NOT EXISTS public.locations (
     CONSTRAINT unique_lat_lon UNIQUE (latitude, longitude)
 );
 
--- Performance index for spatial queries
-CREATE INDEX IF NOT EXISTS idx_locations_geom ON public.locations USING gist (location_geom);
 
 -- Partial index for non-NULL coordinates (additional performance optimization)
 CREATE INDEX IF NOT EXISTS idx_locations_lat_lon_partial 
@@ -197,20 +194,15 @@ CREATE TABLE IF NOT EXISTS metadata (
     dataset_name TEXT,
     dataset_path TEXT,
     extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    date_created DATE,
-    
-    -- PostGIS spatial extent (unlocks spatial queries)
-    extent_geom GEOMETRY(POLYGON, 4326),
-    
-    -- Materialized bounding box for non-spatial queries
-    bbox_envelope BOX2D GENERATED ALWAYS AS (BOX2D(extent_geom)) STORED
+    date_created DATE
+
 );
 
 -- Metadata indexes (removed CONCURRENTLY for init script compatibility)
 CREATE INDEX IF NOT EXISTS idx_metadata_uuid ON metadata(uuid);
 CREATE INDEX IF NOT EXISTS idx_metadata_bbox ON metadata(west, east, south, north);
 CREATE INDEX IF NOT EXISTS idx_metadata_time ON metadata(time_start, time_end);
-CREATE INDEX IF NOT EXISTS idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
+CREATE INDEX IF NOT EXISTS idx_metadata_bbox ON metadata (bbox_west, bbox_south, bbox_east, bbox_north);
 CREATE INDEX IF NOT EXISTS idx_metadata_dataset_name ON metadata(dataset_name);
 CREATE INDEX IF NOT EXISTS idx_metadata_dataset_path ON metadata(dataset_path) 
 WHERE dataset_path IS NOT NULL;
@@ -393,30 +385,30 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- View joining measurements with metadata
 CREATE OR REPLACE VIEW measurements_with_metadata AS
-SELECT 
-    m.time, m.data_id, m.parameter_code, m.namespace, m.value, m.uom,
-    m.uncertainty, m.depth_m, m.location_id, m.quality_flag,
-    md.title AS dataset_title,
-    md.dataset_name,
-    p.parameter_label,
-    p.unit_name,
-    md.extent_geom
+SELECT
+  m.time, m.data_id, m.parameter_code, m.namespace, m.value, m.uom,
+  m.uncertainty, m.depth_m, m.location_id, m.quality_flag,
+  md.title AS dataset_title,
+  md.dataset_name,
+  md.west, md.east, md.south, md.north  -- ← Use bbox columns instead
 FROM measurements m
-LEFT JOIN metadata md ON m.metadata_id = md.id
-LEFT JOIN parameters p ON md.id = p.metadata_id AND m.parameter_code = p.parameter_code;
+LEFT JOIN metadata md ON m.metadata_id = md.id;
 
 -- Spatial view for datasets by parameter
 CREATE OR REPLACE VIEW datasets_by_parameter AS
-SELECT 
-    p.parameter_code,
-    p.parameter_label,
-    p.aodn_parameter_uri,
-    COUNT(DISTINCT md.id) AS dataset_count,
-    ST_Union(md.extent_geom) AS parameter_extent,
-    ARRAY_AGG(DISTINCT md.dataset_name) AS datasets
+SELECT
+  p.parameter_code,
+  p.parameter_label,
+  COUNT(DISTINCT md.id) AS dataset_count,
+  MIN(md.west) AS bbox_west,
+  MIN(md.south) AS bbox_south,
+  MAX(md.east) AS bbox_east,
+  MAX(md.north) AS bbox_north,
+  ARRAY_AGG(DISTINCT md.dataset_name) AS datasets
 FROM parameters p
 JOIN metadata md ON p.metadata_id = md.id
-GROUP BY p.parameter_code, p.parameter_label, p.aodn_parameter_uri;
+GROUP BY p.parameter_code, p.parameter_label;
+
 
 -- Clean Grafana Parameter Dropdown (no namespace clutter)
 CREATE OR REPLACE VIEW grafana_parameters AS
@@ -474,10 +466,11 @@ CREATE TABLE IF NOT EXISTS  spatial_features (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
     uuid TEXT,
-    geom GEOMETRY(Geometry, 4326),
+    longitude DOUBLE PRECISION,
+    latitude DOUBLE PRECISION,
     properties JSONB
 );
-CREATE INDEX IF NOT EXISTS spatial_features_geom_idx ON spatial_features USING GIST (geom);
+CREATE INDEX IF NOT EXISTS spatial_features_lat_lon ON spatial_features (latitude, longitude);
 CREATE INDEX IF NOT EXISTS spatial_features_metadata_id_idx ON spatial_features(metadata_id);
 
 -- Taxonomy Table
@@ -507,9 +500,10 @@ CREATE TABLE IF NOT EXISTS  species_observations (
     size_class TEXT,
     method TEXT,
     notes TEXT,
-    geom GEOMETRY(Point, 4326)
+    longitude DOUBLE PRECISION,
+    latitude DOUBLE PRECISION
 );
-CREATE INDEX IF NOT EXISTS idx_species_obs_geom ON species_observations USING GIST(geom);
+CREATE INDEX IF NOT EXISTS idx_species_obs_lat_lon ON species_observations (latitude, longitude);
 CREATE INDEX IF NOT EXISTS idx_species_obs_tax ON species_observations(taxonomy_id);
 CREATE INDEX IF NOT EXISTS idx_species_obs_meta ON species_observations(metadata_id);
 
