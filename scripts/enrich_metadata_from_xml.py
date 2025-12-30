@@ -359,66 +359,86 @@ class MetadataEnricher:
     
     def update_metadata_table(self, uuid: str, metadata: dict, aodn_uuid: Optional[str] = None) -> int:
         """
-        Update metadata table with extracted values.
+        Update metadata table with extracted values using primary key id.
         
-        Updated to handle aodn_uuid field separately:
-        - aodn_uuid is always updated when present (overwrite NULL)
-        - Other fields only update if they are currently NULL
+        Updated to:
+        - Find metadata.id (primary key) by matching UUID directory name
+        - Use metadata.id in WHERE clause (not uuid field)
+        - Always update aodn_uuid when present
+        - Only update other fields if currently NULL
+        
+        Args:
+            uuid: Directory UUID (filesystem structure identifier)
+            metadata: Dictionary of metadata fields to update
+            aodn_uuid: AODN UUID from XML (if present)
         
         Returns:
             Number of rows updated.
         """
-        # Separate aodn_uuid from other metadata fields
-        aodn_uuid_value = aodn_uuid
-        other_updates = {k: v for k, v in metadata.items() if v is not None}
-        
         cursor = self.conn.cursor()
         rows_updated = 0
         
         try:
-            # FIXED: Build two separate UPDATE operations
-            # 1. Always update aodn_uuid if present (even if other fields exist)
-            if aodn_uuid_value:
-                query1 = """
+            # STEP 1: Find the metadata record id using the directory UUID
+            # The 'uuid' column stores directory UUIDs used in filesystem structure
+            cursor.execute(
+                "SELECT id FROM metadata WHERE uuid = %s LIMIT 1",
+                [uuid]
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                logger.warning(f"No metadata record found for UUID {uuid}")
+                return 0
+            
+            metadata_id = result[0]
+            logger.debug(f"Found metadata.id = {metadata_id} for UUID {uuid}")
+            
+            # STEP 2: Update aodn_uuid if present (always overwrite)
+            if aodn_uuid:
+                query_aodn = """
                     UPDATE metadata 
                     SET aodn_uuid = %s
-                    WHERE uuid = %s
+                    WHERE id = %s
                     RETURNING id
                 """
-                cursor.execute(query1, [aodn_uuid_value, uuid])
-                rows_updated += cursor.rowcount
-                self.conn.commit()
-                logger.info(f"Updated {uuid}: aodn_uuid = {aodn_uuid_value}")
+                cursor.execute(query_aodn, [aodn_uuid, metadata_id])
+                if cursor.rowcount > 0:
+                    rows_updated += cursor.rowcount
+                    self.conn.commit()
+                    logger.info(f"Updated metadata id={metadata_id}: aodn_uuid = {aodn_uuid}")
             
-            # 2. Update other fields only if they are NULL
+            # STEP 3: Update other fields only if they are NULL
+            other_updates = {k: v for k, v in metadata.items() if v is not None}
+            
             if other_updates:
                 null_conditions = ' OR '.join([f'{k} IS NULL' for k in other_updates.keys()])
                 set_clause = ', '.join([f'{k} = %s' for k in other_updates.keys()])
                 
-                query2 = f"""
+                query_fields = f"""
                     UPDATE metadata 
                     SET {set_clause}
-                    WHERE uuid = %s
+                    WHERE id = %s
                       AND ({null_conditions})
                     RETURNING id
                 """
                 
-                values = list(other_updates.values()) + [uuid]
-                cursor.execute(query2, values)
-                rows_updated += cursor.rowcount
-                self.conn.commit()
+                values = list(other_updates.values()) + [metadata_id]
+                cursor.execute(query_fields, values)
                 
                 if cursor.rowcount > 0:
-                    logger.info(f"Updated {uuid}: {cursor.rowcount} fields enriched")
+                    rows_updated += cursor.rowcount
+                    self.conn.commit()
+                    logger.info(f"Updated metadata id={metadata_id}: {cursor.rowcount} fields enriched")
             
-            if rows_updated == 0 and aodn_uuid_value:
-                logger.info(f"Updated {uuid}: aodn_uuid populated (no other fields changed)")
+            if rows_updated == 0:
+                logger.info(f"No updates for metadata id={metadata_id} (all fields already populated)")
                 
         except psycopg2.Error as e:
-            logger.error(f"Database error updating metadata for {uuid}: {e}")
+            logger.error(f"Database error updating metadata id={metadata_id}: {e}")
             self.conn.rollback()
         except Exception as e:
-            logger.error(f"Unexpected error updating metadata for {uuid}: {e}")
+            logger.error(f"Unexpected error updating metadata for UUID {uuid}: {e}")
             self.conn.rollback()
         finally:
             cursor.close()
