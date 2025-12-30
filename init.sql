@@ -2,7 +2,7 @@
 -- Huon Channel Marine Analytics - Database Initialization Script (PostGIS-Free)
 -- =============================================================================
 -- Purpose: Creates PostgreSQL database schema for AODN marine data
--- Version: 3.0 (Pure PostgreSQL - no PostGIS dependency)
+-- Version: 3.1 (Pure PostgreSQL - no PostGIS dependency, with AODN UUID tracking)
 -- Last Updated: December 30, 2025
 --
 -- IMPORTANT NOTES:
@@ -11,6 +11,7 @@
 -- 3. Compatible with timescale/timescaledb:latest-pg18 (Community license)
 -- 4. All spatial queries work with DECIMAL bbox columns
 -- 5. TimescaleDB hypertable enabled for measurements table
+-- 6. Added aodn_uuid field to track AODN source identifiers (non-AODN datasets supported)
 -- =============================================================================
 
 -- Enable extensions (NO PostGIS)
@@ -153,6 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_locations_lat_lon_partial
 CREATE TABLE IF NOT EXISTS metadata (
   id SERIAL PRIMARY KEY,
   uuid TEXT UNIQUE NOT NULL,
+  aodn_uuid TEXT UNIQUE,
   parent_uuid TEXT,
   title TEXT NOT NULL,
   abstract TEXT,
@@ -189,6 +191,8 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 -- Metadata indexes (pure PostgreSQL)
 CREATE INDEX IF NOT EXISTS idx_metadata_uuid ON metadata(uuid);
+CREATE INDEX IF NOT EXISTS idx_metadata_aodn_uuid ON metadata(aodn_uuid)
+  WHERE aodn_uuid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_metadata_bbox ON metadata(west, east, south, north);
 CREATE INDEX IF NOT EXISTS idx_metadata_time ON metadata(time_start, time_end);
 CREATE INDEX IF NOT EXISTS idx_metadata_dataset_name ON metadata(dataset_name);
@@ -282,7 +286,6 @@ EXCEPTION
     RAISE NOTICE 'Hypertable creation error: %', SQLERRM;
 END $$;
 
--- Primary key
 -- Primary key (safe idempotent version)
 CREATE UNIQUE INDEX IF NOT EXISTS measurements_pkey ON measurements (time, data_id);
 
@@ -334,7 +337,6 @@ SELECT time_bucket('1 day', time) AS bucket,
 FROM measurements
 GROUP BY bucket, parameter_code, namespace, location_id;
 
--- -- Continuous aggregate policies (idempotent)
 -- Continuous aggregate policies (idempotent - safe to re-run)
 SELECT add_continuous_aggregate_policy('measurements_1h',
   start_offset => INTERVAL '3 days',
@@ -516,11 +518,12 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO marine_user;
 -- =============================================================================
 -- DATABASE STATISTICS (Post-Cleanup, December 30, 2025)
 -- =============================================================================
--- Schema Version: 3.0 (Pure PostgreSQL, no PostGIS)
+-- Schema Version: 3.1 (Pure PostgreSQL, no PostGIS, with AODN UUID tracking)
 -- Total measurements capacity: 12M+ (quality-controlled)
 -- Unique parameters: 125+
 -- Datasets: 25+
 -- Compatible with: timescale/timescaledb:latest-pg18 (Community license)
+-- NEW: aodn_uuid field for tracking AODN source identifiers (supports future non-AODN datasets)
 -- =============================================================================
 
 VACUUM ANALYZE;
