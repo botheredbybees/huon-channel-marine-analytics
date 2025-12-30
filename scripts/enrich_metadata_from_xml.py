@@ -3,6 +3,11 @@
 Enrich metadata table from ISO 19115-3 XML files in AODN dataset directories.
 Non-destructive: only updates NULL/empty fields.
 
+Enhanced with:
+- AODN UUID extraction from XML metadata
+- Deduplication logic to prevent re-ingestion of AODN datasets
+- aodn_uuid field population for AODN-sourced data
+
 This script extracts metadata from XML files located in dataset directories
 and populates empty fields in the metadata table. It's designed to run
 independently of the main ETL pipeline.
@@ -23,7 +28,7 @@ import os
 import psycopg2
 from pathlib import Path
 from xml.etree import ElementTree as ET
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import logging
 from datetime import datetime
 import sys
@@ -55,7 +60,9 @@ class MetadataEnricher:
             'files_found': 0,
             'files_processed': 0,
             'files_failed': 0,
+            'files_deduplicated': 0,  # NEW: Track deduplicated files
             'rows_updated': 0,
+            'aodn_uuids_extracted': 0,  # NEW: Track AODN UUID extraction
         }
         
     def connect(self):
@@ -97,8 +104,14 @@ class MetadataEnricher:
         logger.info(f"Found {len(xml_files)} metadata.xml files in {self.aodn_data_path}")
         return xml_files
     
-    def parse_iso_19115_xml(self, xml_path: Path) -> Dict[str, any]:
-        """Extract metadata fields from ISO 19115-3 XML file."""
+    def parse_iso_19115_xml(self, xml_path: Path) -> Tuple[Dict[str, any], Optional[str]]:
+        """
+        Extract metadata fields from ISO 19115-3 XML file.
+        
+        Returns:
+            Tuple of (metadata_dict, aodn_uuid) where aodn_uuid may be None
+            for non-AODN datasets.
+        """
         try:
             tree = ET.parse(xml_path)
             root = tree.getroot()
@@ -117,6 +130,13 @@ class MetadataEnricher:
                 'supplemental_info': None,
                 'license_url': None,
             }
+            
+            # ========== NEW: Extract AODN UUID from XML ==========
+            aodn_uuid = self._extract_aodn_uuid(root)
+            if aodn_uuid:
+                logger.info(f"Extracted AODN UUID: {aodn_uuid}")
+                self.stats['aodn_uuids_extracted'] += 1
+            # ====================================================
             
             # Extract abstract
             abstract_xpath = './/gmd:abstract/gco:CharacterString'
@@ -148,16 +168,71 @@ class MetadataEnricher:
             if license_elem is not None and license_elem.text:
                 metadata['license_url'] = license_elem.text[:500]
             
-            return metadata
+            return metadata, aodn_uuid
             
         except ET.ParseError as e:
             logger.error(f"XML parsing error in {xml_path}: {e}")
             self.stats['files_failed'] += 1
-            return {}
+            return {}, None
         except Exception as e:
             logger.error(f"Unexpected error parsing {xml_path}: {e}")
             self.stats['files_failed'] += 1
-            return {}
+            return {}, None
+    
+    def _extract_aodn_uuid(self, root: ET.Element) -> Optional[str]:
+        """
+        Extract AODN UUID from ISO 19115-3 XML metadata.
+        
+        The UUID is typically found in the MD_Metadata/fileIdentifier element.
+        Returns:
+            AODN UUID string if found, None otherwise
+        """
+        try:
+            # Try multiple common XPath patterns for UUID extraction
+            uuid_patterns = [
+                './/gmd:fileIdentifier/gco:CharacterString',
+                './/fileIdentifier/gco:CharacterString',
+                './/mdb:MD_Metadata/mdb:metadataIdentifier/mcc:MD_Identifier/mcc:code/gco:CharacterString',
+                './/gmd:MD_Metadata/gmd:fileIdentifier/gco:CharacterString',
+            ]
+            
+            for pattern in uuid_patterns:
+                uuid_elem = root.find(pattern, NAMESPACES)
+                if uuid_elem is not None and uuid_elem.text:
+                    uuid_str = uuid_elem.text.strip()
+                    if uuid_str:  # Ensure non-empty
+                        return uuid_str
+            
+            logger.debug(f"No AODN UUID found in XML document")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Error extracting AODN UUID: {e}")
+            return None
+    
+    def check_aodn_uuid_exists(self, aodn_uuid: str) -> bool:
+        """
+        Check if AODN UUID already exists in metadata table.
+        
+        NEW: Implements deduplication logic to prevent re-ingestion.
+        
+        Returns:
+            True if AODN UUID already exists (skip processing)
+            False if AODN UUID is new (process normally)
+        """
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id FROM metadata WHERE aodn_uuid = %s LIMIT 1",
+                [aodn_uuid]
+            )
+            result = cursor.fetchone()
+            return result is not None
+        except psycopg2.Error as e:
+            logger.error(f"Database error checking AODN UUID {aodn_uuid}: {e}")
+            return False
+        finally:
+            cursor.close()
     
     def _extract_spatial_extent(self, root: ET.Element, metadata: dict):
         """Extract geographic bounding box from XML."""
@@ -202,10 +277,22 @@ class MetadataEnricher:
         except Exception as e:
             logger.warning(f"Could not extract temporal extent: {e}")
     
-    def update_metadata_table(self, uuid: str, metadata: dict) -> int:
-        """Update metadata table with extracted values. Returns rows updated."""
+    def update_metadata_table(self, uuid: str, metadata: dict, aodn_uuid: Optional[str] = None) -> int:
+        """
+        Update metadata table with extracted values.
+        
+        Updated to handle aodn_uuid field.
+        
+        Returns:
+            Number of rows updated.
+        """
         # Filter out None values and prepare update
         updates_dict = {k: v for k, v in metadata.items() if v is not None}
+        
+        # ========== NEW: Include aodn_uuid in updates ==========
+        if aodn_uuid:
+            updates_dict['aodn_uuid'] = aodn_uuid
+        # =======================================================
         
         if not updates_dict:
             return 0
@@ -237,6 +324,8 @@ class MetadataEnricher:
             
             if rows_updated > 0:
                 logger.info(f"Updated {uuid}: {rows_updated} fields enriched")
+                if aodn_uuid:
+                    logger.info(f"  AODN UUID: {aodn_uuid}")
                 
         except psycopg2.Error as e:
             logger.error(f"Database error updating metadata for {uuid}: {e}")
@@ -259,9 +348,20 @@ class MetadataEnricher:
             
             for uuid, xml_path in xml_files.items():
                 logger.info(f"Processing {uuid}")
-                metadata = self.parse_iso_19115_xml(xml_path)
+                metadata, aodn_uuid = self.parse_iso_19115_xml(xml_path)
                 
-                rows = self.update_metadata_table(uuid, metadata)
+                # ========== NEW: Deduplication check ==========
+                if aodn_uuid:
+                    if self.check_aodn_uuid_exists(aodn_uuid):
+                        logger.warning(
+                            f"AODN dataset with UUID {aodn_uuid} already exists in database. "
+                            f"Skipping to prevent duplication."
+                        )
+                        self.stats['files_deduplicated'] += 1
+                        continue
+                # ==============================================
+                
+                rows = self.update_metadata_table(uuid, metadata, aodn_uuid)
                 if rows > 0:
                     self.stats['rows_updated'] += rows
                     self.stats['files_processed'] += 1
@@ -276,14 +376,16 @@ class MetadataEnricher:
     
     def _print_summary(self):
         """Print enrichment summary statistics."""
-        logger.info("=" * 60)
+        logger.info("=" * 70)
         logger.info("METADATA ENRICHMENT SUMMARY")
-        logger.info("=" * 60)
-        logger.info(f"XML files found:     {self.stats['files_found']}")
-        logger.info(f"Files processed:     {self.stats['files_processed']}")
-        logger.info(f"Files failed:        {self.stats['files_failed']}")
-        logger.info(f"Rows updated:        {self.stats['rows_updated']}")
-        logger.info("=" * 60)
+        logger.info("=" * 70)
+        logger.info(f"XML files found:          {self.stats['files_found']}")
+        logger.info(f"Files processed:          {self.stats['files_processed']}")
+        logger.info(f"Files deduplicated:       {self.stats['files_deduplicated']}")
+        logger.info(f"Files failed:             {self.stats['files_failed']}")
+        logger.info(f"AODN UUIDs extracted:     {self.stats['aodn_uuids_extracted']}")
+        logger.info(f"Rows updated:             {self.stats['rows_updated']}")
+        logger.info("=" * 70)
 
 
 if __name__ == '__main__':
