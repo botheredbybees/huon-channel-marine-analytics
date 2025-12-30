@@ -7,6 +7,9 @@ Enhanced with:
 - AODN UUID extraction from XML metadata
 - Deduplication logic to prevent re-ingestion of AODN datasets
 - aodn_uuid field population for AODN-sourced data
+- Parameter extraction from XML contentInfo sections
+- Automatic update of parameter_mappings table
+- Automatic update of config_parameter_mapping.json file
 - Improved logging for debugging and audit trails
 
 This script extracts metadata from XML files located in dataset directories
@@ -29,11 +32,12 @@ import os
 import psycopg2
 from pathlib import Path
 from xml.etree import ElementTree as ET
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import logging
 from datetime import datetime
 import sys
 import re
+import json
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,32 +46,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # XML namespace mappings for ISO 19115-3
-# Note: Using only common namespaces for explicit find() calls
-# For generic searches, we use regex-based namespace-agnostic matching
 NAMESPACES = {
     'gmd': 'http://www.isotc211.org/2005/gmd',
     'gco': 'http://www.isotc211.org/2005/gco',
     'gml': 'http://www.opengis.net/gml/3.2.1',
     'srv': 'http://www.isotc211.org/2005/srv',
     'mdb': 'http://www.isotc211.org/2005/mdb',
+    'mrc': 'http://standards.iso.org/iso/19115/-3/mrc/1.0',
 }
 
 
 def find_element_with_namespace(root: ET.Element, local_tag: str) -> Optional[ET.Element]:
-    """
-    Find element by local tag name, ignoring namespace.
-    
-    This handles ISO 19115-3 documents where namespace prefixes may vary.
-    
-    Args:
-        root: XML root element
-        local_tag: Tag name without namespace (e.g., 'CharacterString')
-    
-    Returns:
-        First matching element, or None
-    """
+    """Find element by local tag name, ignoring namespace."""
     for elem in root.iter():
-        # Extract local name from tag (remove namespace prefix)
         tag_local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
         if tag_local == local_tag:
             return elem
@@ -75,17 +66,7 @@ def find_element_with_namespace(root: ET.Element, local_tag: str) -> Optional[ET
 
 
 def find_elements_by_path_generic(root: ET.Element, path_parts: list) -> Optional[ET.Element]:
-    """
-    Find element by path, matching local names without namespace.
-    
-    Args:
-        root: XML root element
-        path_parts: List of tag names to match in sequence
-                   e.g., ['metadataIdentifier', 'MD_Identifier', 'code', 'CharacterString']
-    
-    Returns:
-        First matching element at end of path, or None
-    """
+    """Find element by path, matching local names without namespace."""
     def local_name(tag):
         return tag.split('}')[-1] if '}' in tag else tag
     
@@ -113,6 +94,7 @@ class MetadataEnricher:
         self.db_config = db_config
         self.aodn_data_path = Path(aodn_data_path)
         self.conn = None
+        self.config_json_path = Path(__file__).parent.parent / 'config_parameter_mapping.json'
         self.stats = {
             'files_found': 0,
             'files_processed': 0,
@@ -121,6 +103,8 @@ class MetadataEnricher:
             'rows_updated': 0,
             'aodn_uuids_extracted': 0,
             'fields_enriched': 0,
+            'parameters_found': 0,
+            'parameters_added': 0,
         }
         
     def connect(self):
@@ -140,17 +124,21 @@ class MetadataEnricher:
             logger.info("Disconnected from database")
     
     def find_metadata_xml_files(self) -> Dict[str, Path]:
-        """Find all metadata.xml files in AODN_data directory."""
+        """
+        Find all metadata.xml files in AODN_data directory.
+        Searches both {dataset_path}/metadata/metadata.xml and {dataset_path}/metadata.xml
+        """
         xml_files = {}
-        pattern = '**/metadata/metadata.xml'
         
         if not self.aodn_data_path.exists():
             logger.error(f"AODN_DATA_PATH does not exist: {self.aodn_data_path}")
             return xml_files
         
         logger.info(f"Scanning for metadata.xml files in {self.aodn_data_path}")
-        for xml_file in self.aodn_data_path.glob(pattern):
-            # Extract dataset UUID from path: AODN_data/<dataset>/<uuid>/metadata/metadata.xml
+        
+        # Pattern 1: .../metadata/metadata.xml
+        pattern1 = '**/metadata/metadata.xml'
+        for xml_file in self.aodn_data_path.glob(pattern1):
             try:
                 parts = xml_file.parts
                 if len(parts) >= 2:
@@ -159,36 +147,43 @@ class MetadataEnricher:
                     logger.debug(f"Found metadata file: {uuid} -> {xml_file}")
             except Exception as e:
                 logger.warning(f"Could not extract UUID from {xml_file}: {e}")
+        
+        # Pattern 2: .../metadata.xml (fallback)
+        pattern2 = '**/metadata.xml'
+        for xml_file in self.aodn_data_path.glob(pattern2):
+            if xml_file.parent.name != 'metadata':  # Skip if already found
+                try:
+                    uuid = xml_file.parent.name
+                    if uuid not in xml_files:
+                        xml_files[uuid] = xml_file
+                        logger.debug(f"Found metadata file (alt): {uuid} -> {xml_file}")
+                except Exception as e:
+                    logger.warning(f"Could not extract UUID from {xml_file}: {e}")
             
         self.stats['files_found'] = len(xml_files)
         logger.info(f"Found {len(xml_files)} metadata.xml files")
         return xml_files
     
-    def find_metadata_record_id(self, directory_uuid: str) -> Optional[int]:
+    def find_metadata_record_id(self, directory_uuid: str) -> Optional[Tuple[int, str]]:
         """
-        Find metadata record ID by directory UUID.
-        
-        Option 1: Returns only the record ID (simplified lookup).
-        
-        Args:
-            directory_uuid: UUID from filesystem directory structure
+        Find metadata record ID and dataset_path by directory UUID.
         
         Returns:
-            metadata.id (primary key) if found, None otherwise
+            Tuple of (metadata.id, dataset_path) if found, None otherwise
         """
         cursor = self.conn.cursor()
         try:
             logger.debug(f"Looking up metadata record for directory UUID: {directory_uuid}")
             cursor.execute(
-                "SELECT id FROM metadata WHERE uuid = %s LIMIT 1",
+                "SELECT id, dataset_path FROM metadata WHERE uuid = %s LIMIT 1",
                 [directory_uuid]
             )
             result = cursor.fetchone()
             
             if result:
-                record_id = result[0]
-                logger.info(f"✓ Found metadata record: directory_uuid={directory_uuid} -> metadata.id={record_id}")
-                return record_id
+                record_id, dataset_path = result
+                logger.info(f"✓ Found metadata record: directory_uuid={directory_uuid} -> metadata.id={record_id}, dataset_path={dataset_path}")
+                return (record_id, dataset_path)
             else:
                 logger.warning(f"✗ No metadata record found for directory UUID: {directory_uuid}")
                 return None
@@ -199,13 +194,12 @@ class MetadataEnricher:
         finally:
             cursor.close()
     
-    def parse_iso_19115_xml(self, xml_path: Path) -> Tuple[Dict[str, any], Optional[str]]:
+    def parse_iso_19115_xml(self, xml_path: Path) -> Tuple[Dict[str, any], Optional[str], List[Dict]]:
         """
-        Extract metadata fields from ISO 19115-3 XML file.
+        Extract metadata fields and parameters from ISO 19115-3 XML file.
         
         Returns:
-            Tuple of (metadata_dict, aodn_uuid) where aodn_uuid may be None
-            for non-AODN datasets.
+            Tuple of (metadata_dict, aodn_uuid, parameters_list)
         """
         logger.debug(f"Parsing XML: {xml_path}")
         try:
@@ -227,129 +221,228 @@ class MetadataEnricher:
                 'license_url': None,
             }
             
-            # ========== NEW: Extract AODN UUID from XML ==========
+            # Extract AODN UUID
             aodn_uuid = self._extract_aodn_uuid(root)
             if aodn_uuid:
                 logger.info(f"✓ Extracted AODN UUID from XML: {aodn_uuid}")
                 self.stats['aodn_uuids_extracted'] += 1
-            else:
-                logger.debug(f"No AODN UUID found in {xml_path.name}")
-            # ====================================================
             
-            # Extract abstract
-            abstract_xpath = './/gmd:abstract/gco:CharacterString'
-            abstract_elem = root.find(abstract_xpath, NAMESPACES)
-            if abstract_elem is not None and abstract_elem.text:
-                metadata['abstract'] = abstract_elem.text[:1000]  # Limit length
-                logger.debug(f"  Found abstract ({len(abstract_elem.text)} chars)")
+            # Extract metadata fields
+            self._extract_metadata_fields(root, metadata)
             
-            # Extract credit/acknowledgment
-            credit_xpath = './/gmd:credit/gco:CharacterString'
-            credit_elem = root.find(credit_xpath, NAMESPACES)
-            if credit_elem is not None and credit_elem.text:
-                metadata['credit'] = credit_elem.text[:500]
-                logger.debug(f"  Found credit ({len(credit_elem.text)} chars)")
+            # Extract parameters
+            parameters = self._extract_parameters(root)
+            if parameters:
+                logger.info(f"✓ Extracted {len(parameters)} parameter(s) from XML")
+                self.stats['parameters_found'] += len(parameters)
             
-            # Extract spatial extent (bounding box)
-            self._extract_spatial_extent(root, metadata)
-            
-            # Extract temporal extent (dates)
-            self._extract_temporal_extent(root, metadata)
-            
-            # Extract lineage (processing history)
-            lineage_xpath = './/gmd:lineage/gmd:LI_Lineage/gmd:statement/gco:CharacterString'
-            lineage_elem = root.find(lineage_xpath, NAMESPACES)
-            if lineage_elem is not None and lineage_elem.text:
-                metadata['lineage'] = lineage_elem.text[:1000]
-                logger.debug(f"  Found lineage ({len(lineage_elem.text)} chars)")
-            
-            # Extract license/constraints
-            license_xpath = './/gmd:MD_LegalConstraints/gmd:otherConstraints/gco:CharacterString'
-            license_elem = root.find(license_xpath, NAMESPACES)
-            if license_elem is not None and license_elem.text:
-                metadata['license_url'] = license_elem.text[:500]
-                logger.debug(f"  Found license info")
-            
-            # Log summary of extracted fields
-            non_null_fields = [k for k, v in metadata.items() if v is not None]
-            logger.info(f"  Extracted {len(non_null_fields)} metadata fields: {', '.join(non_null_fields)}")
-            
-            return metadata, aodn_uuid
+            return metadata, aodn_uuid, parameters
             
         except ET.ParseError as e:
             logger.error(f"XML parsing error in {xml_path}: {e}")
             self.stats['files_failed'] += 1
-            return {}, None
+            return {}, None, []
         except Exception as e:
             logger.error(f"Unexpected error parsing {xml_path}: {e}")
             self.stats['files_failed'] += 1
-            return {}, None
+            return {}, None, []
     
-    def _extract_aodn_uuid(self, root: ET.Element) -> Optional[str]:
+    def _extract_metadata_fields(self, root: ET.Element, metadata: dict):
+        """Extract standard metadata fields from XML."""
+        # Extract abstract
+        abstract_xpath = './/gmd:abstract/gco:CharacterString'
+        abstract_elem = root.find(abstract_xpath, NAMESPACES)
+        if abstract_elem is not None and abstract_elem.text:
+            metadata['abstract'] = abstract_elem.text[:1000]
+            logger.debug(f"  Found abstract ({len(abstract_elem.text)} chars)")
+        
+        # Extract credit
+        credit_xpath = './/gmd:credit/gco:CharacterString'
+        credit_elem = root.find(credit_xpath, NAMESPACES)
+        if credit_elem is not None and credit_elem.text:
+            metadata['credit'] = credit_elem.text[:500]
+            logger.debug(f"  Found credit ({len(credit_elem.text)} chars)")
+        
+        # Extract spatial extent
+        self._extract_spatial_extent(root, metadata)
+        
+        # Extract temporal extent
+        self._extract_temporal_extent(root, metadata)
+        
+        # Extract lineage
+        lineage_xpath = './/gmd:lineage/gmd:LI_Lineage/gmd:statement/gco:CharacterString'
+        lineage_elem = root.find(lineage_xpath, NAMESPACES)
+        if lineage_elem is not None and lineage_elem.text:
+            metadata['lineage'] = lineage_elem.text[:1000]
+            logger.debug(f"  Found lineage ({len(lineage_elem.text)} chars)")
+        
+        # Extract license
+        license_xpath = './/gmd:MD_LegalConstraints/gmd:otherConstraints/gco:CharacterString'
+        license_elem = root.find(license_xpath, NAMESPACES)
+        if license_elem is not None and license_elem.text:
+            metadata['license_url'] = license_elem.text[:500]
+            logger.debug(f"  Found license info")
+        
+        non_null_fields = [k for k, v in metadata.items() if v is not None]
+        logger.info(f"  Extracted {len(non_null_fields)} metadata fields: {', '.join(non_null_fields)}")
+    
+    def _extract_parameters(self, root: ET.Element) -> List[Dict]:
         """
-        Extract AODN UUID from ISO 19115-3 XML metadata.
-        
-        The UUID is typically found in either:
-        1. metadataIdentifier/MD_Identifier/code/CharacterString (newer ISO 19115-3)
-        2. fileIdentifier/CharacterString (older gmd format)
-        
-        Uses namespace-agnostic matching to handle various namespace prefixes.
+        Extract parameter definitions from ISO 19115-3 XML contentInfo sections.
         
         Returns:
-            AODN UUID string if found, None otherwise
+            List of parameter dictionaries with keys: raw_name, standard_code, namespace, unit, description
         """
+        parameters = []
+        
+        # Search for dimension elements (older format)
+        for dimension in root.findall('.//gmd:dimension', NAMESPACES):
+            param = self._parse_dimension_element(dimension)
+            if param:
+                parameters.append(param)
+        
+        # Search for attribute elements (newer ISO 19115-3 format)
+        for attribute in root.findall('.//mrc:attribute', NAMESPACES):
+            param = self._parse_attribute_element(attribute)
+            if param:
+                parameters.append(param)
+        
+        return parameters
+    
+    def _parse_dimension_element(self, dimension: ET.Element) -> Optional[Dict]:
+        """Parse gmd:dimension element for parameter information."""
         try:
-            # Strategy 1: Try metadataIdentifier path (ISO 19115-3 standard location)
-            # metadataIdentifier -> MD_Identifier -> code -> CharacterString/Anchor
+            # Get sequence identifier (parameter name)
+            seq_id = dimension.find('.//gmd:sequenceIdentifier/gco:MemberName/gco:aName/gco:CharacterString', NAMESPACES)
+            if seq_id is None or not seq_id.text:
+                return None
+            
+            raw_name = seq_id.text.strip().upper()
+            
+            # Get descriptor (description)
+            descriptor = dimension.find('.//gmd:descriptor/gco:CharacterString', NAMESPACES)
+            description = descriptor.text.strip() if descriptor is not None and descriptor.text else None
+            
+            # Get units
+            unit_elem = dimension.find('.//gml:unitOfMeasure', NAMESPACES)
+            unit = unit_elem.text.strip() if unit_elem is not None and unit_elem.text else "unknown"
+            
+            # Generate standard code and namespace
+            standard_code = self._generate_standard_code(raw_name)
+            namespace = self._determine_namespace(raw_name)
+            
+            return {
+                'raw_name': raw_name,
+                'standard_code': standard_code,
+                'namespace': namespace,
+                'unit': unit,
+                'description': description or f"Parameter {raw_name}",
+            }
+        except Exception as e:
+            logger.warning(f"Error parsing dimension element: {e}")
+            return None
+    
+    def _parse_attribute_element(self, attribute: ET.Element) -> Optional[Dict]:
+        """Parse mrc:attribute element for parameter information."""
+        try:
+            # Get member name
+            member_name = attribute.find('.//mrc:memberName/gco:CharacterString', NAMESPACES)
+            if member_name is None or not member_name.text:
+                return None
+            
+            raw_name = member_name.text.strip().upper()
+            
+            # Get description
+            definition = attribute.find('.//mrc:definition/gco:CharacterString', NAMESPACES)
+            description = definition.text.strip() if definition is not None and definition.text else None
+            
+            # Get units
+            unit_elem = attribute.find('.//mrc:units/gml:BaseUnit/gml:identifier', NAMESPACES)
+            unit = unit_elem.text.strip() if unit_elem is not None and unit_elem.text else "unknown"
+            
+            # Generate standard code and namespace
+            standard_code = self._generate_standard_code(raw_name)
+            namespace = self._determine_namespace(raw_name)
+            
+            return {
+                'raw_name': raw_name,
+                'standard_code': standard_code,
+                'namespace': namespace,
+                'unit': unit,
+                'description': description or f"Parameter {raw_name}",
+            }
+        except Exception as e:
+            logger.warning(f"Error parsing attribute element: {e}")
+            return None
+    
+    def _generate_standard_code(self, raw_name: str) -> str:
+        """Generate standard parameter code from raw name."""
+        # Common abbreviations
+        replacements = {
+            'TEMPERATURE': 'TEMP',
+            'SALINITY': 'PSAL',
+            'CHLOROPHYLL': 'CPHL',
+            'OXYGEN': 'DOXY',
+            'PRESSURE': 'PRES',
+            'CONDUCTIVITY': 'COND',
+        }
+        
+        for full, abbr in replacements.items():
+            if full in raw_name:
+                return abbr
+        
+        # Default: use raw name
+        return raw_name
+    
+    def _determine_namespace(self, raw_name: str) -> str:
+        """Determine appropriate namespace for parameter."""
+        # BODC common parameters
+        bodc_params = ['TEMP', 'PSAL', 'CPHL', 'DOXY', 'PRES', 'DEPTH']
+        if any(p in raw_name for p in bodc_params):
+            return 'bodc'
+        
+        # CF standard names
+        cf_params = ['VELOCITY', 'WIND', 'WAVE']
+        if any(p in raw_name for p in cf_params):
+            return 'cf'
+        
+        # Default to custom
+        return 'custom'
+    
+    def _extract_aodn_uuid(self, root: ET.Element) -> Optional[str]:
+        """Extract AODN UUID from ISO 19115-3 XML metadata."""
+        try:
+            # Try metadataIdentifier path
             uuid_elem = find_elements_by_path_generic(
                 root, 
                 ['metadataIdentifier', 'MD_Identifier', 'code', 'CharacterString']
             )
             if uuid_elem is not None and uuid_elem.text:
-                uuid_str = uuid_elem.text.strip()
-                if uuid_str:
-                    logger.debug(f"Found AODN UUID via metadataIdentifier path: {uuid_str}")
-                    return uuid_str
+                return uuid_elem.text.strip()
             
-            # Try Anchor element as fallback (some metadata use gcx:Anchor for URIs)
+            # Try Anchor element
             uuid_elem = find_elements_by_path_generic(
                 root,
                 ['metadataIdentifier', 'MD_Identifier', 'code', 'Anchor']
             )
             if uuid_elem is not None and uuid_elem.text:
-                uuid_str = uuid_elem.text.strip()
-                if uuid_str:
-                    logger.debug(f"Found AODN UUID via Anchor: {uuid_str}")
-                    return uuid_str
+                return uuid_elem.text.strip()
             
-            # Strategy 2: Try older gmd:fileIdentifier path (backward compatibility)
+            # Try fileIdentifier path
             uuid_elem = find_elements_by_path_generic(
                 root,
                 ['fileIdentifier', 'CharacterString']
             )
             if uuid_elem is not None and uuid_elem.text:
-                uuid_str = uuid_elem.text.strip()
-                if uuid_str:
-                    logger.debug(f"Found AODN UUID via fileIdentifier path: {uuid_str}")
-                    return uuid_str
+                return uuid_elem.text.strip()
             
-            logger.debug(f"No AODN UUID found in XML document")
             return None
-            
         except Exception as e:
             logger.warning(f"Error extracting AODN UUID: {e}")
             return None
     
     def check_aodn_uuid_exists(self, aodn_uuid: str) -> bool:
-        """
-        Check if AODN UUID already exists in metadata table.
-        
-        Implements deduplication logic to prevent re-ingestion.
-        
-        Returns:
-            True if AODN UUID already exists (skip processing)
-            False if AODN UUID is new (process normally)
-        """
+        """Check if AODN UUID already exists in metadata table."""
         cursor = self.conn.cursor()
         try:
             cursor.execute(
@@ -361,9 +454,7 @@ class MetadataEnricher:
             
             if exists:
                 logger.info(f"⚠ AODN UUID {aodn_uuid} already exists in database (id={result[0]})")
-            else:
-                logger.debug(f"✓ AODN UUID {aodn_uuid} is new (not in database)")
-                
+            
             return exists
         except psycopg2.Error as e:
             logger.error(f"Database error checking AODN UUID {aodn_uuid}: {e}")
@@ -378,129 +469,156 @@ class MetadataEnricher:
             bbox = root.find(bbox_xpath, NAMESPACES)
             
             if bbox is not None:
-                west_xpath = './gmd:westBoundLongitude/gco:Decimal'
-                east_xpath = './gmd:eastBoundLongitude/gco:Decimal'
-                south_xpath = './gmd:southBoundLatitude/gco:Decimal'
-                north_xpath = './gmd:northBoundLatitude/gco:Decimal'
-                
-                west = bbox.find(west_xpath, NAMESPACES)
-                east = bbox.find(east_xpath, NAMESPACES)
-                south = bbox.find(south_xpath, NAMESPACES)
-                north = bbox.find(north_xpath, NAMESPACES)
+                west = bbox.find('./gmd:westBoundLongitude/gco:Decimal', NAMESPACES)
+                east = bbox.find('./gmd:eastBoundLongitude/gco:Decimal', NAMESPACES)
+                south = bbox.find('./gmd:southBoundLatitude/gco:Decimal', NAMESPACES)
+                north = bbox.find('./gmd:northBoundLatitude/gco:Decimal', NAMESPACES)
                 
                 try:
                     if west is not None and west.text: metadata['west'] = float(west.text)
                     if east is not None and east.text: metadata['east'] = float(east.text)
                     if south is not None and south.text: metadata['south'] = float(south.text)
                     if north is not None and north.text: metadata['north'] = float(north.text)
-                    
-                    if any(k in metadata for k in ['west', 'east', 'south', 'north'] if metadata[k]):
-                        logger.debug(f"  Found bounding box: [{metadata.get('west')}, {metadata.get('east')}, " +
-                                   f"{metadata.get('south')}, {metadata.get('north')}]")
                 except ValueError as e:
                     logger.warning(f"Could not parse spatial extent values: {e}")
         except Exception as e:
             logger.warning(f"Could not extract spatial extent: {e}")
     
     def _extract_temporal_extent(self, root: ET.Element, metadata: dict):
-        """Extract temporal coverage (start and end dates) from XML."""
+        """Extract temporal coverage from XML."""
         try:
-            begin_xpath = './/gmd:beginPosition'
-            end_xpath = './/gmd:endPosition'
-            
-            begin = root.find(begin_xpath, NAMESPACES)
-            end = root.find(end_xpath, NAMESPACES)
+            begin = root.find('.//gmd:beginPosition', NAMESPACES)
+            end = root.find('.//gmd:endPosition', NAMESPACES)
             
             if begin is not None and begin.text:
                 metadata['time_start'] = begin.text
-                logger.debug(f"  Found time_start: {begin.text}")
             if end is not None and end.text:
                 metadata['time_end'] = end.text
-                logger.debug(f"  Found time_end: {end.text}")
         except Exception as e:
             logger.warning(f"Could not extract temporal extent: {e}")
     
     def update_metadata_table(self, record_id: int, directory_uuid: str, metadata: dict, aodn_uuid: Optional[str] = None) -> int:
-        """
-        Update metadata table with extracted values.
-        
-        Option 2: Enhanced logging for all operations.
-        
-        Args:
-            record_id: metadata.id (primary key)
-            directory_uuid: Directory UUID (for logging only)
-            metadata: Dictionary of metadata fields to update
-            aodn_uuid: AODN UUID from XML (if present)
-        
-        Returns:
-            Number of fields updated
-        """
+        """Update metadata table with extracted values."""
         cursor = self.conn.cursor()
         fields_updated = 0
         
         try:
             logger.info(f"Updating record id={record_id} (directory_uuid={directory_uuid})")
             
-            # STEP 1: Update aodn_uuid if present (always overwrite)
+            # Update aodn_uuid if present
             if aodn_uuid:
-                query_aodn = """
-                    UPDATE metadata 
-                    SET aodn_uuid = %s
-                    WHERE id = %s
-                    RETURNING id
-                """
-                cursor.execute(query_aodn, [aodn_uuid, record_id])
+                cursor.execute(
+                    "UPDATE metadata SET aodn_uuid = %s WHERE id = %s RETURNING id",
+                    [aodn_uuid, record_id]
+                )
                 if cursor.rowcount > 0:
                     fields_updated += 1
                     self.conn.commit()
                     logger.info(f"  ✓ Updated aodn_uuid = {aodn_uuid}")
-                else:
-                    logger.debug(f"  - No change to aodn_uuid (already set)")
             
-            # STEP 2: Update other fields only if they are NULL
+            # Update other fields only if NULL
             other_updates = {k: v for k, v in metadata.items() if v is not None}
             
             if other_updates:
-                logger.debug(f"  Checking {len(other_updates)} fields for NULL values")
                 null_conditions = ' OR '.join([f'{k} IS NULL' for k in other_updates.keys()])
                 set_clause = ', '.join([f'{k} = %s' for k in other_updates.keys()])
                 
-                query_fields = f"""
-                    UPDATE metadata 
-                    SET {set_clause}
-                    WHERE id = %s
-                      AND ({null_conditions})
-                    RETURNING id
-                """
-                
-                values = list(other_updates.values()) + [record_id]
-                cursor.execute(query_fields, values)
+                cursor.execute(
+                    f"UPDATE metadata SET {set_clause} WHERE id = %s AND ({null_conditions}) RETURNING id",
+                    list(other_updates.values()) + [record_id]
+                )
                 
                 if cursor.rowcount > 0:
-                    updated_count = cursor.rowcount
                     fields_updated += len(other_updates)
                     self.stats['fields_enriched'] += len(other_updates)
                     self.conn.commit()
-                    logger.info(f"  ✓ Enriched {len(other_updates)} fields: {', '.join(other_updates.keys())}")
-                else:
-                    logger.debug(f"  - No NULL fields to update (all already populated)")
+                    logger.info(f"  ✓ Enriched {len(other_updates)} fields")
             
             if fields_updated > 0:
                 self.stats['rows_updated'] += 1
-                logger.info(f"  SUCCESS: Updated {fields_updated} total fields for record {record_id}")
-            else:
-                logger.info(f"  SKIPPED: All fields already populated for record {record_id}")
                 
         except psycopg2.Error as e:
             logger.error(f"✗ Database error updating record id={record_id}: {e}")
-            self.conn.rollback()
-        except Exception as e:
-            logger.error(f"✗ Unexpected error updating record {record_id}: {e}")
             self.conn.rollback()
         finally:
             cursor.close()
         
         return fields_updated
+    
+    def add_parameters_to_database(self, parameters: List[Dict]):
+        """Add new parameters to parameter_mappings table."""
+        cursor = self.conn.cursor()
+        
+        try:
+            for param in parameters:
+                # Check if parameter already exists
+                cursor.execute(
+                    "SELECT id FROM parameter_mappings WHERE raw_parameter_name = %s",
+                    [param['raw_name']]
+                )
+                
+                if cursor.fetchone() is None:
+                    # Insert new parameter
+                    cursor.execute(
+                        """
+                        INSERT INTO parameter_mappings 
+                        (raw_parameter_name, standard_code, namespace, unit, source, description)
+                        VALUES (%s, %s, %s, %s, 'xml', %s)
+                        """,
+                        [param['raw_name'], param['standard_code'], param['namespace'], 
+                         param['unit'], param['description']]
+                    )
+                    self.stats['parameters_added'] += 1
+                    logger.info(f"  ✓ Added parameter: {param['raw_name']} -> {param['standard_code']} ({param['namespace']})")
+                else:
+                    logger.debug(f"  - Parameter already exists: {param['raw_name']}")
+            
+            self.conn.commit()
+            
+        except psycopg2.Error as e:
+            logger.error(f"Database error adding parameters: {e}")
+            self.conn.rollback()
+        finally:
+            cursor.close()
+    
+    def update_config_json(self, parameters: List[Dict]):
+        """Update config_parameter_mapping.json with new parameters."""
+        try:
+            # Load existing config
+            if self.config_json_path.exists():
+                with open(self.config_json_path, 'r') as f:
+                    config = json.load(f)
+            else:
+                logger.warning(f"Config file not found: {self.config_json_path}")
+                config = {'parameter_mapping': {}}
+            
+            # Add new parameters
+            param_mapping = config.get('parameter_mapping', {})
+            added_count = 0
+            
+            for param in parameters:
+                if param['raw_name'] not in param_mapping:
+                    param_mapping[param['raw_name']] = [
+                        param['standard_code'],
+                        param['namespace'],
+                        param['unit']
+                    ]
+                    added_count += 1
+                    logger.info(f"  ✓ Added to config JSON: {param['raw_name']}")
+            
+            if added_count > 0:
+                config['parameter_mapping'] = param_mapping
+                
+                # Save updated config
+                with open(self.config_json_path, 'w') as f:
+                    json.dump(config, f, indent=2)
+                
+                logger.info(f"✓ Updated {self.config_json_path} with {added_count} new parameter(s)")
+            else:
+                logger.debug("No new parameters to add to config JSON")
+                
+        except Exception as e:
+            logger.error(f"Error updating config JSON: {e}")
     
     def run_enrichment(self):
         """Main enrichment workflow."""
@@ -524,35 +642,35 @@ class MetadataEnricher:
                 logger.info(f"File: {xml_path}")
                 logger.info(f"{'='*70}")
                 
-                # Option 1: Simplified lookup - get record ID
-                record_id = self.find_metadata_record_id(directory_uuid)
-                if not record_id:
+                # Find record by ID and get dataset_path
+                result = self.find_metadata_record_id(directory_uuid)
+                if not result:
                     logger.error(f"Cannot process {directory_uuid}: no metadata record found")
                     self.stats['files_failed'] += 1
                     continue
                 
-                # Parse XML and extract metadata
-                metadata, aodn_uuid = self.parse_iso_19115_xml(xml_path)
+                record_id, dataset_path = result
+                
+                # Parse XML and extract metadata and parameters
+                metadata, aodn_uuid, parameters = self.parse_iso_19115_xml(xml_path)
                 
                 # Check for deduplication
-                if aodn_uuid:
-                    if self.check_aodn_uuid_exists(aodn_uuid):
-                        logger.warning(
-                            f"⚠ SKIPPING: AODN dataset {aodn_uuid} already exists. "
-                            f"Would create duplicate."
-                        )
-                        self.stats['files_deduplicated'] += 1
-                        continue
+                if aodn_uuid and self.check_aodn_uuid_exists(aodn_uuid):
+                    logger.warning(f"⚠ SKIPPING: AODN dataset {aodn_uuid} already exists")
+                    self.stats['files_deduplicated'] += 1
+                    continue
                 
-                # Update database
+                # Update metadata table
                 fields_updated = self.update_metadata_table(record_id, directory_uuid, metadata, aodn_uuid)
                 
-                if fields_updated > 0:
-                    self.stats['files_processed'] += 1
-                    logger.info(f"✓ COMPLETED: {directory_uuid}\n")
-                else:
-                    self.stats['files_processed'] += 1
-                    logger.info(f"○ COMPLETED (no changes): {directory_uuid}\n")
+                # Process parameters if found
+                if parameters:
+                    logger.info(f"Processing {len(parameters)} parameter(s)")
+                    self.add_parameters_to_database(parameters)
+                    self.update_config_json(parameters)
+                
+                self.stats['files_processed'] += 1
+                logger.info(f"✓ COMPLETED: {directory_uuid}\n")
         
         except Exception as e:
             logger.error(f"✗ FATAL ERROR during enrichment: {e}")
@@ -574,24 +692,22 @@ class MetadataEnricher:
         logger.info(f"AODN UUIDs extracted:     {self.stats['aodn_uuids_extracted']}")
         logger.info(f"Records updated:          {self.stats['rows_updated']}")
         logger.info(f"Total fields enriched:    {self.stats['fields_enriched']}")
+        logger.info(f"Parameters found:         {self.stats['parameters_found']}")
+        logger.info(f"Parameters added to DB:   {self.stats['parameters_added']}")
         logger.info("=" * 70)
 
 
 if __name__ == '__main__':
-    # Build db_config from environment variables
-    # Use correct defaults matching docker-compose.yml
     db_config = {
         'host': os.getenv('DB_HOST', 'localhost'),
         'port': int(os.getenv('DB_PORT', 5433)),
         'database': os.getenv('DB_NAME', 'marine_db'),
         'user': os.getenv('DB_USER', 'marine_user'),
-        'password': os.getenv('DB_PASSWORD'),  # No default - must be provided
+        'password': os.getenv('DB_PASSWORD'),
     }
     
-    # Validate required password
     if not db_config['password']:
         logger.error("DB_PASSWORD environment variable not set")
-        logger.error("Set it with: export DB_PASSWORD=marine_pass123")
         sys.exit(1)
     
     aodn_path = os.getenv('AODN_DATA_PATH', '/AODN_data')
