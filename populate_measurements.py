@@ -56,10 +56,10 @@ def get_db_connection():
     """Create database connection."""
     return psycopg2.connect(
         host="localhost",
-        port=5432,
+        port=5433,
         dbname="marine_db",
         user="marine_user",
-        password="marine_pass"
+        password="marine_pass123"
     )
 
 # ============================================================================
@@ -75,15 +75,12 @@ def get_or_create_location(cursor, latitude: float, longitude: float, metadata_i
         
     # Try to find existing location (within 0.0001 degrees ~ 11 meters)
     cursor.execute("""
-        SELECT location_id 
+        SELECT id 
         FROM locations 
-        WHERE ST_DWithin(
-            coordinates::geography,
-            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
-            11
-        )
+        WHERE ABS(latitude - %s) < 0.0001 
+          AND ABS(longitude - %s) < 0.0001
         LIMIT 1
-    """, (longitude, latitude))
+    """, (latitude, longitude))
     
     result = cursor.fetchone()
     if result:
@@ -91,10 +88,10 @@ def get_or_create_location(cursor, latitude: float, longitude: float, metadata_i
     
     # Create new location
     cursor.execute("""
-        INSERT INTO locations (coordinates)
-        VALUES (ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-        RETURNING location_id
-    """, (longitude, latitude))
+        INSERT INTO locations (latitude, longitude)
+        VALUES (%s, %s)
+        RETURNING id
+    """, (latitude, longitude))
     
     return cursor.fetchone()[0]
 
@@ -201,13 +198,16 @@ class CSVExtractor:
                         value = float(row[param_col])
                         if pd.notna(value):
                             measurements.append((
-                                metadata_id,
-                                location_id,
-                                param_name,
-                                value,
-                                timestamp,
-                                None,  # qc_flag
-                                file_path.name
+                                timestamp or datetime.now(),  # time (required)
+                                metadata_id,  # metadata_id
+                                location_id,  # location_id
+                                param_name,  # parameter_code
+                                'custom',  # namespace
+                                value,  # value
+                                'unknown',  # uom (unit of measure)
+                                None,  # uncertainty
+                                None,  # depth_m
+                                1  # quality_flag
                             ))
                     except (ValueError, TypeError):
                         continue
@@ -275,7 +275,7 @@ class NetCDFExtractor:
                                 continue
                             
                             # Convert time to datetime
-                            timestamp = None
+                            timestamp = datetime.now()
                             try:
                                 if isinstance(time_val, (cftime._cftime.DatetimeGregorian, cftime._cftime.DatetimeProlepticGregorian)):
                                     timestamp = datetime(
@@ -302,13 +302,16 @@ class NetCDFExtractor:
                                     pass
                             
                             measurements.append((
-                                metadata_id,
-                                location_id,
-                                param_name,
-                                float(value),
-                                timestamp,
-                                None,  # qc_flag
-                                file_path.name
+                                timestamp,  # time
+                                metadata_id,  # metadata_id
+                                location_id,  # location_id
+                                param_name,  # parameter_code
+                                'custom',  # namespace
+                                float(value),  # value
+                                'unknown',  # uom
+                                None,  # uncertainty
+                                None,  # depth_m
+                                1  # quality_flag
                             ))
                     
                     else:
@@ -325,13 +328,16 @@ class NetCDFExtractor:
                                     pass
                             
                             measurements.append((
-                                metadata_id,
-                                location_id,
-                                param_name,
-                                value,
-                                None,  # timestamp
-                                None,  # qc_flag
-                                file_path.name
+                                datetime.now(),  # time
+                                metadata_id,  # metadata_id
+                                location_id,  # location_id
+                                param_name,  # parameter_code
+                                'custom',  # namespace
+                                value,  # value
+                                'unknown',  # uom
+                                None,  # uncertainty
+                                None,  # depth_m
+                                1  # quality_flag
                             ))
                 
                 except Exception as e:
@@ -372,9 +378,9 @@ class BatchInserter:
                 
                 self.cursor.executemany("""
                     INSERT INTO measurements (
-                        metadata_id, location_id, parameter_name, 
-                        value, timestamp, qc_flag, source_file
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        time, metadata_id, location_id, parameter_code, 
+                        namespace, value, uom, uncertainty, depth_m, quality_flag
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, batch)
                 
                 self.total_inserted += len(batch)
@@ -404,12 +410,12 @@ def main():
         nc_extractor = NetCDFExtractor(cursor)
         inserter = BatchInserter(cursor)
         
-        # Get all datasets
+        # Get all datasets - FIXED: Use 'id' not 'metadata_id'
         cursor.execute("""
-            SELECT metadata_id, title, file_path
+            SELECT id, title, dataset_path
             FROM metadata
-            WHERE file_path IS NOT NULL
-            ORDER BY metadata_id
+            WHERE dataset_path IS NOT NULL
+            ORDER BY id
         """)
         
         datasets = cursor.fetchall()
@@ -467,6 +473,8 @@ def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         logger.info(f"📝 Full log saved to: {log_filename}")
+        import traceback
+        logger.error(traceback.format_exc())
         sys.exit(1)
     
     finally:
