@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+populate_biological.py - Biological Data Ingestion (PostGIS-Free Version)
+
+Processes species observation and biological survey data from CSV files.
+Uses latitude/longitude coordinates instead of PostGIS geometry columns.
+
+Compatible with TimescaleDB Community Edition (no PostGIS dependency).
+Version: 2.0 (PostGIS-free)
+Last Updated: December 30, 2025
+"""
+
 import os
 import sys
 import argparse
@@ -7,7 +19,7 @@ from psycopg2.extras import execute_values
 import numpy as np
 import re
 
-# DB Config
+# Database Configuration
 DB_CONFIG = {
     'dbname': 'marine_db',
     'user': 'marine_user',
@@ -36,7 +48,7 @@ def parse_wkt_point(wkt_string):
     return None, None
 
 def get_or_create_location(cur, lat, lon, metadata_id, name=None):
-    """Get or create location by lat/lon"""
+    """Get or create location by lat/lon (PostGIS-free)"""
     if pd.isna(lat) or pd.isna(lon):
         return None
     
@@ -44,6 +56,7 @@ def get_or_create_location(cur, lat, lon, metadata_id, name=None):
     if name is None:
         name = f"Site at {lat:.4f},{lon:.4f}"
     
+    # Find existing location within 10m (~0.0001 degrees)
     cur.execute("""
         SELECT id FROM locations 
         WHERE ABS(latitude - %s) < 0.0001 AND ABS(longitude - %s) < 0.0001
@@ -53,11 +66,12 @@ def get_or_create_location(cur, lat, lon, metadata_id, name=None):
         return res[0]
     
     try:
+        # Insert new location without PostGIS geometry
         cur.execute("""
-            INSERT INTO locations (location_name, latitude, longitude, location_geom)
-            VALUES (%s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+            INSERT INTO locations (location_name, latitude, longitude)
+            VALUES (%s, %s, %s)
             RETURNING id
-        """, (name, lat, lon, lon, lat))
+        """, (name, lat, lon))
         return cur.fetchone()[0]
     except:
         return None
@@ -119,10 +133,9 @@ def detect_csv_format(df):
     return 'unknown'
 
 def process_australian_phyto_format(df, metadata_id, cur, conn):
-    """Process Australian Phytoplankton Database format"""
+    """Process Australian Phytoplankton Database format (PostGIS-free)"""
     print("  Format: Australian Phytoplankton Database")
     
-    # Map column names
     col_map = {c.upper(): c for c in df.columns}
     
     taxon_col = col_map.get('TAXON_NAME')
@@ -143,7 +156,7 @@ def process_australian_phyto_format(df, metadata_id, cur, conn):
         if pd.isna(row.get(lat_col)) or pd.isna(row.get(lon_col)):
             continue
         
-        # Build species name: prefer GENUS + SPECIES, fallback to TAXON_NAME
+        # Build species name
         species_name = None
         if genus_col and species_col:
             genus = row.get(genus_col)
@@ -153,7 +166,6 @@ def process_australian_phyto_format(df, metadata_id, cur, conn):
             elif pd.notna(genus):
                 species_name = f"{genus} spp."
         
-        # Fallback to TAXON_NAME if species name not built
         if not species_name and taxon_col:
             taxon = row.get(taxon_col)
             if pd.notna(taxon) and str(taxon).strip() != '':
@@ -165,7 +177,7 @@ def process_australian_phyto_format(df, metadata_id, cur, conn):
         lat, lon = row[lat_col], row[lon_col]
         obs_date = row.get(date_col) if date_col else None
         
-        # Get count value (prefer CELLS_L, fallback to biovolume presence)
+        # Get count value
         count = None
         if count_col:
             count_val = row.get(count_col)
@@ -175,11 +187,10 @@ def process_australian_phyto_format(df, metadata_id, cur, conn):
                 except:
                     pass
         
-        # If no count, check if biovolume indicates presence
         if count is None and biovolume_col:
             biovolume = row.get(biovolume_col)
             if pd.notna(biovolume):
-                count = 1  # Presence indicator
+                count = 1
         
         location_id = get_or_create_location(cur, lat, lon, metadata_id)
         if not location_id:
@@ -190,11 +201,12 @@ def process_australian_phyto_format(df, metadata_id, cur, conn):
             continue
         
         try:
+            # PostGIS-free: insert lat/lon directly
             cur.execute("""
                 INSERT INTO species_observations 
-                (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
-                VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
+                (metadata_id, location_id, taxonomy_id, observation_date, count_value, latitude, longitude)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lat, lon))
             records_inserted += 1
         except Exception as e:
             conn.rollback()
@@ -208,10 +220,9 @@ def process_australian_phyto_format(df, metadata_id, cur, conn):
     return records_inserted
 
 def process_matrix_format(df, metadata_id, cur, conn):
-    """Process larval fish matrix format where species are columns"""
+    """Process larval fish matrix format (PostGIS-free)"""
     print("  Format: Matrix (species as columns)")
     
-    # Find species columns (family_genus_species_id format)
     species_cols = [c for c in df.columns if '_' in c and c.count('_') >= 2 and not c.startswith('Sample')]
     
     if 'Latitude' not in df.columns or 'Longitude' not in df.columns:
@@ -228,34 +239,29 @@ def process_matrix_format(df, metadata_id, cur, conn):
         lat, lon = row['Latitude'], row['Longitude']
         obs_date = row.get(date_col) if date_col in row else None
         
-        # Get or create location
         location_id = get_or_create_location(cur, lat, lon, metadata_id)
         if not location_id:
             continue
         
-        # Process each species column
         for species_col in species_cols:
             count = row[species_col]
             if pd.notna(count) and count > 0:
-                # Parse species name from column (format: Family_Genus.species_ID)
                 parts = species_col.split('_')
                 if len(parts) >= 2:
                     genus_species = parts[1].replace('.', ' ')
                 else:
                     genus_species = parts[0]
                 
-                # Get or create taxonomy
                 taxonomy_id = get_or_create_taxonomy(cur, genus_species, '')
                 if not taxonomy_id:
                     continue
                 
-                # Insert observation
                 try:
                     cur.execute("""
                         INSERT INTO species_observations 
-                        (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
-                        VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-                    """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
+                        (metadata_id, location_id, taxonomy_id, observation_date, count_value, latitude, longitude)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (metadata_id, location_id, taxonomy_id, obs_date, count, lat, lon))
                     records_inserted += 1
                 except Exception as e:
                     conn.rollback()
@@ -269,10 +275,9 @@ def process_matrix_format(df, metadata_id, cur, conn):
     return records_inserted
 
 def process_phytoplankton_format(df, metadata_id, cur, conn):
-    """Process phytoplankton format with GENUS_SPECIES or TAXON column"""
+    """Process phytoplankton format (PostGIS-free)"""
     print("  Format: Phytoplankton")
     
-    # Map column names (case insensitive)
     col_map = {c.upper(): c for c in df.columns}
     
     species_col = col_map.get('GENUS_SPECIES') or col_map.get('TAXON')
@@ -309,9 +314,9 @@ def process_phytoplankton_format(df, metadata_id, cur, conn):
         try:
             cur.execute("""
                 INSERT INTO species_observations 
-                (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
-                VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
+                (metadata_id, location_id, taxonomy_id, observation_date, count_value, latitude, longitude)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lat, lon))
             records_inserted += 1
         except Exception as e:
             conn.rollback()
@@ -325,10 +330,9 @@ def process_phytoplankton_format(df, metadata_id, cur, conn):
     return records_inserted
 
 def process_redmap_format(df, metadata_id, cur, conn):
-    """Process Redmap citizen science sightings format"""
+    """Process Redmap citizen science sightings (PostGIS-free)"""
     print("  Format: Redmap sightings")
     
-    # Map column names
     col_map = {c.upper(): c for c in df.columns}
     
     species_col = col_map.get('SPECIES')
@@ -366,9 +370,9 @@ def process_redmap_format(df, metadata_id, cur, conn):
         try:
             cur.execute("""
                 INSERT INTO species_observations 
-                (metadata_id, location_id, taxonomy_id, observation_date, geom)
-                VALUES (%s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-            """, (metadata_id, location_id, taxonomy_id, obs_date, lon, lat))
+                (metadata_id, location_id, taxonomy_id, observation_date, latitude, longitude)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (metadata_id, location_id, taxonomy_id, obs_date, lat, lon))
             records_inserted += 1
         except Exception as e:
             conn.rollback()
@@ -382,10 +386,10 @@ def process_redmap_format(df, metadata_id, cur, conn):
     return records_inserted
 
 def process_standard_format(df, metadata_id, cur, conn):
-    """Process standard observation format with support for WKT GEOM column"""
+    """Process standard observation format (PostGIS-free)"""
     print("  Format: Standard")
     
-    # Try to find species column
+    # Find species column
     species_col = None
     for col in df.columns:
         if col.upper() in ['SPECIES_NAME', 'SPECIES', 'SCIENTIFIC_NAME', 'TAXON']:
@@ -395,7 +399,7 @@ def process_standard_format(df, metadata_id, cur, conn):
     if not species_col:
         return 0
     
-    # Find location columns - check for GEOM first, then lat/lon
+    # Find location columns
     lat_col = lon_col = geom_col = None
     
     for col in df.columns:
@@ -407,13 +411,12 @@ def process_standard_format(df, metadata_id, cur, conn):
         elif col_upper in ['LONGITUDE', 'LON', 'LONG']:
             lon_col = col
     
-    # Need either GEOM or both lat/lon
     has_location = geom_col or (lat_col and lon_col)
     if not has_location:
         print("  Warning: No location columns found (need GEOM or LATITUDE/LONGITUDE)")
         return 0
     
-    # Find date column
+    # Find date and count columns
     date_col = None
     for col in df.columns:
         col_upper = col.upper()
@@ -421,7 +424,6 @@ def process_standard_format(df, metadata_id, cur, conn):
             date_col = col
             break
     
-    # Find count/abundance columns
     count_col = None
     for col in df.columns:
         col_upper = col.upper()
@@ -439,7 +441,6 @@ def process_standard_format(df, metadata_id, cur, conn):
         if geom_col:
             geom_value = row.get(geom_col)
             lat, lon = parse_wkt_point(geom_value)
-            # Fallback to separate columns if WKT parsing failed
             if lat is None and lat_col and lon_col:
                 lat = row.get(lat_col)
                 lon = row.get(lon_col)
@@ -450,10 +451,8 @@ def process_standard_format(df, metadata_id, cur, conn):
         if pd.isna(lat) or pd.isna(lon):
             continue
         
-        # Get observation date
         obs_date = row.get(date_col) if date_col else None
         
-        # Get count value
         count = None
         if count_col:
             count_val = row.get(count_col)
@@ -461,7 +460,7 @@ def process_standard_format(df, metadata_id, cur, conn):
                 try:
                     count = float(count_val)
                 except:
-                    count = 1  # Default to presence if count can't be parsed
+                    count = 1
         
         location_id = get_or_create_location(cur, lat, lon, metadata_id)
         if not location_id:
@@ -474,9 +473,9 @@ def process_standard_format(df, metadata_id, cur, conn):
         try:
             cur.execute("""
                 INSERT INTO species_observations 
-                (metadata_id, location_id, taxonomy_id, observation_date, count_value, geom)
-                VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lon, lat))
+                (metadata_id, location_id, taxonomy_id, observation_date, count_value, latitude, longitude)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (metadata_id, location_id, taxonomy_id, obs_date, count, lat, lon))
             records_inserted += 1
         except:
             conn.rollback()
@@ -493,7 +492,6 @@ def ingest_dataset(conn, file_path, metadata_id):
     """Main ingestion function with format detection"""
     print(f"Ingesting {os.path.basename(file_path)}...")
     
-    # Special handling for Australian Phytoplankton Database (has mixed types)
     if 'Australian_Phytoplankton_Database' in file_path:
         try:
             df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', 
@@ -503,7 +501,6 @@ def ingest_dataset(conn, file_path, metadata_id):
             return
     else:
         try:
-            # Read CSV with flexible encoding
             df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip', comment='#')
         except:
             try:
@@ -514,7 +511,6 @@ def ingest_dataset(conn, file_path, metadata_id):
     
     cur = conn.cursor()
     
-    # Detect format
     csv_format = detect_csv_format(df)
     
     if csv_format == 'australian_phyto':
@@ -547,12 +543,10 @@ def is_biological_csv(file_path):
     cols = [c.upper() for c in df.columns]
     bio_keywords = ['SPECIES', 'TAXON', 'SCIENTIFIC_NAME', 'GENUS', 'PHYLUM', 'FAMILY', 'GENUS_SPECIES']
     
-    # Check if any keyword matches
     for k in bio_keywords:
         if any(k in c for c in cols):
             return True
     
-    # Check for matrix format (many species columns)
     species_cols = [c for c in df.columns if '_' in c and c.count('_') >= 2]
     if len(species_cols) > 50:
         return True
@@ -566,8 +560,7 @@ def main():
     parser.add_argument(
         '--reprocess',
         action='store_true',
-        help='Process ALL datasets with biological CSVs, not just empty ones. '
-             'Useful after clearing species_observations table.'
+        help='Process ALL datasets with biological CSVs, not just empty ones.'
     )
     
     args = parser.parse_args()
@@ -577,7 +570,6 @@ def main():
         cur = conn.cursor()
         
         if args.reprocess:
-            # Process ALL datasets that have a path, ignore existing data
             print("REPROCESS MODE: Processing all datasets with biological data...")
             cur.execute("""
                 SELECT m.id, m.title, m.dataset_path 
@@ -586,7 +578,6 @@ def main():
                 ORDER BY m.title
             """)
         else:
-            # Original behavior: only process empty datasets
             print("Finding empty datasets...")
             cur.execute("""
                 SELECT m.id, m.title, m.dataset_path 
@@ -611,7 +602,6 @@ def main():
             
             print(f"\nScanning '{title}'...")
             
-            # Walk directory
             found_bio = False
             for root, dirs, files in os.walk(path):
                 for file in files:
