@@ -28,7 +28,7 @@ CREATE EXTENSION IF NOT EXISTS unaccent;
 -- PARAMETER MAPPINGS TABLE (replaces config_parameter_mapping.json)
 -- =============================================================================
 
-CREATE TABLE parameter_mappings (
+CREATE TABLE IF NOT EXISTS parameter_mappings (
     id SERIAL PRIMARY KEY,
     raw_parameter_name TEXT UNIQUE NOT NULL,
     standard_code TEXT NOT NULL,
@@ -51,7 +51,7 @@ COMMENT ON COLUMN parameter_mappings.namespace IS 'bodc = British Oceanographic 
 -- IMOS CONTROLLED VOCABULARIES (from AODN)
 -- =============================================================================
 
-CREATE TABLE public.imos_vocab_geographic_extents (
+CREATE TABLE IF NOT EXISTS public.imos_vocab_geographic_extents (
     uri text PRIMARY KEY,
     pref_label text NOT NULL,
     alt_label text,
@@ -65,7 +65,7 @@ CREATE TABLE public.imos_vocab_geographic_extents (
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE public.imos_vocab_organization_categories (
+CREATE TABLE IF NOT EXISTS public.imos_vocab_organization_categories (
     uri text PRIMARY KEY,
     pref_label text NOT NULL,
     alt_label text,
@@ -75,7 +75,7 @@ CREATE TABLE public.imos_vocab_organization_categories (
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE public.imos_vocab_platform_categories (
+CREATE TABLE IF NOT EXISTS public.imos_vocab_platform_categories (
     uri text PRIMARY KEY,
     pref_label text NOT NULL,
     alt_label text,
@@ -85,7 +85,7 @@ CREATE TABLE public.imos_vocab_platform_categories (
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE public.imos_vocab_parameter_categories (
+CREATE TABLE IF NOT EXISTS public.imos_vocab_parameter_categories (
     uri text PRIMARY KEY,
     pref_label text NOT NULL,
     definition text,
@@ -94,7 +94,7 @@ CREATE TABLE public.imos_vocab_parameter_categories (
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE public.imos_vocab_parameters (
+CREATE TABLE IF NOT EXISTS public.imos_vocab_parameters (
     uri text PRIMARY KEY,
     pref_label text NOT NULL,
     alt_label text,
@@ -109,7 +109,7 @@ CREATE TABLE public.imos_vocab_parameters (
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE public.imos_vocab_instruments (
+CREATE TABLE IF NOT EXISTS public.imos_vocab_instruments (
     uri text PRIMARY KEY,
     pref_label text NOT NULL,
     alt_label text,
@@ -121,7 +121,7 @@ CREATE TABLE public.imos_vocab_instruments (
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE public.imos_vocab_units (
+CREATE TABLE IF NOT EXISTS public.imos_vocab_units (
     uri text PRIMARY KEY,
     pref_label text NOT NULL,
     alt_label text,
@@ -136,7 +136,7 @@ CREATE TABLE public.imos_vocab_units (
 -- LOCATIONS & SPATIAL REFERENCES
 -- =============================================================================
 
-CREATE TABLE public.locations (
+CREATE TABLE IF NOT EXISTS public.locations (
     id SERIAL PRIMARY KEY,
     location_name text,
     location_type text DEFAULT 'observation_site',
@@ -162,7 +162,7 @@ WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
 -- METADATA TABLES (normalized structure for 38+ IMAS datasets)
 -- =============================================================================
 
-CREATE TABLE metadata (
+CREATE TABLE IF NOT EXISTS metadata (
     id SERIAL PRIMARY KEY,
     uuid TEXT UNIQUE NOT NULL,
     parent_uuid TEXT,
@@ -214,7 +214,7 @@ CREATE INDEX idx_metadata_dataset_name ON metadata(dataset_name);
 CREATE INDEX idx_metadata_dataset_path ON metadata(dataset_path) 
 WHERE dataset_path IS NOT NULL;
 
-CREATE TABLE public.spatial_ref_system (
+CREATE TABLE IF NOT EXISTS public.spatial_ref_system (
     id SERIAL PRIMARY KEY,
     uuid text NOT NULL REFERENCES metadata(uuid) ON DELETE CASCADE,
     srid integer NOT NULL,
@@ -225,7 +225,7 @@ CREATE TABLE public.spatial_ref_system (
     UNIQUE (uuid, srid)
 );
 
-CREATE TABLE parameters (
+CREATE TABLE IF NOT EXISTS parameters (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
     uuid TEXT NOT NULL REFERENCES metadata(uuid) ON DELETE CASCADE,
@@ -255,7 +255,7 @@ CREATE INDEX idx_parameters_code ON parameters(parameter_code);
 CREATE INDEX idx_parameters_aodn_uri ON parameters(aodn_parameter_uri);
 CREATE INDEX idx_parameters_imos_uri ON parameters(imos_parameter_uri);
 
-CREATE TABLE keywords (
+CREATE TABLE IF NOT EXISTS keywords (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
     uuid TEXT REFERENCES metadata(uuid) ON DELETE CASCADE, 
@@ -278,7 +278,7 @@ CREATE INDEX idx_keywords_thesaurus ON keywords(thesaurus_uri);
 --       Only quality-controlled data is ingested into this table.
 -- =============================================================================
 
-CREATE TABLE measurements (
+CREATE TABLE IF NOT EXISTS measurements (
     time TIMESTAMPTZ NOT NULL,
     data_id BIGSERIAL,
     uuid TEXT REFERENCES metadata(uuid) ON DELETE CASCADE,
@@ -339,7 +339,7 @@ WHERE quality_flag = 1 AND namespace IN ('bodc', 'cf');
 -- =============================================================================
 
 -- Hourly aggregates
-CREATE MATERIALIZED VIEW measurements_1h
+CREATE MATERIALIZED VIEW IF NOT EXISTS measurements_1h
 WITH (timescaledb.continuous) AS
 SELECT time_bucket('1 hour', time) AS bucket,
        parameter_code, namespace, location_id, metadata_id,
@@ -351,7 +351,7 @@ FROM measurements
 GROUP BY bucket, parameter_code, namespace, location_id, metadata_id;
 
 -- Daily aggregates
-CREATE MATERIALIZED VIEW measurements_1d
+CREATE MATERIALIZED VIEW IF NOT EXISTS measurements_1d
 WITH (timescaledb.continuous) AS
 SELECT time_bucket('1 day', time) AS bucket,
        parameter_code, namespace, location_id,
@@ -455,7 +455,7 @@ ORDER BY time DESC, parameter_code;
 -- =============================================================================
 
 -- Spatial Features Table
-CREATE TABLE IF NOT EXISTS spatial_features (
+CREATE TABLE IF NOT EXISTS IF NOT EXISTS spatial_features (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
     uuid TEXT,
@@ -466,7 +466,7 @@ CREATE INDEX IF NOT EXISTS spatial_features_geom_idx ON spatial_features USING G
 CREATE INDEX IF NOT EXISTS spatial_features_metadata_id_idx ON spatial_features(metadata_id);
 
 -- Taxonomy Table
-CREATE TABLE IF NOT EXISTS taxonomy (
+CREATE TABLE IF NOT EXISTS IF NOT EXISTS taxonomy (
     id SERIAL PRIMARY KEY,
     species_name TEXT UNIQUE NOT NULL,
     common_name TEXT,
@@ -479,7 +479,7 @@ CREATE TABLE IF NOT EXISTS taxonomy (
 );
 
 -- Species Observations Table
-CREATE TABLE IF NOT EXISTS species_observations (
+CREATE TABLE IF NOT EXISTS IF NOT EXISTS species_observations (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
     location_id INTEGER REFERENCES locations(id),
