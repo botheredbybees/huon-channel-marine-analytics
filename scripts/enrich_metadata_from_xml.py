@@ -361,51 +361,58 @@ class MetadataEnricher:
         """
         Update metadata table with extracted values.
         
-        Updated to handle aodn_uuid field.
+        Updated to handle aodn_uuid field separately:
+        - aodn_uuid is always updated when present (overwrite NULL)
+        - Other fields only update if they are currently NULL
         
         Returns:
             Number of rows updated.
         """
-        # Filter out None values and prepare update
-        updates_dict = {k: v for k, v in metadata.items() if v is not None}
-        
-        # ========== NEW: Include aodn_uuid in updates ==========
-        if aodn_uuid:
-            updates_dict['aodn_uuid'] = aodn_uuid
-        # =======================================================
-        
-        if not updates_dict:
-            return 0
+        # Separate aodn_uuid from other metadata fields
+        aodn_uuid_value = aodn_uuid
+        other_updates = {k: v for k, v in metadata.items() if v is not None}
         
         cursor = self.conn.cursor()
         rows_updated = 0
         
         try:
-            # Build WHERE clause to only update NULL fields
-            null_conditions = ' OR '.join([f'{k} IS NULL' for k in updates_dict.keys()])
+            # FIXED: Build two separate UPDATE operations
+            # 1. Always update aodn_uuid if present (even if other fields exist)
+            if aodn_uuid_value:
+                query1 = """
+                    UPDATE metadata 
+                    SET aodn_uuid = %s
+                    WHERE uuid = %s
+                    RETURNING id
+                """
+                cursor.execute(query1, [aodn_uuid_value, uuid])
+                rows_updated += cursor.rowcount
+                self.conn.commit()
+                logger.info(f"Updated {uuid}: aodn_uuid = {aodn_uuid_value}")
             
-            # Build SET clause
-            set_clause = ', '.join([f'{k} = %s' for k in updates_dict.keys()])
+            # 2. Update other fields only if they are NULL
+            if other_updates:
+                null_conditions = ' OR '.join([f'{k} IS NULL' for k in other_updates.keys()])
+                set_clause = ', '.join([f'{k} = %s' for k in other_updates.keys()])
+                
+                query2 = f"""
+                    UPDATE metadata 
+                    SET {set_clause}
+                    WHERE uuid = %s
+                      AND ({null_conditions})
+                    RETURNING id
+                """
+                
+                values = list(other_updates.values()) + [uuid]
+                cursor.execute(query2, values)
+                rows_updated += cursor.rowcount
+                self.conn.commit()
+                
+                if cursor.rowcount > 0:
+                    logger.info(f"Updated {uuid}: {cursor.rowcount} fields enriched")
             
-            # Build query
-            query = f"""
-                UPDATE metadata 
-                SET {set_clause}
-                WHERE uuid = %s
-                  AND ({null_conditions})
-                RETURNING id
-            """
-            
-            values = list(updates_dict.values()) + [uuid]
-            
-            cursor.execute(query, values)
-            rows_updated = cursor.rowcount
-            self.conn.commit()
-            
-            if rows_updated > 0:
-                logger.info(f"Updated {uuid}: {rows_updated} fields enriched")
-                if aodn_uuid:
-                    logger.info(f"  AODN UUID: {aodn_uuid}")
+            if rows_updated == 0 and aodn_uuid_value:
+                logger.info(f"Updated {uuid}: aodn_uuid populated (no other fields changed)")
                 
         except psycopg2.Error as e:
             logger.error(f"Database error updating metadata for {uuid}: {e}")
