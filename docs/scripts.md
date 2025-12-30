@@ -6,6 +6,18 @@ This document provides an overview of all Python ETL scripts in the Huon Channel
 
 For step-by-step instructions on running the ETL pipeline, see the [ETL Quick Reference](../ETL_QUICK_REFERENCE.md) in the project root.
 
+## Development Environment Setup
+
+**Default Development Credentials** (from `docker-compose.yml`):
+```bash
+export DB_HOST=localhost
+export DB_PORT=5433                  # Development port
+export DB_NAME=marine_db
+export DB_USER=marine_user
+export DB_PASSWORD=marine_pass123
+export AODN_DATA_PATH=/AODN_data
+```
+
 ## Core ETL Scripts
 
 ### 1. populate_metadata.py
@@ -79,29 +91,18 @@ Standardized: "TEMP" (BODC, Degrees Celsius)
 
 ### 3. populate_measurements.py
 
-**Purpose:** Extracts time-series measurements from NetCDF and CSV files with multi-parameter support.
+**Purpose:** Extracts time-series measurements from NetCDF and CSV files with integrated location patching.
 
 **Key Functions:**
 - Processes NetCDF (`.nc`) and CSV (`.csv`) data files
-- Detects multiple parameters per file (temperature, salinity, pressure, etc.)
 - Extracts time-series measurements (time, value, parameter)
 - Auto-detects time formats (ISO 8601, numeric timestamps, decimal years)
 - Converts cftime objects to standard datetime
-- Validates and creates location records using simple lat/lon matching
-- **Uses pure PostgreSQL for location queries** (no PostGIS dependency)
+- Extracts and patches location data from file headers
+- Applies coordinate validation and correction
+- **Uses parameter_mappings table for standardization** (fast database lookups)
 - Links measurements to locations and metadata
 - Handles large datasets with batch processing
-
-**Database Configuration:**
-```python
-DB_CONFIG = {
-    'dbname': 'marine_db',
-    'user': 'marine_user',
-    'password': 'marine_pass123',  # Updated
-    'host': 'localhost',
-    'port': '5433'  # Updated from 5432
-}
-```
 
 **Usage:**
 ```bash
@@ -116,22 +117,11 @@ python populate_measurements.py --dataset "Chlorophyll"
 ```
 
 **Features:**
-- ✅ Multi-parameter detection from column names
+- ✅ Integrated location patching (from patch_locations_v4.py)
 - ✅ Time format auto-detection
 - ✅ Parameter standardization via database mappings
-- ✅ Location matching using coordinate proximity (0.0001 degree tolerance)
-- ✅ Pure PostgreSQL queries (PostGIS removed December 2025)
 - ✅ Quality control flags
-- ✅ Batch insertion for performance
-
-**Location Matching (Non-PostGIS Implementation):**
-```python
-# Find existing location within ~11 meters
-SELECT id FROM locations 
-WHERE ABS(latitude - %s) < 0.0001 
-  AND ABS(longitude - %s) < 0.0001
-LIMIT 1
-```
+- ✅ Upsert-safe (no duplicate insertions)
 
 [Detailed Documentation →](populate_measurements_detail.md)
 
@@ -141,23 +131,22 @@ LIMIT 1
 
 **Purpose:** Loads spatial reference data (marine regions, boundaries) from shapefiles.
 
-**Important Note:** As of December 2025, PostGIS support has been removed from the database schema. This script requires modification or alternative approaches for spatial data.
-
-**Original Functions (PostGIS-based):**
+**Key Functions:**
 - Reads ESRI Shapefiles (`.shp`) using ogr2ogr conversion
 - Extracts polygon geometries for marine regions
 - Converts to PostGIS-compatible geometry format
 - Populates `spatial_features` table with region boundaries
-
-**Current Status:** Not compatible with PostGIS-free schema. Consider alternatives:
-- Store geometries as GeoJSON in JSONB columns
-- Use external GIS tools for spatial analysis
-- Import pre-processed spatial boundaries as coordinate arrays
+- Supports Tasmania marine bioregions, MPAs, and other spatial features
+- Preserves shapefile attributes as JSONB properties
 
 **Usage:**
 ```bash
-python populate_spatial.py  # May require schema updates
+python populate_spatial.py
 ```
+
+**Requirements:** 
+- GDAL/OGR tools installed
+- Shapefiles must be in `AODN_data/` subdirectories
 
 [Detailed Documentation →](populate_spatial_detail.md)
 
@@ -165,192 +154,235 @@ python populate_spatial.py  # May require schema updates
 
 ### 5. populate_biological.py
 
-**Purpose:** Processes species observation and biological survey data.
+**Purpose:** Extracts biological survey data from CSV files (species observations, habitat assessments).
 
 **Key Functions:**
-- Extracts species occurrence records from CSV files
-- Parses taxonomic information (scientific names, common names)
-- Extracts observation counts and abundance data
-- Links observations to locations and timestamps
-- Handles Redmap sightings, larval fish surveys, phytoplankton data
-- Normalizes taxonomic classifications
-- Creates entries in `taxonomy` and `species_observations` tables
+- Processes biological survey CSV files
+- Maps species codes to standard taxonomies
+- Extracts location, date, and observation metadata
+- Handles abundance estimates and confidence levels
+- Links to existing measurement locations
+- Validates taxonomic information
 
 **Usage:**
 ```bash
 python populate_biological.py
 ```
 
-**Data Sources:**
-- Redmap species sightings
-- IMOS Larval Fish Database
-- Phytoplankton sampling surveys
-- Marine biodiversity observations
+**Output:** Populates the `biological_observations` and `species_mapping` tables.
 
 [Detailed Documentation →](populate_biological_detail.md)
 
 ---
 
-## Utility Scripts
+## Metadata Enrichment Scripts (Phase 1)
 
-### diagnostic_etl.py
+These NEW scripts enrich existing data with metadata extracted from XML files and NetCDF headers. **Non-destructive:** Only UPDATE NULL/empty fields.
 
-**Purpose:** Comprehensive diagnostic tool for analyzing data files and ETL processes.
+### 6. enrich_metadata_from_xml.py ✨ NEW
+
+**Purpose:** Extract ISO 19115-3 metadata from XML files and populate empty metadata fields.
+
+**Problem Solved:**
+- Empty metadata fields in `metadata` table (abstract, lineage, credits, dates)
+- Missing spatial/temporal bounds
+- Undocumented data lineage and processing history
 
 **Key Functions:**
-- Scans all data files and reports structure
-- Identifies time columns and formats
-- Detects parameter columns
-- Reports location data availability
-- Generates JSON diagnostic report
-- Validates data quality
+- Locates metadata.xml files in dataset directories
+- Parses ISO 19115-3 XML with proper namespace handling
+- Extracts geographic bounding boxes (W, E, S, N coordinates)
+- Extracts temporal coverage (start and end dates)
+- Extracts lineage (processing history)
+- Extracts credits and acknowledgments
+- Batch updates database with non-destructive UPDATEs
+
+**Workflow:**
+```
+AODN_data/
+└── <dataset_name>/
+    └── <uuid>/
+        └── metadata/
+            └── metadata.xml  ← Parsed here
+                ↓
+            Extract abstract, spatial extent, dates, lineage
+                ↓
+            UPDATE metadata table WHERE field IS NULL
+```
 
 **Usage:**
 ```bash
-python diagnostic_etl.py
+python enrich_metadata_from_xml.py
 ```
 
-**Output:** Creates `diagnostic_report.json` with detailed file analysis.
+**Expected Output:**
+- ~30 metadata fields enriched for ~40 datasets
+- Audit trail logged to console
+- No data deleted or overwritten
 
-[Detailed Documentation →](diagnostic_etl_detail.md)
+**Safety Features:**
+- Only updates NULL/empty fields
+- Logs all changes for traceability
+- Can be run multiple times safely (idempotent)
+
+[Detailed Documentation →](enrich_metadata_from_xml_detail.md)
 
 ---
 
-### example_data_access.py
+### 7. enrich_measurements_from_netcdf_headers.py ✨ NEW
 
-**Purpose:** Demonstrates how to query the database after ETL completion.
+**Purpose:** Extract parameter metadata from NetCDF files and update parameter mappings and units.
+
+**Problem Solved:**
+- Missing parameter descriptions (long_name, standard_name)
+- Incorrect parameter mappings (e.g., "ph" misidentified as pH instead of phosphate)
+- Unit conversion failures (wind_speed off by 100x)
+- Quality flags undocumented
 
 **Key Functions:**
-- Example queries for measurements
-- Spatial filtering examples (using coordinate ranges, not PostGIS)
-- Time-series data retrieval
-- Parameter-based queries
-- Joins across tables
+- Discovers NetCDF files in dataset directories
+- Extracts CF-compliant variable metadata
+- Reads attributes: long_name, standard_name, units, comments, instrument info
+- Cross-references with actual measurements in database
+- Validates extracted units against observed data ranges
+- Detects unit mismatches (e.g., cm/s vs m/s)
+- Updates `parameter_mappings` table with discovered metadata
+- Updates `measurements` table with extracted units
+
+**Workflow:**
+```
+AODN_data/
+└── <dataset>/
+    └── <file>.nc  ← Read NetCDF variables
+        ↓
+    Extract long_name, standard_name, units
+        ↓
+    Validate against actual min/max values
+        ↓
+    INSERT/UPDATE parameter_mappings
+    UPDATE measurements SET units
+```
 
 **Usage:**
 ```bash
-python example_data_access.py
+python enrich_measurements_from_netcdf_headers.py
 ```
 
-[Detailed Documentation →](example_data_access_detail.md)
+**Expected Output:**
+- Parameter descriptions for 50+ parameters
+- Detected unit issues (e.g., wind_speed cm/s → m/s)
+- Quality flag documentation
+- Instrument calibration metadata
+- Updated `parameter_mappings` table
 
----
-
-## ETL Pipeline Execution Order
-
-For a complete data ingestion, run scripts in this order:
-
-```bash
-# 1. Initialize database (if not already done)
-docker-compose up -d
-
-# 2. Load metadata
-python populate_metadata.py
-
-# 3. Load parameter mappings (creates lookup table)
-python populate_parameter_mappings.py
-
-# 4. Load spatial features (optional - requires schema updates post-PostGIS removal)
-# python populate_spatial.py
-
-# 5. Load measurements (uses parameter_mappings for standardization)
-python populate_measurements.py
-
-# 6. Load biological observations
-python populate_biological.py
-
-# 7. Verify data
-python example_data_access.py
-```
-
-**Important:** `populate_parameter_mappings.py` must run **before** `populate_measurements.py` because measurements script queries the `parameter_mappings` table for standardization.
-
-## Common Command-Line Options
-
-Most ETL scripts support the following options:
-
-- `--help` - Display usage information
-- `--limit N` - Process only N records (for testing)
-- `--dataset "Name"` - Process only datasets matching name
-- `--verbose` - Enable detailed logging
-- `--dry-run` - Validate without writing to database
-
-## Configuration Files
-
-- **config_parameter_mapping.json** - Parameter standardization mappings (80+ definitions)
-  - Raw parameter names → Standard codes
-  - Namespace definitions (BODC, CF, custom)
-  - Unit specifications
-  - Time format hints
-  - Quality flag definitions
-- **init.sql** - Database schema initialization (PostGIS-free as of Dec 2025)
-- **docker-compose.yml** - Database service configuration
-- **.env** - Database credentials (not in repo)
-
-## Database Connection
-
-All scripts use these default connection parameters:
-
+**Validation Examples:**
 ```python
-DB_CONFIG = {
-    'dbname': 'marine_db',
-    'user': 'marine_user',
-    'password': 'marine_pass123',  # Updated Dec 2025
-    'host': 'localhost',
-    'port': '5433'  # Updated from 5432
-}
+# Wind speed validation
+if var_name == 'wind_speed' and units == 'cm/s':
+    max_observed = 1200  # cm/s = 12 m/s
+    if max_observed > 50:
+        issue = "Units should be m/s, not cm/s"
+
+# Parameter name disambiguation
+if var_name in ['ph', 'PH']:
+    if value_range == (0.0, 33.0):
+        actual_param = 'phosphate'  # Not pH!
 ```
 
-**Important Changes (December 2025):**
-- Port changed from `5432` to `5433`
-- Password changed from `marine_pass` to `marine_pass123`
-- PostGIS plugin removed from schema
-- Location queries use pure PostgreSQL (ABS comparisons instead of ST_DWithin)
+[Detailed Documentation →](enrich_measurements_from_netcdf_headers_detail.md)
 
-Modify connection settings in each script or use environment variables.
+---
 
-## Logging
+### 8. validate_and_fix_data_issues.py ✨ NEW
 
-All scripts use Python's `logging` module:
+**Purpose:** Implement data quality fixes identified in enrichment phase.
 
-- **INFO** level: Standard progress messages
-- **WARNING** level: Skipped or problematic records
-- **ERROR** level: Critical failures
-- **DEBUG** level: Detailed processing information
+**Fixes Applied:**
+```sql
+-- Fix 1: Rename phosphate parameters (ph/PH → phosphate)
+UPDATE measurements 
+SET parameter_code = 'PHOSPHATE'
+WHERE parameter_code IN ('ph', 'PH')
+  AND value BETWEEN 0.0 AND 33.0;
 
-Scripts typically write logs to `logs/` directory with timestamps.
+-- Fix 2: Convert wind_speed from cm/s to m/s
+UPDATE measurements
+SET value = value / 100
+WHERE parameter_code = 'wind_speed'
+  AND value > 50;
 
-## Error Handling
+-- Fix 3: Flag negative pressure values
+UPDATE measurements
+SET quality_flag = 3  -- Bad data
+WHERE parameter_code IN ('PRES', 'pressure')
+  AND value < -10;
 
-ETL scripts implement defensive programming:
+-- Fix 4: Remove obviously erroneous silicate values
+UPDATE measurements
+SET quality_flag = 4  -- Suspicious
+WHERE parameter_code = 'SIO4'
+  AND value > 500;
+```
 
-- ✅ Graceful failure for individual records
-- ✅ Transaction rollback on critical errors
-- ✅ Detailed error logging with full tracebacks
-- ✅ Progress tracking
-- ✅ Resume capability (upsert patterns)
+**Usage:**
+```bash
+# Review changes first (dry run)
+python validate_and_fix_data_issues.py --dry-run
 
-## Data Quality Flags
+# Apply fixes
+python validate_and_fix_data_issues.py --confirm
+```
 
-Scripts apply quality control flags:
+**Safety Features:**
+- Dry-run mode shows what will change
+- Backups recommendations before applying
+- Logs all changes with affected row counts
+- Can be rolled back using backup
 
-- `quality_flag = 1` - Good data
-- `quality_flag = 0` - Questionable data
-- `location_qc_flag` - Location validation status:
-  - `clean` - Passed all checks
-  - `lat_sign_flipped` - Corrected hemisphere
-  - `lon_normalized` - Normalized to -180..180
-  - `outside_tasmania` - Outside expected region
-  - `missing_coordinates` - No location data
+[Detailed Documentation →](validate_and_fix_data_issues_detail.md)
 
-## Performance Considerations
+---
+
+## Execution Order & Dependencies
+
+**Recommended ETL Pipeline Order:**
+
+```
+1. populate_metadata.py
+   ↓
+2. populate_parameter_mappings.py
+   ↓
+3. populate_measurements.py
+   ↓
+4. populate_spatial.py
+   ↓
+5. populate_biological.py
+   ↓
+6. enrich_metadata_from_xml.py      [NEW - Phase 1]
+   ↓
+7. enrich_measurements_from_netcdf_headers.py  [NEW - Phase 1]
+   ↓
+8. validate_and_fix_data_issues.py  [NEW - Phase 1]
+```
+
+**Parallel Execution:**
+- Steps 4, 5 can run while 3 completes
+- Steps 6, 7 can run in parallel (independent data sources)
+- Step 8 should run after 6, 7 complete
+
+---
+
+## Performance Optimization
+
+Key optimization techniques across all scripts:
 
 - **Batch Processing:** Scripts use batch inserts (default 1000 rows)
 - **Indexing:** Database tables have appropriate indexes
 - **Parameter Lookups:** Database queries (~10µs) vs. JSON file reads (~1ms)
 - **Memory:** Large files processed incrementally
 - **Parallelization:** Scripts can run independently after metadata and parameter mappings load
-- **No PostGIS Overhead:** Pure SQL queries faster than geometry operations
+
+---
 
 ## Troubleshooting
 
@@ -358,8 +390,8 @@ Common issues and solutions:
 
 1. **Connection refused**
    - Check Docker containers: `docker-compose ps`
-   - Verify port 5433 is available (not 5432)
-   - Confirm password is `marine_pass123`
+   - Verify port 5433 is available
+   - Check credentials: `DB_USER=marine_user`, `DB_PASSWORD=marine_pass123`
 
 2. **File not found**
    - Ensure `AODN_data/` directory exists
@@ -379,36 +411,30 @@ Common issues and solutions:
    - Verify `parameter_mappings` table exists
    - Check `config_parameter_mapping.json` is valid JSON
 
-6. **Database schema errors**
-   - Column name mismatch: Use `id` not `metadata_id` in SELECT queries
-   - PostGIS function errors: Script may need updating for pure SQL
-   - Check init.sql matches current schema version
+6. **XML parsing errors** (enrich_metadata_from_xml.py)
+   - Verify XML files are well-formed
+   - Check namespace declarations match expected ISO 19115-3
+   - Review logs for specific element paths
+
+7. **NetCDF attribute errors** (enrich_measurements_from_netcdf_headers.py)
+   - Verify NetCDF files are readable: `ncdump -h <file.nc>`
+   - Check for CF conventions compliance
+   - Review unit strings for non-standard formats
+
+---
 
 ## Contributing
 
 When modifying ETL scripts:
 
 1. Maintain upsert-safe patterns (`ON CONFLICT DO NOTHING`)
-2. Add comprehensive logging with timestamps
+2. Add comprehensive logging
 3. Update this documentation
 4. Update `config_parameter_mapping.json` for new parameters
 5. Test with diagnostic_etl.py
 6. Verify data integrity with example_data_access.py
-7. Use pure PostgreSQL (avoid PostGIS dependencies)
-8. Include full traceback logging for errors
 
-## Schema Migration Notes (December 2025)
-
-**PostGIS Removal:**
-- All `ST_*` functions replaced with standard SQL
-- Location matching uses `ABS(latitude - lat) < 0.0001` proximity checks
-- Geometry columns converted to latitude/longitude pairs
-- Spatial queries use coordinate range filters
-
-**Connection Updates:**
-- Port: 5432 → 5433
-- Password: `marine_pass` → `marine_pass123`
-- Column: `metadata_id` → `id` (metadata table primary key)
+---
 
 ## Additional Resources
 
@@ -420,5 +446,4 @@ When modifying ETL scripts:
 
 ---
 
-*Last Updated: December 30, 2025*
-*PostGIS removed, pure PostgreSQL implementation*
+*Last Updated: December 31, 2025*
