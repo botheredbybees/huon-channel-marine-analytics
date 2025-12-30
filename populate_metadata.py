@@ -306,7 +306,7 @@ def verify_population(conn):
     logger.info(f"\nDatasets without measurements: {empty_count}")
     
     if empty_count > 0:
-        logger.info("\nRun 'python populate_measurements_v2.py' to ingest measurements for these datasets.")
+        logger.info("\nRun 'python populate_measurements.py' to ingest measurements for these datasets.")
     
     cursor.close()
 
@@ -354,7 +354,7 @@ def main():
         # Close connection
         conn.close()
         logger.info("\nMetadata population completed successfully!")
-        logger.info("Next step: Run 'python populate_measurements_v2.py' to ingest measurements.")
+        logger.info("Next step: Run 'python populate_measurements.py' to ingest measurements.")
         
     except Exception as e:
         logger.error(f"Metadata population failed: {e}")
