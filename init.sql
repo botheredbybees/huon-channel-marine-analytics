@@ -24,6 +24,7 @@ CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 
+
 -- =============================================================================
 -- PARAMETER MAPPINGS TABLE (replaces config_parameter_mapping.json)
 -- =============================================================================
@@ -40,9 +41,9 @@ CREATE TABLE IF NOT EXISTS parameter_mappings (
     updated_at TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX idx_param_mappings_raw ON parameter_mappings(raw_parameter_name);
-CREATE INDEX idx_param_mappings_code ON parameter_mappings(standard_code);
-CREATE INDEX idx_param_mappings_namespace ON parameter_mappings(namespace);
+CREATE INDEX IF NOT EXISTS idx_param_mappings_raw ON parameter_mappings(raw_parameter_name);
+CREATE INDEX IF NOT EXISTS idx_param_mappings_code ON parameter_mappings(standard_code);
+CREATE INDEX IF NOT EXISTS idx_param_mappings_namespace ON parameter_mappings(namespace);
 
 COMMENT ON TABLE parameter_mappings IS 'Maps raw parameter names from data files to standardized BODC/CF codes';
 COMMENT ON COLUMN parameter_mappings.namespace IS 'bodc = British Oceanographic Data Centre, cf = Climate & Forecast, custom = user-defined';
@@ -151,10 +152,10 @@ CREATE TABLE IF NOT EXISTS public.locations (
 );
 
 -- Performance index for spatial queries
-CREATE INDEX idx_locations_geom ON public.locations USING gist (location_geom);
+CREATE INDEX IF NOT EXISTS idx_locations_geom ON public.locations USING gist (location_geom);
 
 -- Partial index for non-NULL coordinates (additional performance optimization)
-CREATE INDEX idx_locations_lat_lon_partial 
+CREATE INDEX IF NOT EXISTS idx_locations_lat_lon_partial 
 ON public.locations (latitude, longitude) 
 WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
 
@@ -206,12 +207,12 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 
 -- Metadata indexes (removed CONCURRENTLY for init script compatibility)
-CREATE INDEX idx_metadata_uuid ON metadata(uuid);
-CREATE INDEX idx_metadata_bbox ON metadata(west, east, south, north);
-CREATE INDEX idx_metadata_time ON metadata(time_start, time_end);
-CREATE INDEX idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
-CREATE INDEX idx_metadata_dataset_name ON metadata(dataset_name);
-CREATE INDEX idx_metadata_dataset_path ON metadata(dataset_path) 
+CREATE INDEX IF NOT EXISTS idx_metadata_uuid ON metadata(uuid);
+CREATE INDEX IF NOT EXISTS idx_metadata_bbox ON metadata(west, east, south, north);
+CREATE INDEX IF NOT EXISTS idx_metadata_time ON metadata(time_start, time_end);
+CREATE INDEX IF NOT EXISTS idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
+CREATE INDEX IF NOT EXISTS idx_metadata_dataset_name ON metadata(dataset_name);
+CREATE INDEX IF NOT EXISTS idx_metadata_dataset_path ON metadata(dataset_path) 
 WHERE dataset_path IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS public.spatial_ref_system (
@@ -250,10 +251,10 @@ CREATE TABLE IF NOT EXISTS parameters (
     UNIQUE(uuid, parameter_code)
 );
 
-CREATE INDEX idx_parameters_metadata_id ON parameters(metadata_id);
-CREATE INDEX idx_parameters_code ON parameters(parameter_code);
-CREATE INDEX idx_parameters_aodn_uri ON parameters(aodn_parameter_uri);
-CREATE INDEX idx_parameters_imos_uri ON parameters(imos_parameter_uri);
+CREATE INDEX IF NOT EXISTS idx_parameters_metadata_id ON parameters(metadata_id);
+CREATE INDEX IF NOT EXISTS idx_parameters_code ON parameters(parameter_code);
+CREATE INDEX IF NOT EXISTS idx_parameters_aodn_uri ON parameters(aodn_parameter_uri);
+CREATE INDEX IF NOT EXISTS idx_parameters_imos_uri ON parameters(imos_parameter_uri);
 
 CREATE TABLE IF NOT EXISTS keywords (
     id SERIAL PRIMARY KEY,
@@ -266,9 +267,9 @@ CREATE TABLE IF NOT EXISTS keywords (
     UNIQUE(metadata_id, keyword)
 );
 
-CREATE INDEX idx_keywords_metadata_id ON keywords(metadata_id);
-CREATE INDEX idx_keywords_keyword ON keywords(keyword);
-CREATE INDEX idx_keywords_thesaurus ON keywords(thesaurus_uri);
+CREATE INDEX IF NOT EXISTS idx_keywords_metadata_id ON keywords(metadata_id);
+CREATE INDEX IF NOT EXISTS idx_keywords_keyword ON keywords(keyword);
+CREATE INDEX IF NOT EXISTS idx_keywords_thesaurus ON keywords(thesaurus_uri);
 
 -- =============================================================================
 -- MEASUREMENTS HYPERTABLE (TimescaleDB optimized for 12M+ measurements)
@@ -297,41 +298,56 @@ COMMENT ON TABLE measurements IS 'Timeseries measurements (quality-controlled on
 COMMENT ON COLUMN measurements.quality_flag IS 'IMOS QC flag: 1=good, 2=probably good (only values 1-2 stored)';
 
 -- Create hypertable BEFORE adding indexes
-SELECT create_hypertable('measurements', by_range('time'));
+-- Create hypertable ONLY if not already created
+DO $$ 
+BEGIN
+  PERFORM create_hypertable('measurements', by_range('time'));
+EXCEPTION 
+  WHEN duplicate_table THEN 
+    NULL;  -- Already a hypertable
+  WHEN others THEN
+    RAISE NOTICE 'Hypertable creation error: %', SQLERRM;
+END $$;
+
 
 -- Now add PRIMARY KEY as index (after hypertable creation)
-CREATE UNIQUE INDEX measurements_pkey ON measurements (time, data_id);
-ALTER TABLE measurements ADD CONSTRAINT measurements_pkey_constraint PRIMARY KEY USING INDEX measurements_pkey;
+CREATE UNIQUE INDEX IF NOT EXISTS measurements_pkey ON measurements (time, data_id);
+DO $$ BEGIN
+  ALTER TABLE measurements ADD CONSTRAINT measurements_pkey_constraint PRIMARY KEY USING INDEX measurements_pkey;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- Enable compression with segmentation by parameter and namespace
-ALTER TABLE measurements SET (
+ALTER TABLE  IF EXISTS measurements SET (
     timescaledb.compress,
     timescaledb.compress_segmentby = 'parameter_code, namespace'
 );
 
 -- Add compression policy (compress data older than 7 days)
-SELECT add_compression_policy('measurements', INTERVAL '7 days');
+-- Compression policy (idempotent)
+DO $$ BEGIN
+  PERFORM add_compression_policy('measurements', INTERVAL '7 days');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- CRITICAL INDEXES FOR GRAFANA QUERIES
-CREATE INDEX idx_measurements_time_param ON measurements (time DESC, parameter_code)
+CREATE INDEX IF NOT EXISTS idx_measurements_time_param ON measurements (time DESC, parameter_code)
 WHERE namespace = 'bodc';
 
-CREATE INDEX idx_measurements_param_time ON measurements (parameter_code, time DESC);
-CREATE INDEX idx_measurements_location_time ON measurements (location_id, time DESC)
+CREATE INDEX IF NOT EXISTS idx_measurements_param_time ON measurements (parameter_code, time DESC);
+CREATE INDEX IF NOT EXISTS idx_measurements_location_time ON measurements (location_id, time DESC)
 WHERE location_id IS NOT NULL;
 
-CREATE INDEX idx_measurements_namespace ON measurements (namespace);
-CREATE INDEX idx_measurements_metadata_id ON measurements (metadata_id);
-CREATE INDEX idx_measurements_uuid ON measurements (uuid);
+CREATE INDEX IF NOT EXISTS idx_measurements_namespace ON measurements (namespace);
+CREATE INDEX IF NOT EXISTS idx_measurements_metadata_id ON measurements (metadata_id);
+CREATE INDEX IF NOT EXISTS idx_measurements_uuid ON measurements (uuid);
 
 -- BRIN indexes for massive time-range scans
-CREATE INDEX idx_measurements_time_brin ON measurements USING BRIN (time);
+CREATE INDEX IF NOT EXISTS idx_measurements_time_brin ON measurements USING BRIN (time);
 
 -- GIN for parameter_code fuzzy search
-CREATE INDEX idx_measurements_param_gin ON measurements USING GIN (to_tsvector('english', parameter_code));
+CREATE INDEX IF NOT EXISTS idx_measurements_param_gin ON measurements USING GIN (to_tsvector('english', parameter_code));
 
 -- Partial index for quality data only
-CREATE INDEX idx_measurements_good_data ON measurements (time DESC, parameter_code) 
+CREATE INDEX IF NOT EXISTS idx_measurements_good_data ON measurements (time DESC, parameter_code) 
 WHERE quality_flag = 1 AND namespace IN ('bodc', 'cf');
 
 -- =============================================================================
@@ -362,22 +378,21 @@ FROM measurements
 GROUP BY bucket, parameter_code, namespace, location_id;
 
 -- Real-time refresh policies
-SELECT add_continuous_aggregate_policy('measurements_1h',
-    start_offset => INTERVAL '3 days', 
-    end_offset => INTERVAL '1 hour', 
-    schedule_interval => INTERVAL '1 hour');
+-- Continuous aggregate policies (idempotent)
+DO $$ BEGIN
+  PERFORM add_continuous_aggregate_policy('measurements_1h', start_offset => INTERVAL '3 days', end_offset => INTERVAL '1 hour', schedule_interval => INTERVAL '1 hour');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
-SELECT add_continuous_aggregate_policy('measurements_1d',
-    start_offset => INTERVAL '30 days', 
-    end_offset => INTERVAL '1 day', 
-    schedule_interval => INTERVAL '1 day');
+DO $$ BEGIN
+  PERFORM add_continuous_aggregate_policy('measurements_1d', start_offset => INTERVAL '30 days', end_offset => INTERVAL '1 day', schedule_interval => INTERVAL '1 day');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- =============================================================================
 -- VIEWS FOR GRAFANA & ANALYSIS
 -- =============================================================================
 
 -- View joining measurements with metadata
-CREATE VIEW measurements_with_metadata AS
+CREATE OR REPLACE VIEW measurements_with_metadata AS
 SELECT 
     m.time, m.data_id, m.parameter_code, m.namespace, m.value, m.uom,
     m.uncertainty, m.depth_m, m.location_id, m.quality_flag,
@@ -391,7 +406,7 @@ LEFT JOIN metadata md ON m.metadata_id = md.id
 LEFT JOIN parameters p ON md.id = p.metadata_id AND m.parameter_code = p.parameter_code;
 
 -- Spatial view for datasets by parameter
-CREATE VIEW datasets_by_parameter AS
+CREATE OR REPLACE VIEW datasets_by_parameter AS
 SELECT 
     p.parameter_code,
     p.parameter_label,
@@ -455,7 +470,7 @@ ORDER BY time DESC, parameter_code;
 -- =============================================================================
 
 -- Spatial Features Table
-CREATE TABLE IF NOT EXISTS IF NOT EXISTS spatial_features (
+CREATE TABLE IF NOT EXISTS  spatial_features (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
     uuid TEXT,
@@ -466,7 +481,7 @@ CREATE INDEX IF NOT EXISTS spatial_features_geom_idx ON spatial_features USING G
 CREATE INDEX IF NOT EXISTS spatial_features_metadata_id_idx ON spatial_features(metadata_id);
 
 -- Taxonomy Table
-CREATE TABLE IF NOT EXISTS IF NOT EXISTS taxonomy (
+CREATE TABLE IF NOT EXISTS  taxonomy (
     id SERIAL PRIMARY KEY,
     species_name TEXT UNIQUE NOT NULL,
     common_name TEXT,
@@ -479,7 +494,7 @@ CREATE TABLE IF NOT EXISTS IF NOT EXISTS taxonomy (
 );
 
 -- Species Observations Table
-CREATE TABLE IF NOT EXISTS IF NOT EXISTS species_observations (
+CREATE TABLE IF NOT EXISTS  species_observations (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
     location_id INTEGER REFERENCES locations(id),
