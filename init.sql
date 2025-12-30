@@ -260,6 +260,7 @@ CREATE TABLE IF NOT EXISTS measurements (
   namespace TEXT NOT NULL DEFAULT 'custom',
   value DOUBLE PRECISION NOT NULL,
   uom TEXT NOT NULL,
+  location_qc_flag TEXT,
   uncertainty DOUBLE PRECISION,
   depth_m NUMERIC,
   location_id BIGINT REFERENCES locations(id),
