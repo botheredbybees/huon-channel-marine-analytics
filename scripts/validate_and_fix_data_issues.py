@@ -15,10 +15,10 @@ Usage:
 
 Environment variables:
     DB_HOST: Database host (default: localhost)
-    DB_PORT: Database port (default: 5432)
-    DB_NAME: Database name (default: marine_data)
-    DB_USER: Database user (default: postgres)
-    DB_PASSWORD: Database password (default: empty)
+    DB_PORT: Database port (default: 5433)
+    DB_NAME: Database name (default: marine_db)
+    DB_USER: Database user (default: marine_user)
+    DB_PASSWORD: Database password (required for authentication)
     DRY_RUN: If set to 1, run in dry-run mode (no database changes)
 """
 
@@ -53,10 +53,15 @@ class DataValidator:
     
     def connect(self):
         """Connect to PostgreSQL database."""
-        self.conn = psycopg2.connect(**self.db_config)
-        logger.info(f"Connected to {self.db_config['database']}")
-        if self.dry_run:
-            logger.warning("*** DRY RUN MODE - No database changes will be committed ***")
+        try:
+            self.conn = psycopg2.connect(**self.db_config)
+            logger.info(f"Connected to {self.db_config['database']} at {self.db_config['host']}:{self.db_config['port']}")
+            if self.dry_run:
+                logger.warning("*** DRY RUN MODE - No database changes will be committed ***")
+        except psycopg2.OperationalError as e:
+            logger.error(f"Failed to connect to database: {e}")
+            logger.error("Check your environment variables: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD")
+            sys.exit(1)
     
     def disconnect(self):
         """Disconnect from database."""
@@ -70,11 +75,6 @@ class DataValidator:
         rows_affected = 0
         
         try:
-            # First, get row count before change
-            if 'UPDATE' in query:
-                check_query = query.replace('UPDATE', 'SELECT COUNT(*) FROM (SELECT').replace(
-                    'RETURNING', ') t;').rstrip(';')
-            
             cursor.execute(query, params)
             rows_affected = cursor.rowcount
             
@@ -148,9 +148,10 @@ class DataValidator:
                   AND value > 50
             """
             cursor.execute(query)
-            count, max_val = cursor.fetchone()
+            result = cursor.fetchone()
+            count, max_val = result if result else (0, None)
             
-            if count > 0:
+            if count and count > 0:
                 logger.info(f"Found {count} wind_speed values > 50 (max={max_val}) - likely cm/s not m/s")
                 self.stats['issues_detected'] += 1
                 return True
@@ -201,7 +202,7 @@ class DataValidator:
             SET quality_flag = 2
             WHERE parameter_code IN ('PRES', 'pressure', 'PRESSURE')
               AND value < 0
-              AND quality_flag IS NULL OR quality_flag = 1
+              AND (quality_flag IS NULL OR quality_flag = 1)
         """
         rows = self.execute_fix("Flag negative pressure values (quality=2)", query)
         
@@ -234,7 +235,7 @@ class DataValidator:
             result = cursor.fetchone()
             count, max_val = result if result else (0, None)
             
-            if count > 0:
+            if count and count > 0:
                 logger.info(f"Found {count} silicate values > 500 (max={max_val}) - outliers")
                 self.stats['issues_detected'] += 1
                 return True
@@ -331,13 +332,21 @@ class DataValidator:
 if __name__ == '__main__':
     dry_run = '--dry-run' in sys.argv or os.getenv('DRY_RUN', '0') == '1'
     
+    # Build db_config from environment variables
+    # Use correct defaults matching docker-compose.yml
     db_config = {
         'host': os.getenv('DB_HOST', 'localhost'),
-        'port': int(os.getenv('DB_PORT', 5432)),
-        'database': os.getenv('DB_NAME', 'marine_data'),
-        'user': os.getenv('DB_USER', 'postgres'),
-        'password': os.getenv('DB_PASSWORD', ''),
+        'port': int(os.getenv('DB_PORT', 5433)),
+        'database': os.getenv('DB_NAME', 'marine_db'),
+        'user': os.getenv('DB_USER', 'marine_user'),
+        'password': os.getenv('DB_PASSWORD'),  # No default - must be provided
     }
+    
+    # Validate required password
+    if not db_config['password']:
+        logger.error("DB_PASSWORD environment variable not set")
+        logger.error("Set it with: export DB_PASSWORD=<your_password>")
+        sys.exit(1)
     
     validator = DataValidator(db_config, dry_run=dry_run)
     validator.run_validation()
