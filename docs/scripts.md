@@ -79,18 +79,29 @@ Standardized: "TEMP" (BODC, Degrees Celsius)
 
 ### 3. populate_measurements.py
 
-**Purpose:** Extracts time-series measurements from NetCDF and CSV files with integrated location patching.
+**Purpose:** Extracts time-series measurements from NetCDF and CSV files with multi-parameter support.
 
 **Key Functions:**
 - Processes NetCDF (`.nc`) and CSV (`.csv`) data files
+- Detects multiple parameters per file (temperature, salinity, pressure, etc.)
 - Extracts time-series measurements (time, value, parameter)
 - Auto-detects time formats (ISO 8601, numeric timestamps, decimal years)
 - Converts cftime objects to standard datetime
-- Extracts and patches location data from file headers
-- Applies coordinate validation and correction
-- **Uses parameter_mappings table for standardization** (fast database lookups)
+- Validates and creates location records using simple lat/lon matching
+- **Uses pure PostgreSQL for location queries** (no PostGIS dependency)
 - Links measurements to locations and metadata
 - Handles large datasets with batch processing
+
+**Database Configuration:**
+```python
+DB_CONFIG = {
+    'dbname': 'marine_db',
+    'user': 'marine_user',
+    'password': 'marine_pass123',  # Updated
+    'host': 'localhost',
+    'port': '5433'  # Updated from 5432
+}
+```
 
 **Usage:**
 ```bash
@@ -105,11 +116,22 @@ python populate_measurements.py --dataset "Chlorophyll"
 ```
 
 **Features:**
-- ✅ Integrated location patching (from patch_locations_v4.py)
+- ✅ Multi-parameter detection from column names
 - ✅ Time format auto-detection
 - ✅ Parameter standardization via database mappings
+- ✅ Location matching using coordinate proximity (0.0001 degree tolerance)
+- ✅ Pure PostgreSQL queries (PostGIS removed December 2025)
 - ✅ Quality control flags
-- ✅ Upsert-safe (no duplicate insertions)
+- ✅ Batch insertion for performance
+
+**Location Matching (Non-PostGIS Implementation):**
+```python
+# Find existing location within ~11 meters
+SELECT id FROM locations 
+WHERE ABS(latitude - %s) < 0.0001 
+  AND ABS(longitude - %s) < 0.0001
+LIMIT 1
+```
 
 [Detailed Documentation →](populate_measurements_detail.md)
 
@@ -119,22 +141,23 @@ python populate_measurements.py --dataset "Chlorophyll"
 
 **Purpose:** Loads spatial reference data (marine regions, boundaries) from shapefiles.
 
-**Key Functions:**
+**Important Note:** As of December 2025, PostGIS support has been removed from the database schema. This script requires modification or alternative approaches for spatial data.
+
+**Original Functions (PostGIS-based):**
 - Reads ESRI Shapefiles (`.shp`) using ogr2ogr conversion
 - Extracts polygon geometries for marine regions
 - Converts to PostGIS-compatible geometry format
 - Populates `spatial_features` table with region boundaries
-- Supports Tasmania marine bioregions, MPAs, and other spatial features
-- Preserves shapefile attributes as JSONB properties
+
+**Current Status:** Not compatible with PostGIS-free schema. Consider alternatives:
+- Store geometries as GeoJSON in JSONB columns
+- Use external GIS tools for spatial analysis
+- Import pre-processed spatial boundaries as coordinate arrays
 
 **Usage:**
 ```bash
-python populate_spatial.py
+python populate_spatial.py  # May require schema updates
 ```
-
-**Requirements:** 
-- GDAL/OGR tools installed
-- Shapefiles must be in `AODN_data/` subdirectories
 
 [Detailed Documentation →](populate_spatial_detail.md)
 
@@ -199,7 +222,7 @@ python diagnostic_etl.py
 
 **Key Functions:**
 - Example queries for measurements
-- Spatial filtering examples
+- Spatial filtering examples (using coordinate ranges, not PostGIS)
 - Time-series data retrieval
 - Parameter-based queries
 - Joins across tables
@@ -227,8 +250,8 @@ python populate_metadata.py
 # 3. Load parameter mappings (creates lookup table)
 python populate_parameter_mappings.py
 
-# 4. Load spatial features (optional)
-python populate_spatial.py
+# 4. Load spatial features (optional - requires schema updates post-PostGIS removal)
+# python populate_spatial.py
 
 # 5. Load measurements (uses parameter_mappings for standardization)
 python populate_measurements.py
@@ -260,7 +283,7 @@ Most ETL scripts support the following options:
   - Unit specifications
   - Time format hints
   - Quality flag definitions
-- **init.sql** - Database schema initialization
+- **init.sql** - Database schema initialization (PostGIS-free as of Dec 2025)
 - **docker-compose.yml** - Database service configuration
 - **.env** - Database credentials (not in repo)
 
@@ -272,11 +295,17 @@ All scripts use these default connection parameters:
 DB_CONFIG = {
     'dbname': 'marine_db',
     'user': 'marine_user',
-    'password': 'marine_pass123',
+    'password': 'marine_pass123',  # Updated Dec 2025
     'host': 'localhost',
-    'port': '5433'
+    'port': '5433'  # Updated from 5432
 }
 ```
+
+**Important Changes (December 2025):**
+- Port changed from `5432` to `5433`
+- Password changed from `marine_pass` to `marine_pass123`
+- PostGIS plugin removed from schema
+- Location queries use pure PostgreSQL (ABS comparisons instead of ST_DWithin)
 
 Modify connection settings in each script or use environment variables.
 
@@ -289,13 +318,15 @@ All scripts use Python's `logging` module:
 - **ERROR** level: Critical failures
 - **DEBUG** level: Detailed processing information
 
+Scripts typically write logs to `logs/` directory with timestamps.
+
 ## Error Handling
 
 ETL scripts implement defensive programming:
 
 - ✅ Graceful failure for individual records
 - ✅ Transaction rollback on critical errors
-- ✅ Detailed error logging
+- ✅ Detailed error logging with full tracebacks
 - ✅ Progress tracking
 - ✅ Resume capability (upsert patterns)
 
@@ -319,6 +350,7 @@ Scripts apply quality control flags:
 - **Parameter Lookups:** Database queries (~10µs) vs. JSON file reads (~1ms)
 - **Memory:** Large files processed incrementally
 - **Parallelization:** Scripts can run independently after metadata and parameter mappings load
+- **No PostGIS Overhead:** Pure SQL queries faster than geometry operations
 
 ## Troubleshooting
 
@@ -326,7 +358,8 @@ Common issues and solutions:
 
 1. **Connection refused**
    - Check Docker containers: `docker-compose ps`
-   - Verify port 5433 is available
+   - Verify port 5433 is available (not 5432)
+   - Confirm password is `marine_pass123`
 
 2. **File not found**
    - Ensure `AODN_data/` directory exists
@@ -346,16 +379,36 @@ Common issues and solutions:
    - Verify `parameter_mappings` table exists
    - Check `config_parameter_mapping.json` is valid JSON
 
+6. **Database schema errors**
+   - Column name mismatch: Use `id` not `metadata_id` in SELECT queries
+   - PostGIS function errors: Script may need updating for pure SQL
+   - Check init.sql matches current schema version
+
 ## Contributing
 
 When modifying ETL scripts:
 
 1. Maintain upsert-safe patterns (`ON CONFLICT DO NOTHING`)
-2. Add comprehensive logging
+2. Add comprehensive logging with timestamps
 3. Update this documentation
 4. Update `config_parameter_mapping.json` for new parameters
 5. Test with diagnostic_etl.py
 6. Verify data integrity with example_data_access.py
+7. Use pure PostgreSQL (avoid PostGIS dependencies)
+8. Include full traceback logging for errors
+
+## Schema Migration Notes (December 2025)
+
+**PostGIS Removal:**
+- All `ST_*` functions replaced with standard SQL
+- Location matching uses `ABS(latitude - lat) < 0.0001` proximity checks
+- Geometry columns converted to latitude/longitude pairs
+- Spatial queries use coordinate range filters
+
+**Connection Updates:**
+- Port: 5432 → 5433
+- Password: `marine_pass` → `marine_pass123`
+- Column: `metadata_id` → `id` (metadata table primary key)
 
 ## Additional Resources
 
@@ -367,4 +420,5 @@ When modifying ETL scripts:
 
 ---
 
-*Last Updated: December 25, 2025*
+*Last Updated: December 30, 2025*
+*PostGIS removed, pure PostgreSQL implementation*
