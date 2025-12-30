@@ -32,6 +32,7 @@ from typing import Dict, Optional, Tuple
 import logging
 from datetime import datetime
 import sys
+import re
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +41,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # XML namespace mappings for ISO 19115-3
+# Note: Using only common namespaces for explicit find() calls
+# For generic searches, we use regex-based namespace-agnostic matching
 NAMESPACES = {
     'gmd': 'http://www.isotc211.org/2005/gmd',
     'gco': 'http://www.isotc211.org/2005/gco',
@@ -47,6 +50,59 @@ NAMESPACES = {
     'srv': 'http://www.isotc211.org/2005/srv',
     'mdb': 'http://www.isotc211.org/2005/mdb',
 }
+
+
+def find_element_with_namespace(root: ET.Element, local_tag: str) -> Optional[ET.Element]:
+    """
+    Find element by local tag name, ignoring namespace.
+    
+    This handles ISO 19115-3 documents where namespace prefixes may vary.
+    
+    Args:
+        root: XML root element
+        local_tag: Tag name without namespace (e.g., 'CharacterString')
+    
+    Returns:
+        First matching element, or None
+    """
+    for elem in root.iter():
+        # Extract local name from tag (remove namespace prefix)
+        tag_local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+        if tag_local == local_tag:
+            return elem
+    return None
+
+
+def find_elements_by_path_generic(root: ET.Element, path_parts: list) -> Optional[ET.Element]:
+    """
+    Find element by path, matching local names without namespace.
+    
+    Args:
+        root: XML root element
+        path_parts: List of tag names to match in sequence
+                   e.g., ['metadataIdentifier', 'MD_Identifier', 'code', 'CharacterString']
+    
+    Returns:
+        First matching element at end of path, or None
+    """
+    def local_name(tag):
+        return tag.split('}')[-1] if '}' in tag else tag
+    
+    def search_path(current, remaining_path):
+        if not remaining_path:
+            return current
+        
+        target_tag = remaining_path[0]
+        rest_path = remaining_path[1:]
+        
+        for child in current:
+            if local_name(child.tag) == target_tag:
+                result = search_path(child, rest_path)
+                if result is not None:
+                    return result
+        return None
+    
+    return search_path(root, path_parts)
 
 
 class MetadataEnricher:
@@ -183,25 +239,49 @@ class MetadataEnricher:
         """
         Extract AODN UUID from ISO 19115-3 XML metadata.
         
-        The UUID is typically found in the MD_Metadata/fileIdentifier element.
+        The UUID is typically found in either:
+        1. metadataIdentifier/MD_Identifier/code/CharacterString (newer ISO 19115-3)
+        2. fileIdentifier/CharacterString (older gmd format)
+        
+        Uses namespace-agnostic matching to handle various namespace prefixes.
+        
         Returns:
             AODN UUID string if found, None otherwise
         """
         try:
-            # Try multiple common XPath patterns for UUID extraction
-            uuid_patterns = [
-                './/gmd:fileIdentifier/gco:CharacterString',
-                './/fileIdentifier/gco:CharacterString',
-                './/mdb:MD_Metadata/mdb:metadataIdentifier/mcc:MD_Identifier/mcc:code/gco:CharacterString',
-                './/gmd:MD_Metadata/gmd:fileIdentifier/gco:CharacterString',
-            ]
+            # Strategy 1: Try metadataIdentifier path (ISO 19115-3 standard location)
+            # metadataIdentifier -> MD_Identifier -> code -> CharacterString/Anchor
+            uuid_elem = find_elements_by_path_generic(
+                root, 
+                ['metadataIdentifier', 'MD_Identifier', 'code', 'CharacterString']
+            )
+            if uuid_elem is not None and uuid_elem.text:
+                uuid_str = uuid_elem.text.strip()
+                if uuid_str:
+                    logger.debug(f"Found AODN UUID via metadataIdentifier path: {uuid_str}")
+                    return uuid_str
             
-            for pattern in uuid_patterns:
-                uuid_elem = root.find(pattern, NAMESPACES)
-                if uuid_elem is not None and uuid_elem.text:
-                    uuid_str = uuid_elem.text.strip()
-                    if uuid_str:  # Ensure non-empty
-                        return uuid_str
+            # Try Anchor element as fallback (some metadata use gcx:Anchor for URIs)
+            uuid_elem = find_elements_by_path_generic(
+                root,
+                ['metadataIdentifier', 'MD_Identifier', 'code', 'Anchor']
+            )
+            if uuid_elem is not None and uuid_elem.text:
+                uuid_str = uuid_elem.text.strip()
+                if uuid_str:
+                    logger.debug(f"Found AODN UUID via Anchor: {uuid_str}")
+                    return uuid_str
+            
+            # Strategy 2: Try older gmd:fileIdentifier path (backward compatibility)
+            uuid_elem = find_elements_by_path_generic(
+                root,
+                ['fileIdentifier', 'CharacterString']
+            )
+            if uuid_elem is not None and uuid_elem.text:
+                uuid_str = uuid_elem.text.strip()
+                if uuid_str:
+                    logger.debug(f"Found AODN UUID via fileIdentifier path: {uuid_str}")
+                    return uuid_str
             
             logger.debug(f"No AODN UUID found in XML document")
             return None
