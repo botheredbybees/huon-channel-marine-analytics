@@ -4,12 +4,14 @@ Comprehensive marine data platform for analyzing oceanographic, biological, and 
 
 ## Features
 
-- **TimescaleDB** for high-performance time-series data
-- **PostGIS** for spatial analysis
+- **TimescaleDB Community Edition** for high-performance time-series data
+- **Latitude/Longitude coordinates** for spatial indexing
 - **Grafana** dashboards for visualization
 - **pgAdmin** for database management
 - **ETL pipeline** for AODN/IMOS data ingestion
 - **Parameter standardization** via database-backed mappings
+
+> **Note:** This project uses TimescaleDB Community Edition, which does not include PostGIS. All spatial features are stored using simple latitude/longitude coordinates for maximum compatibility.
 
 ## Quick Start
 
@@ -18,6 +20,7 @@ Comprehensive marine data platform for analyzing oceanographic, biological, and 
 - Docker & Docker Compose
 - Python 3.9+
 - Git
+- Optional: GDAL/ogr2ogr for shapefile processing (spatial features only)
 
 ### 1. Clone Repository
 
@@ -33,7 +36,7 @@ docker-compose up -d
 ```
 
 This starts:
-- **TimescaleDB** on port 5433
+- **TimescaleDB Community** on port 5433
 - **Grafana** on port 3000
 - **pgAdmin** on port 8088
 
@@ -82,9 +85,9 @@ See **[docs/data_ingestion.md](docs/data_ingestion.md)** for complete guide.
 python diagnostic_etl.py
 
 # 3. Ingest measurements (CSV/NetCDF)
-python populate_measurements_v2.py
+python populate_measurements.py
 
-# 4. Ingest spatial features (Shapefiles)
+# 4. Ingest spatial features (Shapefiles -> lat/lon centroids)
 python populate_spatial.py
 
 # 5. Ingest biological observations
@@ -131,10 +134,35 @@ See **[docs/database_schema.md](docs/database_schema.md)** for detailed document
 - **`metadata`**: Dataset registry (ISO 19115 metadata)
 - **`measurements`**: Time-series hypertable (sensor data)
 - **`parameter_mappings`**: Parameter name standardization
-- **`spatial_features`**: Polygons, lines (seagrass, kelp)
-- **`species_observations`**: Biological surveys
+- **`spatial_features`**: Spatial features with lat/lon centroids
+- **`species_observations`**: Biological surveys with lat/lon
 - **`taxonomy`**: Species registry
-- **`locations`**: Survey sites
+- **`locations`**: Survey sites with lat/lon
+
+### Spatial Data Storage
+
+All spatial data is stored using simple **latitude** and **longitude** columns instead of PostGIS geometries:
+
+```sql
+-- Locations table
+CREATE TABLE locations (
+    id SERIAL PRIMARY KEY,
+    location_name TEXT,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    UNIQUE (latitude, longitude)
+);
+
+-- Spatial features (centroids of polygons/lines)
+CREATE TABLE spatial_features (
+    id SERIAL PRIMARY KEY,
+    metadata_id INTEGER REFERENCES metadata(id),
+    uuid UUID,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    properties JSONB
+);
+```
 
 ### Example Queries
 
@@ -154,18 +182,24 @@ WHERE parameter_code = 'CPHL'
 ORDER BY time DESC
 LIMIT 100;
 
--- Count parameter mapping variants
-SELECT standard_code, COUNT(*) as variants
-FROM parameter_mappings
-GROUP BY standard_code
-ORDER BY variants DESC;
+-- Find locations within bounding box (simple lat/lon filter)
+SELECT location_name, latitude, longitude
+FROM locations
+WHERE latitude BETWEEN -43.5 AND -43.0
+  AND longitude BETWEEN 146.8 AND 147.3;
+
+-- Count observations near a point (within ~10km)
+SELECT COUNT(*)
+FROM species_observations
+WHERE ABS(latitude - (-43.2)) < 0.1
+  AND ABS(longitude - 147.0) < 0.1;
 ```
 
 ## Parameter Mappings
 
 The system uses a hybrid approach:
 
-1. **JSON config** (`config_parameter_mapping.json`): Source of truth with hints
+1. **JSON config** (`config_parameter_mapping.json`): Source of truth
 2. **Database table** (`parameter_mappings`): Runtime lookup for ETL
 
 ### Adding Custom Mappings
@@ -194,14 +228,15 @@ VALUES ('CUSTOM_PARAM', 'MY_CODE', 'custom', 'units', 'user');
 ```
 huon-channel-marine-analytics/
 ├── docker-compose.yml              # Service definitions
-├── init.sql                        # Database schema
+├── init.sql                        # Database schema (PostGIS-free)
 ├── requirements.txt                # Python dependencies
-├── config_parameter_mapping.json   # Parameter mappings + hints
+├── config_parameter_mapping.json   # Parameter mappings
 ├── populate_parameter_mappings.py  # Migration script (JSON → DB)
+├── populate_metadata.py            # Metadata extraction
 ├── diagnostic_etl.py               # Data diagnostics
-├── populate_measurements_v2.py     # Time-series ETL
-├── populate_spatial.py             # Spatial ETL
-├── populate_biological.py          # Biological ETL
+├── populate_measurements.py        # Time-series ETL
+├── populate_spatial.py             # Spatial ETL (lat/lon centroids)
+├── populate_biological.py          # Biological ETL (lat/lon)
 ├── docs/
 │   ├── data_ingestion.md           # Complete ingestion guide
 │   ├── database_schema.md          # Schema documentation
@@ -214,6 +249,30 @@ huon-channel-marine-analytics/
     ├── Dataset_2/
     └── ...
 ```
+
+## Spatial Features Without PostGIS
+
+### How It Works
+
+The system processes shapefiles using `ogr2ogr` to convert them to GeoJSON, then extracts **centroid coordinates** for storage:
+
+1. **Shapefiles** → GeoJSON conversion via `ogr2ogr`
+2. **Centroid extraction** from polygons/lines
+3. **Storage** as simple lat/lon in `spatial_features` table
+4. **Properties** preserved as JSONB column
+
+### Limitations
+
+- No native spatial indexing (use lat/lon range queries)
+- No complex geometry operations (intersections, buffers, etc.)
+- Polygons reduced to centroid points
+
+### Benefits
+
+- Works with TimescaleDB Community Edition
+- Simple queries (no PostGIS syntax)
+- Portable to any PostgreSQL installation
+- Lower resource requirements
 
 ## Maintenance
 
@@ -277,6 +336,20 @@ docker ps
 - Check if dataset is biological (use `populate_biological.py`)
 - Run diagnostic: `python diagnostic_etl.py`
 
+### Shapefile processing fails
+
+```bash
+# Install ogr2ogr (part of GDAL)
+# Ubuntu/Debian:
+sudo apt-get install gdal-bin
+
+# macOS:
+brew install gdal
+
+# Windows:
+# Download from https://trac.osgeo.org/osgeo4w/
+```
+
 ### Parameter mapping not found
 
 ```bash
@@ -287,6 +360,21 @@ docker exec marine_timescaledb psql -U marine_user -d marine_db -c \
 # If missing, add to JSON and re-run migration
 python populate_parameter_mappings.py
 ```
+
+## Migration from PostGIS
+
+If you previously used a PostGIS-enabled version:
+
+1. **Backup your data** before migrating
+2. **Export geometry columns** to lat/lon:
+   ```sql
+   -- Extract centroids from PostGIS geometries
+   UPDATE locations SET 
+       latitude = ST_Y(ST_Centroid(location_geom)),
+       longitude = ST_X(ST_Centroid(location_geom));
+   ```
+3. **Drop PostGIS extension** (optional)
+4. **Run updated ETL scripts** (v2.0+)
 
 ## Contributing
 
@@ -301,7 +389,7 @@ MIT License - see LICENSE file
 - **AODN Portal**: https://portal.aodn.org.au/
 - **IMOS Data**: https://imos.org.au/
 - **TimescaleDB**: https://docs.timescale.com/
-- **PostGIS**: https://postgis.net/
+- **GDAL/OGR**: https://gdal.org/
 - **Grafana**: https://grafana.com/docs/
 
 ## Contact
