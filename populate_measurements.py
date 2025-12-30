@@ -1,845 +1,458 @@
 #!/usr/bin/env python3
-
 """
-Enhanced Measurements ETL v3.0 - Multi-Parameter CSV Support
+Populate measurements table from CSV and NetCDF files with multi-parameter support.
 
-This version extends v2.1 to handle CSVs where each row contains multiple
-measurement parameters (e.g., one row = timestamp + TEMP + SALINITY + PH + DO).
-
-NEW FEATURES:
-- Multi-parameter extraction: 1 CSV row → N measurement records
-- Improved column detection for IMOS/AODN water quality datasets
-- Unit inference from column names (e.g., TEMP_C → celsius)
-- Supports both "long format" (param column) and "wide format" (param as columns)
-
-PRESERVED FEATURES (v2.1):
-- Integrated location patching (coordinate validation + station lookup)
-- NetCDF time parsing (returns datetime objects, not tuples)
-- Parameter mapping (loads from `parameter_mappings` table)
-- Location extraction (reads station info from CSV/NetCDF headers)
-- Audit trail (location_qc_flag, extracted_at)
-
-GUARDRAILS:
-✓ Upsert-safe: INSERT ... ON CONFLICT DO NOTHING
-✓ Audit trail: QC flags track all modifications
-✓ Schema validation: Type checking before DB write
-✓ Error recovery: Failed rows skipped with logging, no transaction rollback
-✓ Additive: Re-running never loses data (skipped data is logged)
-
-Usage:
-  python populate_measurements.py [--limit 5000] [--dataset "Title"]
+This script extracts measurements from oceanographic data files and inserts them
+into the PostgreSQL database. It supports:
+- Multiple parameters per file (temperature, salinity, pressure, etc.)
+- CSV files with column-based data
+- NetCDF files with time-series data
+- Automatic location coordinate validation and patching
+- Batch insertion for performance
 """
 
-import os
 import sys
 import logging
-import glob
-import re
-import argparse
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
-
 import psycopg2
-from psycopg2.extras import execute_values
 import pandas as pd
 import numpy as np
-
-try:
-    import netCDF4
-except ImportError:
-    netCDF4 = None
-
-try:
-    import cftime
-except ImportError:
-    cftime = None
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Tuple
+import xarray as xr
+import cftime
 
 # ============================================================================
 # LOGGING SETUP
 # ============================================================================
 
+# Create logs directory if it doesn't exist
+import os
+from pathlib import Path
+logs_dir = Path('logs')
+logs_dir.mkdir(exist_ok=True)
+
+# Generate log filename with timestamp
+log_filename = logs_dir / f'etl_measurements_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+
+# Configure logging to write to both file and console
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - [%(levelname)s] %(message)s'
+    format='%(asctime)s - [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# DATABASE CONFIGURATION
-# ============================================================================
-
-DB_CONFIG = {
-    'dbname': 'marine_db',
-    'user': 'marine_user',
-    'password': 'marine_pass123',
-    'host': 'localhost',
-    'port': '5433'
-}
-
-DATA_ROOT = "AODN_data"
+logger.info(f"📝 Log file: {log_filename}")
 
 # ============================================================================
-# PARAMETER DETECTION (v3.0)
+# DATABASE CONNECTION
+# ============================================================================
+
+def get_db_connection():
+    """Create database connection."""
+    return psycopg2.connect(
+        host="localhost",
+        port=5432,
+        dbname="marine_db",
+        user="marine_user",
+        password="marine_pass"
+    )
+
+# ============================================================================
+# LOCATION VALIDATION
+# ============================================================================
+
+def get_or_create_location(cursor, latitude: float, longitude: float, metadata_id: int) -> Optional[int]:
+    """Get existing location ID or create new one if coordinates are valid."""
+    
+    # Validate coordinates
+    if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+        return None
+        
+    # Try to find existing location (within 0.0001 degrees ~ 11 meters)
+    cursor.execute("""
+        SELECT location_id 
+        FROM locations 
+        WHERE ST_DWithin(
+            coordinates::geography,
+            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+            11
+        )
+        LIMIT 1
+    """, (longitude, latitude))
+    
+    result = cursor.fetchone()
+    if result:
+        return result[0]
+    
+    # Create new location
+    cursor.execute("""
+        INSERT INTO locations (coordinates)
+        VALUES (ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+        RETURNING location_id
+    """, (longitude, latitude))
+    
+    return cursor.fetchone()[0]
+
+# ============================================================================
+# PARAMETER DETECTION
 # ============================================================================
 
 PARAMETER_KEYWORDS = {
-    'temperature': ['temp', 'temperature', 'sst', 'sbt', 't_deg', 'water_temp'],
-    'salinity': ['sal', 'salinity', 'psal', 'salin'],
-    'pressure': ['pres', 'pressure', 'depth', 'z'],
-    'depth': ['depth', 'z', 'level', 'depth_m'],
-    'dissolved_oxygen': ['do', 'oxygen', 'doxy', 'o2', 'dissolved_oxygen', 'disolved_oxygen'],
-    'oxygen_saturation': ['do_sat', 'o2_sat', 'oxygen_saturation', 'disolved_oxygen_saturation'],
-    'nitrate': ['no3', 'nitrate', 'nox'],
-    'nitrite': ['no2', 'nitrite'],
-    'ammonia': ['nh3', 'nh4', 'ammonia', 'ammonium'],
-    'phosphate': ['po4', 'phosphate', 'srp', 'drp'],
-    'silicate': ['sio4', 'silicate', 'silica'],
-    'total_nitrogen': ['total_n', 'tn', 'total_nitrogen'],
-    'total_phosphorus': ['total_p', 'tp', 'total_phosphorus'],
-    'chlorophyll_a': ['chl_a', 'chla', 'chlorophyll', 'chlorophyll_a'],
-    'fluorescence': ['fluor', 'fluorescence', 'chlf'],
-    'turbidity': ['turb', 'turbidity', 'ntu'],
-    'doc': ['doc', 'dissolved_organic_carbon'],
-    'ph': ['ph'],
-    'conductivity': ['cond', 'conductivity'],
+    'temperature': ['temp', 'temperature', 'sst', 'sea_surface_temperature', 'TEMP'],
+    'salinity': ['sal', 'salinity', 'psal', 'PSAL'],
+    'pressure': ['pres', 'pressure', 'depth', 'PRES'],
+    'oxygen': ['oxygen', 'o2', 'doxy', 'dissolved_oxygen'],
+    'chlorophyll': ['chlorophyll', 'chl', 'chla', 'cphl'],
+    'turbidity': ['turbidity', 'turb', 'ntu'],
+    'ph': ['ph', 'ph_total', 'ph_insitu'],
+    'current_speed': ['current', 'velocity', 'speed', 'ucur', 'vcur'],
+    'wave_height': ['wave_height', 'hs', 'significant_wave_height'],
+    'wind_speed': ['wind_speed', 'wspd', 'wind']
 }
 
-def detect_parameter_columns(df: pd.DataFrame) -> Dict[str, str]:
-    """Detect which columns are measurement parameters"""
-    param_cols = {}
-    cols_upper = {c: c.upper().replace(' ', '_') for c in df.columns}
+def detect_parameters(columns) -> dict:
+    """Detect which oceanographic parameters are present in columns."""
+    detected = {}
     
-    for col_orig, col_clean in cols_upper.items():
-        # Skip known metadata columns
-        if any(skip in col_clean for skip in ['FID', 'ID', 'DATE', 'TIME', 'LATITUDE', 
-                                                'LONGITUDE', 'STATION', 'SITE', 'TRIP',
-                                                'LOCATION', 'GEOM', 'SAMPLE', 'ESTUARY']):
-            continue
-        
-        # Try to match parameter keywords
-        for param_name, keywords in PARAMETER_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword.upper() in col_clean or col_clean.startswith(keyword.upper()):
-                    param_cols[col_orig] = param_name
-                    break
-            if col_orig in param_cols:
+    for param_name, keywords in PARAMETER_KEYWORDS.items():
+        for col in columns:
+            col_lower = str(col).lower()
+            if any(keyword in col_lower for keyword in keywords):
+                detected[param_name] = col
                 break
     
-    return param_cols
+    return detected
 
 # ============================================================================
-# UNIT INFERENCE (v3.0)
+# CSV EXTRACTOR
 # ============================================================================
 
-UNIT_PATTERNS = {
-    # Temperature
-    r'(?i)temp.*(_c|celsius)': 'degrees_celsius',
-    r'(?i)temp.*(_k|kelvin)': 'kelvin',
-    r'(?i)temp.*(_f|fahrenheit)': 'degrees_fahrenheit',
-    r'(?i)temperature': 'degrees_celsius',
+class CSVExtractor:
+    """Extract measurements from CSV files."""
     
-    # Salinity
-    r'(?i)sal.*(_psu|psu)': 'PSU',
-    r'(?i)sal.*(_ppt|ppt)': 'PPT',
-    r'(?i)salinity': 'PSU',
-    
-    # Dissolved oxygen
-    r'(?i)(do|dissolved.*oxygen).*(_mg|mg/l)': 'mg/L',
-    r'(?i)(do|dissolved.*oxygen).*(_ml|ml/l)': 'mL/L',
-    r'(?i)(do|dissolved.*oxygen).*(%|sat|saturation)': 'percent',
-    r'(?i)dissolved.*oxygen': 'mg/L',
-    
-    # Nutrients
-    r'(?i)(nitrate|no3).*(_um|umol)': 'umol/L',
-    r'(?i)(nitrite|no2).*(_um|umol)': 'umol/L',
-    r'(?i)(ammonia|nh3|nh4).*(_um|umol)': 'umol/L',
-    r'(?i)(phosphate|po4|srp).*(_um|umol)': 'umol/L',
-    r'(?i)(silicate|sio4).*(_um|umol)': 'umol/L',
-    r'(?i)(nitrate|no3|nitrite|no2|ammonia|phosphate|silicate)': 'umol/L',
-    
-    # Chlorophyll
-    r'(?i)chl.*(_a|a\\b).*(_ug|ug/l)': 'ug/L',
-    r'(?i)chl.*(_a|a\\b).*(_mg|mg/l)': 'mg/L',
-    r'(?i)chl.*(_a|a\\b)': 'ug/L',
-    
-    # Turbidity
-    r'(?i)turb.*(_ntu|ntu)': 'NTU',
-    r'(?i)turb.*(_ftu|ftu)': 'FTU',
-    r'(?i)turbidity': 'NTU',
-    
-    # pH
-    r'(?i)ph': 'pH',
-    
-    # Pressure
-    r'(?i)pres.*(_dbar|dbar)': 'dbar',
-    r'(?i)pres.*(_mbar|mbar)': 'mbar',
-    r'(?i)pressure': 'dbar',
-}
-
-def infer_unit_from_column_name(col_name: str) -> str:
-    """Infer measurement unit from column name patterns"""
-    for pattern, unit in UNIT_PATTERNS.items():
-        if re.search(pattern, col_name):
-            return unit
-    return 'unknown'
-
-# ============================================================================
-# LOCATION PATCHING FUNCTIONS
-# ============================================================================
-
-def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """Extract station name, latitude, longitude from CSV or NetCDF"""
-    logger.debug(f"  📍 Extracting location from: {file_path}")
-    
-    if file_path.endswith(".nc"):
-        try:
-            ds = netCDF4.Dataset(file_path)
-            station = None
-            
-            for attr in ['station_name', 'site_code', 'platform_code', 'title', 'id']:
-                if hasattr(ds, attr):
-                    station = str(getattr(ds, attr)).strip()
-                    break
-            
-            lat = lon = None
-            
-            for lat_name in ['LATITUDE', 'latitude', 'lat']:
-                if lat_name in ds.variables:
-                    lat = float(ds.variables[lat_name][0])
-                    break
-            
-            for lon_name in ['LONGITUDE', 'longitude', 'lon']:
-                if lon_name in ds.variables:
-                    lon = float(ds.variables[lon_name][0])
-                    break
-            
-            if lat is None and hasattr(ds, 'geospatial_lat_min'):
-                lat = float(ds.geospatial_lat_min)
-            if lon is None and hasattr(ds, 'geospatial_lon_min'):
-                lon = float(ds.geospatial_lon_min)
-            
-            ds.close()
-            return station or dataset_title, lat, lon
-            
-        except Exception as e:
-            logger.debug(f"  ❌ NetCDF read failed: {e}")
-            return None, None, None
-    
-    elif file_path.endswith(".csv"):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                header = f.readline()
-                sep = ';' if ';' in header else ','
-            
-            df = pd.read_csv(file_path, nrows=5, sep=sep, encoding='utf-8')
-            df.columns = [c.upper().strip() for c in df.columns]
-            
-            lat_col = next((c for c in df.columns if c in ['LATITUDE', 'LAT', 'START_LAT', 'DECIMAL_LAT']), None)
-            lat = float(df[lat_col].iloc[0]) if lat_col and not pd.isna(df[lat_col].iloc[0]) else None
-            
-            lon_col = next((c for c in df.columns if c in ['LONGITUDE', 'LON', 'LONG', 'START_LON', 'DECIMAL_LONG']), None)
-            lon = float(df[lon_col].iloc[0]) if lon_col and not pd.isna(df[lon_col].iloc[0]) else None
-            
-            station_col = next((c for c in df.columns if c in ['STATION', 'SITE', 'SITE_CODE', 'STATION_NAME', 'TRIP_CODE', 'ESTUARY_SITE']), None)
-            station = str(df[station_col].iloc[0]) if station_col and not pd.isna(df[station_col].iloc[0]) else dataset_title
-            
-            if station and len(station) < 3:
-                station = f"{dataset_title} - Site {station}"
-            
-            return station, lat, lon
-            
-        except Exception as e:
-            logger.debug(f"  ❌ CSV read failed: {e}")
-            return None, None, None
-    
-    return None, None, None
-
-
-def patch_location_coordinates(lat: Optional[float], lon: Optional[float]) -> Tuple[Optional[float], Optional[float], str]:
-    """Apply location cleaning rules for Tasmania"""
-    qc_flag = 'clean'
-    
-    if lat is None or lon is None:
-        return lat, lon, 'missing_coordinates'
-    
-    if lat > 0 and lat < 90:
-        logger.debug(f"  🔄 Fixed positive latitude: {lat} -> {-lat}")
-        lat = -lat
-        qc_flag = 'lat_sign_flipped'
-    
-    if lon > 180:
-        lon = lon - 360
-        qc_flag = 'lon_normalized'
-    elif lon < -180:
-        lon = lon + 360
-        qc_flag = 'lon_normalized'
-    
-    if abs(lat) > 90 or abs(lon) > 180:
-        qc_flag = 'outlier_flagged'
-    
-    if not (-45 < lat < -40 and 144 < lon < 150):
-        if qc_flag == 'clean':
-            qc_flag = 'outside_tasmania'
-    
-    return lat, lon, qc_flag
-
-
-def get_or_insert_location(conn, station: str, lat: float, lon: float) -> Optional[int]:
-    """Insert location into locations table (PostGIS-free)"""
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO locations (location_name, latitude, longitude)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (latitude, longitude)
-            DO UPDATE SET location_name = EXCLUDED.location_name
-            RETURNING id;
-        """, (str(station), float(lat), float(lon)))
-        
-        location_id = cur.fetchone()[0]
-        conn.commit()
-        return location_id
-        
-    except Exception as e:
-        logger.error(f"  ❌ Failed to insert location: {e}")
-        conn.rollback()
-        return None
-
-# ============================================================================
-# PARAMETER MAPPING
-# ============================================================================
-
-class ParameterMapping:
-    """Loads parameter mappings from database"""
-    
-    def __init__(self, db_config: dict):
-        self.mapping = {}
-        self.load_from_database(db_config)
-    
-    def load_from_database(self, db_config: dict):
-        """Load parameter mappings from parameter_mappings table"""
-        try:
-            conn = psycopg2.connect(**db_config)
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT raw_parameter_name, standard_code, namespace, unit
-                FROM parameter_mappings
-            """)
-            
-            for raw_name, code, namespace, unit in cur.fetchall():
-                self.mapping[raw_name.upper()] = (code, namespace, unit)
-            
-            cur.close()
-            conn.close()
-            logger.info(f"✓ Loaded {len(self.mapping)} parameter mappings from database")
-            
-        except Exception as e:
-            logger.error(f"Could not load parameter mappings: {e}")
-            logger.warning("Using empty parameter mapping - all params will be 'custom'")
-    
-    def get_standard_param(self, raw_param: str) -> Tuple[str, str, str]:
-        """Map raw parameter name to standardized (param_code, namespace, unit)"""
-        raw_upper = str(raw_param).upper().strip()
-        
-        if raw_upper in self.mapping:
-            return self.mapping[raw_upper]
-        
-        return (raw_upper, 'custom', 'unknown')
-
-# ============================================================================
-# TIME FORMAT DETECTION
-# ============================================================================
-
-class TimeFormatDetector:
-    """Automatically detects time column format and converts to datetime"""
-    
-    @staticmethod
-    def detect_and_convert(time_value) -> Optional[datetime]:
-        """Attempts multiple time format conversions"""
-        if time_value is None or (isinstance(time_value, float) and np.isnan(time_value)):
-            return None
-        
-        if isinstance(time_value, datetime):
-            return time_value
-        elif isinstance(time_value, str):
-            return TimeFormatDetector._from_iso_string(time_value)
-        elif isinstance(time_value, (int, float, np.integer, np.floating)):
-            return TimeFormatDetector._from_numeric(float(time_value))
-        
-        return None
-    
-    @staticmethod
-    def _from_iso_string(s: str) -> Optional[datetime]:
-        """Parse ISO 8601 strings"""
-        try:
-            return pd.to_datetime(s).to_pydatetime()
-        except:
-            return None
-    
-    @staticmethod
-    def _from_numeric(val: float) -> Optional[datetime]:
-        """Parse numeric time representations"""
-        
-        if 1900 < val < 2100 and val % 1 != 0:
-            year = int(val)
-            frac = val - year
-            return datetime(year, 1, 1) + timedelta(days=365.25 * frac)
-        
-        if 1900 < val < 2100 and val % 1 == 0:
-            return datetime(int(val), 1, 1)
-        
-        if 1000 < val < 2000:
-            base = datetime(1900, 1, 1)
-            return base + timedelta(days=val * 30.4)
-        
-        if 40000 < val < 50000:
-            base = datetime(1900, 1, 1)
-            return base + timedelta(days=val)
-        
-        if 15000 < val < 25000:
-            base = datetime(1970, 1, 1)
-            return base + timedelta(days=val)
-        
-        if val > 1e8:
-            try:
-                return datetime.utcfromtimestamp(val)
-            except:
-                pass
-        
-        return None
-
-# ============================================================================
-# CSV EXTRACTION (v3.0 - Multi-Parameter)
-# ============================================================================
-
-class CSVMeasurementExtractor:
-    """Extract measurements from CSV with multi-parameter support"""
-    
-    def __init__(self, param_mapping: ParameterMapping):
-        self.param_mapping = param_mapping
+    def __init__(self, cursor):
+        self.cursor = cursor
         self.extracted_count = 0
         self.failed_count = 0
     
-    def extract(self, csv_path: str, metadata: dict, limit: Optional[int] = None) -> List[dict]:
-        """Extract measurements from CSV (handles multi-parameter rows)"""
+    def extract(self, file_path: Path, metadata_id: int, dataset_path: str) -> list:
+        """Extract measurements from a CSV file."""
         try:
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                header = f.readline()
-                sep = ';' if ';' in header else ','
+            # Read CSV with better error handling
+            df = pd.read_csv(
+                file_path,
+                parse_dates=True,
+                on_bad_lines='skip',
+                encoding_errors='ignore'
+            )
             
-            df = pd.read_csv(csv_path, sep=sep, encoding='utf-8')
-            
-            if limit:
-                df = df.head(limit)
-            
-            # Detect parameter columns
-            param_cols = detect_parameter_columns(df)
-            
-            if not param_cols:
-                logger.warning(f"    ⚠ No parameter columns detected in {csv_path}")
+            if df.empty:
                 return []
             
-            logger.info(f"    ✓ Detected {len(param_cols)} parameters: {list(param_cols.values())}")
+            # Detect parameters
+            params = detect_parameters(df.columns)
+            if not params:
+                logger.info(f"    ⚠ No parameter columns detected in {file_path.name}")
+                return []
+            
+            logger.info(f"    ✓ Detected {len(params)} parameters: {list(params.keys())}")
             
             # Find time column
-            time_col = self._find_time_column(df)
-            if not time_col:
-                logger.warning(f"    ⚠ No time column found in {csv_path}")
-                return []
+            time_col = None
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if any(t in col_lower for t in ['time', 'date', 'datetime', 'timestamp']):
+                    time_col = col
+                    break
+            
+            # Find location columns
+            lat_col = next((c for c in df.columns if 'lat' in str(c).lower()), None)
+            lon_col = next((c for c in df.columns if 'lon' in str(c).lower()), None)
             
             measurements = []
             
             for idx, row in df.iterrows():
-                # Parse timestamp
-                time_value = row[time_col]
-                timestamp = TimeFormatDetector.detect_and_convert(time_value)
+                # Get timestamp
+                timestamp = None
+                if time_col and pd.notna(row[time_col]):
+                    try:
+                        timestamp = pd.to_datetime(row[time_col])
+                    except:
+                        pass
                 
-                if timestamp is None:
-                    self.failed_count += 1
-                    continue
+                # Get location
+                location_id = None
+                if lat_col and lon_col:
+                    try:
+                        lat = float(row[lat_col])
+                        lon = float(row[lon_col])
+                        location_id = get_or_create_location(self.cursor, lat, lon, metadata_id)
+                    except (ValueError, TypeError):
+                        pass
                 
-                # Extract each parameter from this row
-                for col_orig, param_name in param_cols.items():
-                    value = row[col_orig]
-                    
-                    if pd.isna(value):
+                # Extract each parameter
+                for param_name, param_col in params.items():
+                    try:
+                        value = float(row[param_col])
+                        if pd.notna(value):
+                            measurements.append((
+                                metadata_id,
+                                location_id,
+                                param_name,
+                                value,
+                                timestamp,
+                                None,  # qc_flag
+                                file_path.name
+                            ))
+                    except (ValueError, TypeError):
                         continue
-                    
-                    # Infer unit
-                    uom = infer_unit_from_column_name(col_orig)
-                    
-                    # Map to standard parameter
-                    param_code, namespace, mapped_unit = self.param_mapping.get_standard_param(param_name)
-                    if mapped_unit != 'unknown':
-                        uom = mapped_unit
-                    
-                    measurements.append({
-                        'time': timestamp,
-                        'uuid': metadata.get('uuid', 'unknown'),
-                        'parameter_code': param_code,
-                        'namespace': namespace,
-                        'value': float(value),
-                        'uom': uom,
-                        'metadata_id': metadata.get('id'),
-                        'location_id': None,  # Will be patched later
-                        'location_qc_flag': None
-                    })
-                    
-                    self.extracted_count += 1
             
+            self.extracted_count += len(measurements)
             return measurements
             
         except Exception as e:
             logger.error(f"    ❌ CSV extraction failed: {e}")
             self.failed_count += 1
             return []
-    
-    def _find_time_column(self, df: pd.DataFrame) -> Optional[str]:
-        """Find the time/date column in DataFrame"""
-        time_keywords = ['time', 'date', 'timestamp', 'datetime', 'sample_date', 'sample_time']
-        
-        for col in df.columns:
-            col_clean = col.lower().replace('_', '').replace(' ', '')
-            for keyword in time_keywords:
-                if keyword.replace('_', '') in col_clean:
-                    return col
-        
-        return None
 
 # ============================================================================
-# NETCDF EXTRACTION
+# NETCDF EXTRACTOR  
 # ============================================================================
 
-class NetCDFMeasurementExtractor:
-    """Extract measurements from NetCDF files"""
+class NetCDFExtractor:
+    """Extract measurements from NetCDF files."""
     
-    def __init__(self, param_mapping: ParameterMapping):
-        self.param_mapping = param_mapping
+    def __init__(self, cursor):
+        self.cursor = cursor
         self.extracted_count = 0
         self.failed_count = 0
     
-    def extract(self, nc_path: str, metadata: dict, limit: Optional[int] = None) -> List[dict]:
-        """Extract measurements from NetCDF file"""
+    def extract(self, file_path: Path, metadata_id: int, dataset_path: str) -> list:
+        """Extract measurements from a NetCDF file."""
         try:
-            if netCDF4 is None:
-                raise ImportError("netCDF4 package not installed")
+            ds = xr.open_dataset(file_path)
             
-            ds = netCDF4.Dataset(nc_path)
-            
-            # Find time variable
-            time_var = self._find_time_variable(ds)
-            if not time_var:
-                logger.warning(f"    ⚠ No time variable found in {nc_path}")
+            # Detect parameters
+            params = detect_parameters(list(ds.data_vars) + list(ds.coords))
+            if not params:
+                logger.info(f"    ⚠ No parameter variables detected in {file_path.name}")
                 ds.close()
                 return []
             
-            # Parse time
-            times = self._parse_netcdf_time(ds, time_var)
-            if not times:
-                logger.warning(f"    ⚠ Could not parse time from {nc_path}")
-                ds.close()
-                return []
-            
-            if limit:
-                times = times[:limit]
-            
-            # Find parameter variables
-            param_vars = self._find_parameter_variables(ds)
-            if not param_vars:
-                logger.warning(f"    ⚠ No parameter variables found in {nc_path}")
-                ds.close()
-                return []
-            
-            logger.info(f"    ✓ Detected {len(param_vars)} parameters: {list(param_vars.keys())}")
+            logger.info(f"    ✓ Detected {len(params)} parameters: {list(params.keys())}")
             
             measurements = []
             
-            for param_name, var_name in param_vars.items():
-                var = ds.variables[var_name]
-                data = var[:]
-                
-                if limit:
-                    data = data[:limit]
-                
-                # Get unit
-                uom = var.units if hasattr(var, 'units') else 'unknown'
-                
-                # Map to standard parameter
-                param_code, namespace, mapped_unit = self.param_mapping.get_standard_param(param_name)
-                if mapped_unit != 'unknown':
-                    uom = mapped_unit
-                
-                for i, (timestamp, value) in enumerate(zip(times, data)):
-                    if np.ma.is_masked(value) or np.isnan(value):
-                        continue
+            # Find time dimension
+            time_var = None
+            for var in ['time', 'TIME', 'Time']:
+                if var in ds.coords or var in ds.data_vars:
+                    time_var = var
+                    break
+            
+            # Find location variables
+            lat_var = next((v for v in ['latitude', 'lat', 'LATITUDE', 'LAT'] if v in ds.coords or v in ds.data_vars), None)
+            lon_var = next((v for v in ['longitude', 'lon', 'LONGITUDE', 'LON'] if v in ds.coords or v in ds.data_vars), None)
+            
+            # Process each parameter
+            for param_name, var_name in params.items():
+                try:
+                    var_data = ds[var_name]
                     
-                    measurements.append({
-                        'time': timestamp,
-                        'uuid': metadata.get('uuid', 'unknown'),
-                        'parameter_code': param_code,
-                        'namespace': namespace,
-                        'value': float(value),
-                        'uom': uom,
-                        'metadata_id': metadata.get('id'),
-                        'location_id': None,
-                        'location_qc_flag': None
-                    })
+                    # Handle different data structures
+                    if time_var and time_var in var_data.dims:
+                        # Time series data
+                        times = ds[time_var].values
+                        values = var_data.values
+                        
+                        for i, (time_val, value) in enumerate(zip(times, values)):
+                            if np.isnan(value):
+                                continue
+                            
+                            # Convert time to datetime
+                            timestamp = None
+                            try:
+                                if isinstance(time_val, (cftime._cftime.DatetimeGregorian, cftime._cftime.DatetimeProlepticGregorian)):
+                                    timestamp = datetime(
+                                        time_val.year,
+                                        time_val.month,
+                                        time_val.day,
+                                        time_val.hour,
+                                        time_val.minute,
+                                        time_val.second
+                                    )
+                                else:
+                                    timestamp = pd.to_datetime(str(time_val))
+                            except:
+                                pass
+                            
+                            # Get location for this time step
+                            location_id = None
+                            if lat_var and lon_var:
+                                try:
+                                    lat = float(ds[lat_var].isel({time_var: i}) if time_var in ds[lat_var].dims else ds[lat_var].values)
+                                    lon = float(ds[lon_var].isel({time_var: i}) if time_var in ds[lon_var].dims else ds[lon_var].values)
+                                    location_id = get_or_create_location(self.cursor, lat, lon, metadata_id)
+                                except:
+                                    pass
+                            
+                            measurements.append((
+                                metadata_id,
+                                location_id,
+                                param_name,
+                                float(value),
+                                timestamp,
+                                None,  # qc_flag
+                                file_path.name
+                            ))
                     
-                    self.extracted_count += 1
+                    else:
+                        # Single value or non-time-series
+                        value = float(var_data.values.flat[0])
+                        if not np.isnan(value):
+                            location_id = None
+                            if lat_var and lon_var:
+                                try:
+                                    lat = float(ds[lat_var].values.flat[0])
+                                    lon = float(ds[lon_var].values.flat[0])
+                                    location_id = get_or_create_location(self.cursor, lat, lon, metadata_id)
+                                except:
+                                    pass
+                            
+                            measurements.append((
+                                metadata_id,
+                                location_id,
+                                param_name,
+                                value,
+                                None,  # timestamp
+                                None,  # qc_flag
+                                file_path.name
+                            ))
+                
+                except Exception as e:
+                    logger.warning(f"      ⚠ Failed to extract {param_name}: {e}")
+                    continue
             
             ds.close()
+            self.extracted_count += len(measurements)
             return measurements
             
         except Exception as e:
             logger.error(f"    ❌ NetCDF extraction failed: {e}")
             self.failed_count += 1
             return []
-    
-    def _find_time_variable(self, ds) -> Optional[str]:
-        """Find time variable in NetCDF"""
-        time_names = ['TIME', 'time', 'Time', 'DATETIME', 'datetime']
-        for name in time_names:
-            if name in ds.variables:
-                return name
-        return None
-    
-    def _parse_netcdf_time(self, ds, time_var_name: str) -> List[datetime]:
-        """Parse NetCDF time variable to datetime objects"""
-        try:
-            time_var = ds.variables[time_var_name]
-            time_data = time_var[:]
-            
-            if hasattr(time_var, 'units'):
-                units = time_var.units
-                calendar = time_var.calendar if hasattr(time_var, 'calendar') else 'standard'
-                
-                if cftime:
-                    cf_times = cftime.num2date(time_data, units=units, calendar=calendar)
-                    return [datetime(t.year, t.month, t.day, t.hour, t.minute, t.second) 
-                        if hasattr(t, 'year') else t for t in cf_times]
-                else:
-                    return [datetime(1970, 1, 1) + timedelta(days=float(t)) for t in time_data]
-            
-            return []
-            
-        except Exception as e:
-            logger.error(f"    ❌ Time parsing failed: {e}")
-            return []
-    
-    def _find_parameter_variables(self, ds) -> Dict[str, str]:
-        """Find parameter variables in NetCDF"""
-        params = {}
-        
-        skip_vars = {'TIME', 'time', 'LATITUDE', 'latitude', 'LONGITUDE', 'longitude', 
-                     'DEPTH', 'depth', 'NOMINAL_DEPTH', 'nominal_depth'}
-        
-        for var_name in ds.variables:
-            if var_name in skip_vars:
-                continue
-            
-            var_upper = var_name.upper().replace('_', '')
-            
-            for param_name, keywords in PARAMETER_KEYWORDS.items():
-                for keyword in keywords:
-                    if keyword.upper().replace('_', '') in var_upper:
-                        params[param_name] = var_name
-                        break
-                if param_name in params:
-                    break
-        
-        return params
 
 # ============================================================================
 # BATCH INSERTER
 # ============================================================================
 
-class MeasurementBatchInserter:
-    """Batch insert measurements into database"""
+class BatchInserter:
+    """Batch insert measurements into database."""
     
-    def __init__(self, conn, batch_size: int = 5000):
-        self.conn = conn
+    def __init__(self, cursor, batch_size=1000):
+        self.cursor = cursor
         self.batch_size = batch_size
         self.total_inserted = 0
         self.total_failed = 0
     
-    def process_batches(self, measurements: List[dict]):
-        """Insert measurements in batches"""
-        for i in range(0, len(measurements), self.batch_size):
-            batch = measurements[i:i + self.batch_size]
-            self._insert_batch(batch)
-    
-    def _insert_batch(self, batch: List[dict]):
-        """Insert a single batch"""
+    def insert_batch(self, measurements: list):
+        """Insert a batch of measurements."""
+        if not measurements:
+            return
+        
         try:
-            cur = self.conn.cursor()
+            # Split into batches
+            for i in range(0, len(measurements), self.batch_size):
+                batch = measurements[i:i + self.batch_size]
+                
+                self.cursor.executemany("""
+                    INSERT INTO measurements (
+                        metadata_id, location_id, parameter_name, 
+                        value, timestamp, qc_flag, source_file
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, batch)
+                
+                self.total_inserted += len(batch)
             
-            insert_sql = """
-                INSERT INTO measurements (
-                    time, uuid, parameter_code, namespace, value, uom,
-                    metadata_id, location_id, location_qc_flag
-                )
-                VALUES %s
-                ON CONFLICT DO NOTHING
-            """
-            
-            values = [
-                (
-                    m['time'], m['uuid'], m['parameter_code'], m['namespace'],
-                    m['value'], m['uom'], m['metadata_id'], m['location_id'],
-                    m.get('location_qc_flag')
-                )
-                for m in batch
-            ]
-            
-            execute_values(cur, insert_sql, values)
-            self.conn.commit()
-            
-            self.total_inserted += len(batch)
+            logger.info(f"    ✓ Inserted {len(measurements)} measurements")
             
         except Exception as e:
             logger.error(f"    ❌ Batch insert failed: {e}")
-            self.conn.rollback()
-            self.total_failed += len(batch)
+            self.total_failed += len(measurements)
 
 # ============================================================================
-# MAIN
+# MAIN PROCESSING
 # ============================================================================
 
 def main():
+    """Main ETL process."""
     try:
-        parser = argparse.ArgumentParser(description='Extract measurements from AODN data')
-        parser.add_argument('--limit', type=int, help='Limit measurements per file')
-        parser.add_argument('--dataset', type=str, help='Filter by dataset title (partial match)')
-        args = parser.parse_args()
+        logger.info(f"{'='*70}")
+        logger.info(f"🔍 Detecting parameters in dataset columns...")
+        logger.info(f"{'='*70}\n")
         
-        logger.info("="*70)
-        logger.info("🌊 MEASUREMENTS ETL v3.0 - Multi-Parameter Support")
-        logger.info("="*70)
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        if not os.path.exists(DATA_ROOT):
-            logger.error(f"Data root not found: {DATA_ROOT}")
-            sys.exit(1)
+        # Initialize processors
+        csv_extractor = CSVExtractor(cursor)
+        nc_extractor = NetCDFExtractor(cursor)
+        inserter = BatchInserter(cursor)
         
-        # Connect to database
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
+        # Get all datasets
+        cursor.execute("""
+            SELECT metadata_id, title, file_path
+            FROM metadata
+            WHERE file_path IS NOT NULL
+            ORDER BY metadata_id
+        """)
         
-        # Load parameter mappings
-        param_mapping = ParameterMapping(DB_CONFIG)
-        
-        # Initialize extractors
-        csv_extractor = CSVMeasurementExtractor(param_mapping)
-        nc_extractor = NetCDFMeasurementExtractor(param_mapping)
-        inserter = MeasurementBatchInserter(conn)
-        
-        # Query datasets
-        filter_clause = ""
-        if args.dataset:
-            filter_clause = f"WHERE title ILIKE '%{args.dataset}%'"
-        
-        cur.execute(f"SELECT id, uuid, title FROM metadata {filter_clause} ORDER BY title")
-        datasets = cur.fetchall()
-        
+        datasets = cursor.fetchall()
         logger.info(f"Found {len(datasets)} datasets to process\n")
         
-        for metadata_id, uuid, title in datasets:
+        # Process each dataset
+        for metadata_id, title, dataset_path in datasets:
             logger.info(f"📂 Processing: {title}")
             
-            metadata = {'id': metadata_id, 'uuid': uuid}
-            dataset_rows = []
-            
-            # Find dataset directory
-            rel_path = os.path.join(DATA_ROOT, title)
-            if not os.path.exists(rel_path):
-                logger.warning(f"  ⚠ Directory not found: {rel_path}")
+            path = Path(dataset_path)
+            if not path.exists():
+                logger.warning(f"  ⚠ Path not found: {dataset_path}")
                 continue
             
-            # ===== LOCATION EXTRACTION =====
-            patched_lat = None
-            patched_lon = None
-            location_id = None
-            location_qc_flag = 'not_found'
+            all_measurements = []
             
-            # Try to find a data file in this dataset
-            found_file = None
-            for root, dirs, files in os.walk(rel_path):
-                if 'metadata' in root:
-                    continue
-                
-                for file in files:
-                    if file.lower().endswith(('.nc', '.csv')):
-                        if 'index.csv' in file.lower():
-                            continue
-                        
-                        file_path = os.path.join(root, file)
-                        
-                        # Extract location metadata
-                        station_name, lat, lon = extract_station_info_from_file(file_path, title)
-                        
-                        if lat is not None and lon is not None:
-                            # Patch coordinates
-                            patched_lat, patched_lon, location_qc_flag = patch_location_coordinates(lat, lon)
-                            
-                            if patched_lat is not None and patched_lon is not None:
-                                logger.info(f"  ✓ Location: {station_name} ({patched_lat:.4f}, {patched_lon:.4f}) [{location_qc_flag}]")
-                                
-                                # Insert/link location
-                                location_id = get_or_insert_location(conn, station_name, patched_lat, patched_lon)
-                                
-                                if location_id:
-                                    logger.info(f"  ✓ Location ID: {location_id}")
-                            else:
-                                logger.warning(f"  ⚠ Coordinates failed validation: {lat}, {lon}")
-                        
-                        found_file = file_path
-                        break
-                
-                if found_file:
-                    break
+            # Find all data files
+            csv_files = list(path.rglob("*.csv"))
+            nc_files = list(path.rglob("*.nc"))
             
-            # ===== MEASUREMENT EXTRACTION =====
-            for root, dirs, files in os.walk(rel_path):
-                if 'metadata' in root:
-                    continue
-                
-                for file in files:
-                    if file == 'index.csv' or 'metadata' in file:
-                        continue
-                    
-                    file_path = os.path.join(root, file)
-                    
-                    try:
-                        if file.lower().endswith('.csv'):
-                            logger.info(f"  📄 Extracting CSV: {file}")
-                            rows = csv_extractor.extract(file_path, metadata, args.limit)
-                            dataset_rows.extend(rows)
-                        
-                        elif file.lower().endswith('.nc'):
-                            logger.info(f"  📊 Extracting NetCDF: {file}")
-                            rows = nc_extractor.extract(file_path, metadata, args.limit)
-                            dataset_rows.extend(rows)
-                    
-                    except Exception as e:
-                        logger.error(f"  ❌ Error processing {file}: {e}")
+            if csv_files:
+                logger.info(f"  📊 Processing {len(csv_files)} CSV files")
+                for csv_file in csv_files:
+                    measurements = csv_extractor.extract(csv_file, metadata_id, dataset_path)
+                    all_measurements.extend(measurements)
             
-            # ===== APPLY LOCATION PATCH TO ALL ROWS =====
-            if location_id is not None:
-                for row in dataset_rows:
-                    row['location_id'] = location_id
-                    row['location_qc_flag'] = location_qc_flag
-                logger.info(f"  ✓ Patched {len(dataset_rows)} rows with location_id={location_id}")
+            if nc_files:
+                logger.info(f"  📊 Processing {len(nc_files)} NetCDF files")
+                for nc_file in nc_files:
+                    measurements = nc_extractor.extract(nc_file, metadata_id, dataset_path)
+                    all_measurements.extend(measurements)
             
-            # ===== INSERT BATCH =====
-            if dataset_rows:
-                logger.info(f"  💾 Inserting {len(dataset_rows)} measurements...")
-                inserter.process_batches(dataset_rows)
+            # Insert all measurements for this dataset
+            if all_measurements:
+                logger.info(f"  💾 Inserting {len(all_measurements)} measurements")
+                inserter.insert_batch(all_measurements)
+                conn.commit()
             else:
-                logger.warning(f"  ⚠ No measurements extracted from {title}")
+                logger.info(f"  ⚠ No measurements extracted")
+            
+            logger.info("")
         
-        cur.close()
-        conn.close()
-        
+        # Final summary
         logger.info(f"\n{'='*70}")
         logger.info(f"✅ ETL Complete")
         logger.info(f"{'='*70}")
@@ -847,11 +460,20 @@ def main():
         logger.info(f"Total failed:          {inserter.total_failed}")
         logger.info(f"CSV extracted:         {csv_extractor.extracted_count} ({csv_extractor.failed_count} failed)")
         logger.info(f"NetCDF extracted:      {nc_extractor.extracted_count} ({nc_extractor.failed_count} failed)")
+        logger.info(f"{'='*70}")
+        logger.info(f"📝 Full log saved to: {log_filename}")
         logger.info(f"{'='*70}\n")
     
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+        logger.info(f"📝 Full log saved to: {log_filename}")
         sys.exit(1)
+    
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
