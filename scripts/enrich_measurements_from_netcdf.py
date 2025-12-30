@@ -12,10 +12,10 @@ Usage:
 
 Environment variables:
     DB_HOST: Database host (default: localhost)
-    DB_PORT: Database port (default: 5432)
-    DB_NAME: Database name (default: marine_data)
-    DB_USER: Database user (default: postgres)
-    DB_PASSWORD: Database password (default: empty)
+    DB_PORT: Database port (default: 5433)
+    DB_NAME: Database name (default: marine_db)
+    DB_USER: Database user (default: marine_user)
+    DB_PASSWORD: Database password (required for authentication)
     AODN_DATA_PATH: Path to AODN_data directory (default: /AODN_data)
 """
 
@@ -26,6 +26,7 @@ from pathlib import Path
 import logging
 from typing import Dict, List, Tuple
 from collections import defaultdict
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,8 +56,13 @@ class NetCDFEnricher:
     
     def connect(self):
         """Connect to PostgreSQL database."""
-        self.conn = psycopg2.connect(**self.db_config)
-        logger.info(f"Connected to {self.db_config['database']}")
+        try:
+            self.conn = psycopg2.connect(**self.db_config)
+            logger.info(f"Connected to {self.db_config['database']} at {self.db_config['host']}:{self.db_config['port']}")
+        except psycopg2.OperationalError as e:
+            logger.error(f"Failed to connect to database: {e}")
+            logger.error("Check your environment variables: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD")
+            sys.exit(1)
     
     def disconnect(self):
         """Disconnect from database."""
@@ -67,6 +73,10 @@ class NetCDFEnricher:
     def find_netcdf_files(self) -> Dict[str, List[Path]]:
         """Find all .nc files in dataset directories."""
         nc_files = {}
+        
+        if not self.aodn_data_path.exists():
+            logger.error(f"AODN_DATA_PATH does not exist: {self.aodn_data_path}")
+            return nc_files
         
         try:
             for nc_file in self.aodn_data_path.rglob('*.nc'):
@@ -241,6 +251,10 @@ class NetCDFEnricher:
         try:
             nc_files = self.find_netcdf_files()
             
+            if not nc_files:
+                logger.warning("No NetCDF files found to process")
+                return
+            
             for dataset_name, files in nc_files.items():
                 for nc_file in files:
                     try:
@@ -299,13 +313,21 @@ class NetCDFEnricher:
 
 
 if __name__ == '__main__':
+    # Build db_config from environment variables
+    # Use correct defaults matching docker-compose.yml
     db_config = {
         'host': os.getenv('DB_HOST', 'localhost'),
-        'port': int(os.getenv('DB_PORT', 5432)),
-        'database': os.getenv('DB_NAME', 'marine_data'),
-        'user': os.getenv('DB_USER', 'postgres'),
-        'password': os.getenv('DB_PASSWORD', ''),
+        'port': int(os.getenv('DB_PORT', 5433)),
+        'database': os.getenv('DB_NAME', 'marine_db'),
+        'user': os.getenv('DB_USER', 'marine_user'),
+        'password': os.getenv('DB_PASSWORD'),  # No default - must be provided
     }
+    
+    # Validate required password
+    if not db_config['password']:
+        logger.error("DB_PASSWORD environment variable not set")
+        logger.error("Set it with: export DB_PASSWORD=<your_password>")
+        sys.exit(1)
     
     aodn_path = os.getenv('AODN_DATA_PATH', '/AODN_data')
     
