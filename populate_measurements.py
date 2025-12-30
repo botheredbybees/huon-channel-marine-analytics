@@ -159,9 +159,9 @@ UNIT_PATTERNS = {
     r'(?i)(nitrate|no3|nitrite|no2|ammonia|phosphate|silicate)': 'umol/L',
     
     # Chlorophyll
-    r'(?i)chl.*(_a|a\b).*(_ug|ug/l)': 'ug/L',
-    r'(?i)chl.*(_a|a\b).*(_mg|mg/l)': 'mg/L',
-    r'(?i)chl.*(_a|a\b)': 'ug/L',
+    r'(?i)chl.*(_a|a\\b).*(_ug|ug/l)': 'ug/L',
+    r'(?i)chl.*(_a|a\\b).*(_mg|mg/l)': 'mg/L',
+    r'(?i)chl.*(_a|a\\b)': 'ug/L',
     
     # Turbidity
     r'(?i)turb.*(_ntu|ntu)': 'NTU',
@@ -228,11 +228,11 @@ def extract_station_info_from_file(file_path: str, dataset_title: str) -> Tuple[
     
     elif file_path.endswith(".csv"):
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 header = f.readline()
                 sep = ';' if ';' in header else ','
             
-            df = pd.read_csv(file_path, nrows=5, sep=sep, encoding='utf-8', errors='ignore')
+            df = pd.read_csv(file_path, nrows=5, sep=sep, encoding='utf-8')
             df.columns = [c.upper().strip() for c in df.columns]
             
             lat_col = next((c for c in df.columns if c in ['LATITUDE', 'LAT', 'START_LAT', 'DECIMAL_LAT']), None)
@@ -424,11 +424,11 @@ class CSVMeasurementExtractor:
     def extract(self, csv_path: str, metadata: dict, limit: Optional[int] = None) -> List[dict]:
         """Extract measurements from CSV (handles multi-parameter rows)"""
         try:
-            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(csv_path, 'r', encoding='utf-8') as f:
                 header = f.readline()
                 sep = ';' if ';' in header else ','
             
-            df = pd.read_csv(csv_path, sep=sep, encoding='utf-8', errors='ignore')
+            df = pd.read_csv(csv_path, sep=sep, encoding='utf-8')
             
             if limit:
                 df = df.head(limit)
@@ -616,7 +616,8 @@ class NetCDFMeasurementExtractor:
                 
                 if cftime:
                     cf_times = cftime.num2date(time_data, units=units, calendar=calendar)
-                    return [t.replace(tzinfo=None) if hasattr(t, 'replace') else datetime(t.year, t.month, t.day) for t in cf_times]
+                    return [datetime(t.year, t.month, t.day, t.hour, t.minute, t.second) 
+                        if hasattr(t, 'year') else t for t in cf_times]
                 else:
                     return [datetime(1970, 1, 1) + timedelta(days=float(t)) for t in time_data]
             
