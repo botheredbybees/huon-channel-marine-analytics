@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 # Database connection parameters
 DB_CONFIG = {
     'dbname': os.getenv('POSTGRES_DB', 'marine_db'),
-    'user': os.getenv('POSTGRES_USER', 'postgres'),
-    'password': os.getenv('POSTGRES_PASSWORD', 'postgres'),
+    'user': os.getenv('POSTGRES_USER', 'marine_user'),
+    'password': os.getenv('POSTGRES_PASSWORD', 'marine_pass123'),
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': os.getenv('DB_PORT', '5433')
 }
