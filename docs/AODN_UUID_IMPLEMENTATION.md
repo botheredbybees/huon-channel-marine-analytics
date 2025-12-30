@@ -1,461 +1,466 @@
-# Update metadata Table: Add AODN UUID Field (Non-PostGIS Version)
+# AODN UUID Extraction & Deduplication Implementation Guide
 
 ## Overview
 
-Add an optional `aodn_uuid` field to the `metadata` table to track the source AODN UUID separately from the internal `uuid` field. This supports your future requirement to ingest non-AODN datasets while maintaining AODN data provenance.
+This document describes the implementation of AODN UUID extraction and automatic deduplication logic for the Huon Estuary marine data ETL pipeline.
 
-**Key Design Decision**: The internal `uuid` field remains the primary key (links all related data), while `aodn_uuid` is optional and tracks the original AODN source identifier.
+**Purpose**: Prevent duplicate ingestion of AODN datasets by:
+1. Extracting the official AODN UUID from ISO 19115-3 XML metadata
+2. Checking if the AODN UUID already exists in the database
+3. Skipping re-ingestion of existing AODN datasets
+4. Maintaining an audit trail of deduplication actions
 
 ---
 
-## 1. SQL Changes for `init.sql`
+## Key Changes
 
-### Add Column to Metadata Table
+### 1. Database Schema (init.sql)
 
-Add this to the `metadata` table definition in `init.sql` (after the `date_created` column):
-
-```sql
-CREATE TABLE IF NOT EXISTS metadata (
-  id SERIAL PRIMARY KEY,
-  uuid TEXT UNIQUE NOT NULL,
-  aodn_uuid TEXT UNIQUE,  -- ✓ NEW: AODN source identifier (optional, nullable)
-  parent_uuid TEXT,
-  title TEXT NOT NULL,
-  abstract TEXT,
-  credit TEXT,
-  status TEXT,
-  topic_category TEXT,
-  metadata_creation_date TIMESTAMP,
-  metadata_revision_date TIMESTAMP,
-  citation_date TIMESTAMP,
-  language TEXT DEFAULT 'eng',
-  character_set TEXT DEFAULT 'utf8',
-  west DECIMAL(10,6),
-  east DECIMAL(10,6),
-  south DECIMAL(10,6),
-  north DECIMAL(10,6),
-  time_start DATE,
-  time_end DATE,
-  vertical_min DECIMAL(6,2),
-  vertical_max DECIMAL(6,2),
-  vertical_crs TEXT,
-  lineage TEXT,
-  supplemental_info TEXT,
-  use_limitation TEXT,
-  license_url TEXT,
-  distribution_wfs_url TEXT,
-  distribution_wms_url TEXT,
-  distribution_portal_url TEXT,
-  distribution_publication_url TEXT,
-  dataset_name TEXT,
-  dataset_path TEXT,
-  extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  date_created DATE
-);
-```
-
-### Add Index for AODN UUID Lookups
-
-Add this index definition after the metadata indexes:
+Added `aodn_uuid` field to `metadata` table:
 
 ```sql
--- Index for AODN UUID lookups (sparse - only non-null values)
-CREATE INDEX IF NOT EXISTS idx_metadata_aodn_uuid ON metadata(aodn_uuid)
-  WHERE aodn_uuid IS NOT NULL;
-```
-
-### Migration Script (for existing databases)
-
-If you already have a `metadata` table, run this migration:
-
-```sql
--- Add the column if it doesn't exist
 ALTER TABLE metadata 
-  ADD COLUMN aodn_uuid TEXT UNIQUE 
-  DEFAULT NULL;
+ADD COLUMN IF NOT EXISTS aodn_uuid TEXT UNIQUE;
 
--- Add the index
 CREATE INDEX IF NOT EXISTS idx_metadata_aodn_uuid ON metadata(aodn_uuid)
   WHERE aodn_uuid IS NOT NULL;
-
--- Verify the column was added
-SELECT column_name, data_type, is_nullable 
-FROM information_schema.columns 
-WHERE table_name = 'metadata' 
-  AND column_name = 'aodn_uuid';
 ```
 
----
+**Field Details**:
+- **Type**: TEXT UNIQUE (nullable)
+- **Purpose**: Store official AODN identifier separate from internal UUID
+- **NULL Handling**: Intentionally nullable for non-AODN datasets
+- **Index**: Sparse index (only on non-NULL values) for performance
 
-## 2. Update `docs/database_schema.md`
+### 2. Updated Scripts
 
-### Replace the metadata section with this updated version:
+#### enrich_metadata_from_xml.py (Enhanced)
 
-#### OLD (Delete this section):
-```markdown
-### `metadata`
-The central table for all datasets. Every file or distinct dataset ingested has an entry here.
+**New Features**:
+- Extracts AODN UUID from ISO 19115-3 XML metadata
+- Implements deduplication check before processing
+- Populates `aodn_uuid` field for AODN-sourced datasets
+- Logs all deduplication actions
 
-#### DDL
-
-```sql
-CREATE TABLE metadata (
-    id SERIAL PRIMARY KEY,
-    uuid TEXT UNIQUE NOT NULL,
-    parent_uuid TEXT,
-    ...
-    extent_geom GEOMETRY(POLYGON, 4326),
-    bbox_envelope BOX2D GENERATED ALWAYS AS (BOX2D(extent_geom)) STORED
-);
-```
-```
-
-#### NEW (Replace with):
-```markdown
-### `metadata`
-The central registry for all datasets (AODN and future non-AODN sources).
-
-#### DDL
-
-```sql
-CREATE TABLE metadata (
-    id SERIAL PRIMARY KEY,
-    uuid TEXT UNIQUE NOT NULL,
-    aodn_uuid TEXT UNIQUE,
-    parent_uuid TEXT,
-    title TEXT NOT NULL,
-    abstract TEXT,
-    credit TEXT,
-    status TEXT,
-    topic_category TEXT,
-    metadata_creation_date TIMESTAMP,
-    metadata_revision_date TIMESTAMP,
-    citation_date TIMESTAMP,
-    language TEXT DEFAULT 'eng',
-    character_set TEXT DEFAULT 'utf8',
-    west DECIMAL(10,6),
-    east DECIMAL(10,6),
-    south DECIMAL(10,6),
-    north DECIMAL(10,6),
-    time_start DATE,
-    time_end DATE,
-    vertical_min DECIMAL(6,2),
-    vertical_max DECIMAL(6,2),
-    vertical_crs TEXT,
-    lineage TEXT,
-    supplemental_info TEXT,
-    use_limitation TEXT,
-    license_url TEXT,
-    distribution_wfs_url TEXT,
-    distribution_wms_url TEXT,
-    distribution_portal_url TEXT,
-    distribution_publication_url TEXT,
-    dataset_name TEXT,
-    dataset_path TEXT,
-    extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    date_created DATE
-);
-
-CREATE INDEX idx_metadata_uuid ON metadata(uuid);
-CREATE INDEX idx_metadata_aodn_uuid ON metadata(aodn_uuid) WHERE aodn_uuid IS NOT NULL;
-CREATE INDEX idx_metadata_bbox ON metadata(west, east, south, north);
-CREATE INDEX idx_metadata_time ON metadata(time_start, time_end);
-```
-
-#### Key Fields
-
-- **`id`** (PK): Internal integer ID used for all foreign keys (performance).
-- **`uuid`**: Unique internal identifier. Used to link all related data (measurements, parameters, species observations). Generated by the system on insert.
-- **`aodn_uuid`** ⭐ **[NEW]**: The AODN/IMOS UUID from the original ISO 19115 XML metadata. **Optional** (nullable) to support future non-AODN datasets. Allows tracking data provenance back to AODN source.
-  - Always populated when ingesting from AODN sources
-  - NULL for non-AODN datasets
-  - Has unique constraint to prevent duplicate AODN ingests
-  - Sparse index (only non-null values) for efficient queries
-- **`west`, `east`, `south`, `north`**: Bounding box coordinates in decimal degrees (WGS84 / EPSG:4326). Pure PostgreSQL, no PostGIS required.
-- **`dataset_path`**: Relative path to the source folder/file on disk.
-- **`dataset_name`**: Human-readable name of the dataset (e.g., "Australian Chlorophyll-a Database").
-
-#### Relationships
-
-| Field | Links To | Purpose |
-|-------|----------|---------|
-| `id` | FK in `parameters`, `measurements`, `species_observations` | Primary relationships |
-| `uuid` | FK in `measurements.uuid`, `parameters.uuid` | Backward reference field |
-| `aodn_uuid` | AODN catalog | Provenance tracking |
-
-#### Usage Examples
-
-```sql
--- Find dataset by AODN UUID
-SELECT * FROM metadata WHERE aodn_uuid = '9eff1f00-5115-4726-b41f-5a1a93f97575';
-
--- Check if AODN dataset already ingested (deduplication)
-SELECT id, dataset_name FROM metadata 
-WHERE aodn_uuid = %s;
-
--- List all AODN datasets (non-null aodn_uuid)
-SELECT id, dataset_name, aodn_uuid 
-FROM metadata 
-WHERE aodn_uuid IS NOT NULL 
-ORDER BY dataset_name;
-
--- List all non-AODN datasets
-SELECT id, dataset_name, uuid 
-FROM metadata 
-WHERE aodn_uuid IS NULL 
-ORDER BY dataset_name;
-
--- Join measurements with AODN provenance info
-SELECT 
-  m.time, m.value, m.parameter_code,
-  md.dataset_name, md.aodn_uuid, md.lineage
-FROM measurements m
-JOIN metadata md ON m.metadata_id = md.id
-WHERE md.aodn_uuid IS NOT NULL;
-```
-```
-
----
-
-## 3. Update Population Scripts
-
-### Modify `enrich_metadata_from_xml.py`
-
-Update the XML parsing to extract AODN UUID and populate `aodn_uuid`:
+**Key Methods**:
 
 ```python
-import xml.etree.ElementTree as ET
+def _extract_aodn_uuid(self, root: ET.Element) -> Optional[str]:
+    """Extract AODN UUID from XML fileIdentifier element."""
+    # Tries multiple XPath patterns:
+    # - .//gmd:fileIdentifier/gco:CharacterString
+    # - .//mdb:MD_Metadata/mdb:metadataIdentifier/mcc:MD_Identifier/mcc:code/gco:CharacterString
+    # Returns: AODN UUID string or None
+
+def check_aodn_uuid_exists(self, aodn_uuid: str) -> bool:
+    """Check if AODN UUID already exists (deduplication)."""
+    # Query: SELECT id FROM metadata WHERE aodn_uuid = %s
+    # Returns: True if exists (skip), False if new (process)
+```
+
+**Enhanced Statistics**:
+```
+=== METADATA ENRICHMENT SUMMARY ===
+XML files found:          10
+Files processed:          8
+Files deduplicated:       2    [NEW]
+Files failed:             0
+AODN UUIDs extracted:     8    [NEW]
+Rows updated:             12
+```
+
+### 3. New Utility Module: aodn_deduplication.py
+
+Reusable deduplication utility for all ETL scripts:
+
+```python
+from aodn_deduplication import AODNDeduplicator
+
+dedup = AODNDeduplicator(db_connection)
+
+# Single check
+if dedup.aodn_uuid_exists(aodn_uuid):
+    logger.info("Dataset already ingested")
+else:
+    # Process new dataset
+    pass
+
+# Batch check (more efficient)
+results = dedup.batch_check_aodn_uuids([uuid1, uuid2, uuid3])
+for uuid, exists in results.items():
+    if not exists:
+        process(uuid)
+
+# Find duplicates in database
+duplicates = dedup.get_duplicate_aodn_datasets()
+if duplicates:
+    logger.warning(f"Found {len(duplicates)} duplicate AODN UUIDs")
+
+# Print statistics
+dedup.print_stats()
+```
+
+**Available Methods**:
+
+| Method | Purpose |
+|--------|----------|
+| `aodn_uuid_exists(uuid)` | Check if AODN UUID exists |
+| `batch_check_aodn_uuids(uuids)` | Check multiple UUIDs efficiently |
+| `log_skip(uuid, reason)` | Log deduplication events (optional) |
+| `get_aodn_uuid_for_internal_uuid(uuid)` | Lookup AODN UUID by internal UUID |
+| `get_duplicate_aodn_datasets()` | Find duplicates in database |
+| `print_stats()` | Print deduplication statistics |
+| `reset_stats()` | Reset statistics counters |
+
+---
+
+## Usage Examples
+
+### Example 1: Run Metadata Enrichment with AODN UUID Extraction
+
+```bash
+# Set environment variables
+export DB_HOST=localhost
+export DB_PORT=5433
+export DB_NAME=marine_db
+export DB_USER=marine_user
+export DB_PASSWORD=marine_pass123
+export AODN_DATA_PATH=/AODN_data
+
+# Run enrichment (with automatic AODN UUID extraction & deduplication)
+python scripts/enrich_metadata_from_xml.py
+```
+
+**Expected Output**:
+```
+INFO - Found 10 metadata.xml files in /AODN_data
+INFO - Processing 550e8400-e29b-41d4-a716-446655440000
+INFO - Extracted AODN UUID: 550e8400-e29b-41d4-a716-446655440000
+INFO - Updated 550e8400-e29b-41d4-a716-446655440000: 5 fields enriched
+INFO -   AODN UUID: 550e8400-e29b-41d4-a716-446655440000
+INFO - Processing a1b2c3d4-e5f6-47g8-h9i0-j1k2l3m4n5o6
+WARNING - AODN dataset with UUID 550e8400-e29b-41d4-a716-446655440000 already exists. Skipping.
+=== METADATA ENRICHMENT SUMMARY ===
+XML files found:          2
+Files processed:          1
+Files deduplicated:       1
+AODN UUIDs extracted:     2
+Rows updated:             5
+```
+
+### Example 2: Using Deduplicator Utility in Custom Script
+
+```python
+#!/usr/bin/env python3
 import psycopg2
-import os
+import logging
+from aodn_deduplication import AODNDeduplicator, create_dedup_log_table
 
-def extract_aodn_uuid_from_xml(xml_path):
-    """Extract AODN UUID from ISO 19115 XML metadata"""
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        
-        # Common namespace prefixes in AODN metadata
-        namespaces = {
-            'gmd': 'http://www.opengis.net/gmd',
-            'gco': 'http://www.opengis.net/gco',
-            'mcp': 'http://schemas.aodn.org.au/mcp',
-        }
-        
-        # Try different XPath patterns
-        uuid_elem = root.find('.//gmd:uuid/gco:CharacterString', namespaces)
-        if uuid_elem is None:
-            uuid_elem = root.find('.//gmd:fileIdentifier/gco:CharacterString', namespaces)
-        
-        if uuid_elem is not None and uuid_elem.text:
-            return uuid_elem.text.strip()
-    except Exception as e:
-        logger.warning(f"Could not extract UUID from {xml_path}: {e}")
-    
-    return None
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def insert_metadata_with_aodn_uuid(cursor, metadata_dict, aodn_uuid=None):
-    """Insert metadata record with optional AODN UUID"""
-    
-    query = """
-    INSERT INTO metadata (
-        uuid, aodn_uuid, title, abstract, west, east, south, north,
-        time_start, time_end, dataset_name, dataset_path, extracted_at
-    ) VALUES (
-        %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, NOW()
-    )
-    ON CONFLICT (uuid) DO UPDATE SET
-        aodn_uuid = EXCLUDED.aodn_uuid,
-        extracted_at = NOW()
-    RETURNING id;
-    """
-    
-    params = (
-        metadata_dict['uuid'],
-        aodn_uuid,  # ← NEW: Add AODN UUID
-        metadata_dict.get('title'),
-        metadata_dict.get('abstract'),
-        metadata_dict.get('west'),
-        metadata_dict.get('east'),
-        metadata_dict.get('south'),
-        metadata_dict.get('north'),
-        metadata_dict.get('time_start'),
-        metadata_dict.get('time_end'),
-        metadata_dict.get('dataset_name'),
-        metadata_dict.get('dataset_path'),
-    )
-    
-    cursor.execute(query, params)
-    return cursor.fetchone()[0]
+# Connect to database
+conn = psycopg2.connect(
+    host="localhost",
+    port=5433,
+    database="marine_db",
+    user="marine_user",
+    password="marine_pass123"
+)
+
+# Create deduplicator
+dedup = AODNDeduplicator(conn)
+
+# Optional: Create audit log table on first run
+create_dedup_log_table(conn)
+
+# Check if datasets exist
+aodn_uuids = [
+    "550e8400-e29b-41d4-a716-446655440000",
+    "a1b2c3d4-e5f6-47g8-h9i0-j1k2l3m4n5o6",
+]
+
+existing = dedup.batch_check_aodn_uuids(aodn_uuids)
+
+for uuid, exists in existing.items():
+    if exists:
+        logger.info(f"Skipping {uuid} (already ingested)")
+        dedup.log_skip(uuid, reason="duplicate", details="Already in system")
+    else:
+        logger.info(f"Processing new dataset {uuid}")
+        # ... process dataset ...
+
+# Print statistics
+dedup.print_stats()
+conn.close()
 ```
 
-### Deduplication Check (Before Ingestion)
+---
 
-Add this check to prevent re-ingesting the same AODN dataset:
+## Data Model
+
+### Metadata Table
+
+| Field | Type | Nullable | Purpose |
+|-------|------|----------|----------|
+| `id` | SERIAL | No | Internal primary key |
+| `uuid` | TEXT | No | Internal system identifier |
+| `aodn_uuid` | TEXT | **Yes** | Official AODN identifier (NEW) |
+| ... other fields ... | | | |
+
+### UUID Mapping Examples
+
+**AODN Dataset**:
+```
+uuid:      550e8400-e29b-41d4-a716-446655440000  (internal)
+aodn_uuid: 550e8400-e29b-41d4-a716-446655440000  (same, from XML)
+```
+
+**Non-AODN Dataset**:
+```
+uuid:      a1b2c3d4-e5f6-47g8-h9i0-j1k2l3m4n5o6  (internal, auto-generated)
+aodn_uuid: NULL  (no AODN source)
+```
+
+### Optional Dedup Log Table
+
+```sql
+CREATE TABLE dedup_log (
+    id SERIAL PRIMARY KEY,
+    aodn_uuid TEXT NOT NULL,
+    skip_reason TEXT,
+    details TEXT,
+    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+## Deduplication Flow
+
+```
+Parse XML Metadata
+    ↓
+Extract AODN UUID
+    ↓
+Check if AODN UUID exists in DB?
+    ├─ YES → Log skip
+    │       └─ Continue to next file
+    └─ NO  → Extract other metadata
+           └─ Update database
+           └─ Log successful ingest
+```
+
+---
+
+## Testing
+
+### Test 1: AODN UUID Extraction
+
+```bash
+# Test data with UUID in XML
+cat > /tmp/test_metadata.xml << 'EOF'
+<?xml version="1.0"?>
+<gmd:MD_Metadata xmlns:gmd="http://www.isotc211.org/2005/gmd"
+                 xmlns:gco="http://www.isotc211.org/2005/gco">
+    <gmd:fileIdentifier>
+        <gco:CharacterString>550e8400-e29b-41d4-a716-446655440000</gco:CharacterString>
+    </gmd:fileIdentifier>
+</gmd:MD_Metadata>
+EOF
+
+# Script will extract UUID automatically
+```
+
+### Test 2: Deduplication
+
+```bash
+# First run: Processes dataset
+python scripts/enrich_metadata_from_xml.py
+# Output: "Updated ...: fields enriched"
+
+# Second run: Skips duplicate
+python scripts/enrich_metadata_from_xml.py
+# Output: "already exists in database. Skipping."
+```
+
+### Test 3: Batch Deduplication Check
 
 ```python
-def check_aodn_dataset_exists(cursor, aodn_uuid):
-    """Check if this AODN dataset has already been ingested"""
-    if not aodn_uuid:
-        return False  # Non-AODN datasets can be re-ingested with different internal UUIDs
-    
-    cursor.execute(
-        "SELECT id, dataset_name FROM metadata WHERE aodn_uuid = %s",
-        (aodn_uuid,)
-    )
-    result = cursor.fetchone()
-    
-    if result:
-        logger.warning(f"AODN dataset {aodn_uuid} already exists as {result[1]} (id={result[0]})")
-        return True
-    
-    return False
+from aodn_deduplication import AODNDeduplicator
+import psycopg2
 
-# In main ETL loop:
-for xml_file in xml_files:
-    aodn_uuid = extract_aodn_uuid_from_xml(xml_file)
-    
-    if check_aodn_dataset_exists(cursor, aodn_uuid):
-        logger.info(f"Skipping duplicate AODN dataset: {aodn_uuid}")
-        continue
-    
-    # Proceed with insertion
-    metadata_id = insert_metadata_with_aodn_uuid(cursor, metadata_dict, aodn_uuid)
-    logger.info(f"Inserted: {metadata_dict.get('dataset_name')} (AODN: {aodn_uuid})")
+conn = psycopg2.connect(...)
+dedup = AODNDeduplicator(conn)
+
+# Test batch check
+uuids = ["uuid1", "uuid2", "uuid3"]
+results = dedup.batch_check_aodn_uuids(uuids)
+
+assert len(results) == 3
+assert all(isinstance(v, bool) for v in results.values())
+print(results)  # {"uuid1": False, "uuid2": True, "uuid3": False}
 ```
 
 ---
 
-## 4. Updated Schema Diagram
+## Troubleshooting
 
-```mermaid
-erDiagram
-    METADATA ||--o{ MEASUREMENTS : contains
-    METADATA ||--o{ PARAMETERS : defines
-    METADATA ||--o{ SPECIES_OBSERVATIONS : contains
-    
-    MEASUREMENTS {
-        timestamp time
-        string parameter_code
-        double value
-        string namespace
-        integer metadata_id FK
-        string uuid FK
-    }
-    
-    METADATA {
-        integer id PK
-        string uuid UNIQUE "internal identifier"
-        string aodn_uuid UNIQUE "AODN source (optional)"
-        string dataset_name
-        decimal west "bbox west"
-        decimal east "bbox east"
-        decimal south "bbox south"
-        decimal north "bbox north"
-    }
-    
-    PARAMETERS {
-        integer id PK
-        integer metadata_id FK
-        string uuid FK
-        string parameter_code
-    }
+### Issue: AODN UUID Not Extracted
+
+**Symptoms**: `aodn_uuid` column remains NULL
+
+**Diagnosis**:
+```python
+# Check if UUID element exists in XML
+import xml.etree.ElementTree as ET
+tree = ET.parse('metadata.xml')
+root = tree.getroot()
+
+# Try XPath patterns
+NS = {'gmd': 'http://www.isotc211.org/2005/gmd', 'gco': 'http://www.isotc211.org/2005/gco'}
+for elem in root.findall('.//gmd:fileIdentifier/gco:CharacterString', NS):
+    print(elem.text)
 ```
 
----
+**Solutions**:
+1. Verify XML uses correct ISO 19115-3 namespaces
+2. Check XPath patterns in `_extract_aodn_uuid()`
+3. Enable debug logging: `logging.basicConfig(level=logging.DEBUG)`
 
-## 5. Implementation Checklist
+### Issue: Deduplication Not Working
 
-- [ ] **Step 1**: Update `init.sql` with the new `aodn_uuid` column and index
-- [ ] **Step 2**: Update `docs/database_schema.md` with the new field documentation
-- [ ] **Step 3**: Update `enrich_metadata_from_xml.py` to extract and populate `aodn_uuid`
-- [ ] **Step 4**: Add deduplication logic to prevent re-ingesting AODN datasets
-- [ ] **Step 5**: Test migration on a backup database
-- [ ] **Step 6**: Run migration on production database (if existing metadata table)
-- [ ] **Step 7**: Test ETL scripts with new field
-- [ ] **Step 8**: Verify no duplicate AODN UUIDs exist in production
+**Symptoms**: Same dataset ingested multiple times
 
----
-
-## 6. Query Examples
-
-### Check AODN UUID Coverage
-
+**Diagnosis**:
 ```sql
--- How many datasets have AODN UUIDs?
-SELECT 
-  COUNT(*) AS total,
-  COUNT(aodn_uuid) AS aodn_sources,
-  COUNT(*) - COUNT(aodn_uuid) AS non_aodn
-FROM metadata;
-
--- Result:
--- total | aodn_sources | non_aodn
--- ------|--------------|----------
---    38 |           38 |        0  (currently all AODN)
-```
-
-### Find Datasets by AODN Source
-
-```sql
--- Get a specific AODN dataset by its original UUID
-SELECT id, uuid, dataset_name, title 
-FROM metadata 
-WHERE aodn_uuid = '9eff1f00-5115-4726-b41f-5a1a93f97575';
-```
-
-### Check for Duplicate AODN Ingests
-
-```sql
--- This should return 0 rows if no duplicates exist
-SELECT aodn_uuid, COUNT(*) as count 
-FROM metadata 
+-- Check for duplicate AODN UUIDs
+SELECT aodn_uuid, COUNT(*) as count FROM metadata 
 WHERE aodn_uuid IS NOT NULL 
 GROUP BY aodn_uuid 
 HAVING COUNT(*) > 1;
 ```
 
----
+**Solutions**:
+1. Verify `aodn_uuid` column exists: `ALTER TABLE metadata ADD COLUMN aodn_uuid TEXT UNIQUE;`
+2. Check for NULL values: `SELECT COUNT(*) FROM metadata WHERE aodn_uuid IS NULL;`
+3. Verify dedup logic is enabled in script
 
-## 7. Backward Compatibility
+### Issue: Database Constraint Violation
 
-✓ **Non-breaking change**: Existing code continues to work
-- `uuid` field unchanged (primary key)
-- `aodn_uuid` is nullable and optional
-- No existing queries need modification
-- All foreign keys still reference `uuid` and `id`
+**Error**: `duplicate key value violates unique constraint 'metadata_aodn_uuid_key'`
 
----
+**Cause**: Attempting to insert duplicate AODN UUID
 
-## 8. Future Non-AODN Dataset Integration
+**Solution**: Remove duplicate rows first
 
-When you later ingest non-AODN data:
-
-```python
-# For non-AODN datasets, aodn_uuid will be NULL
-metadata_id = insert_metadata_with_aodn_uuid(
-    cursor,
-    metadata_dict={
-        'uuid': generate_new_uuid(),  # Generate new internal UUID
-        'dataset_name': 'My Custom Dataset',
-        'title': 'Custom observation data',
-        # ... other fields
-    },
-    aodn_uuid=None  # ← NULL for non-AODN
+```sql
+-- Identify duplicates
+WITH dupes AS (
+  SELECT aodn_uuid, COUNT(*) as cnt, array_agg(id) as ids
+  FROM metadata
+  WHERE aodn_uuid IS NOT NULL
+  GROUP BY aodn_uuid
+  HAVING COUNT(*) > 1
 )
+SELECT dupes.aodn_uuid, dupes.cnt, dupes.ids[2:] as to_delete
+FROM dupes;
 
-# The internal `uuid` links all data relationships
-# aodn_uuid remains NULL
+-- Delete duplicates (keep first occurrence)
+DELETE FROM metadata
+WHERE id IN (
+  SELECT (array_agg(id))[2]
+  FROM metadata
+  GROUP BY aodn_uuid
+  HAVING COUNT(*) > 1
+);
 ```
 
 ---
 
-## Summary of Changes
+## Migration Guide
 
-| File | Change | Impact |
-|------|--------|--------|
-| `init.sql` | Add `aodn_uuid` column + sparse index | Schema update |
-| `docs/database_schema.md` | Document `aodn_uuid` field | Documentation |
-| `enrich_metadata_from_xml.py` | Extract and populate `aodn_uuid` | Data population |
-| Existing code | No changes needed | Fully backward compatible |
+### For Existing Databases
 
+**Option 1: No Action** (Recommended for mixed-source data)
+```sql
+-- Add column (already nullable)
+ALTER TABLE metadata 
+ADD COLUMN IF NOT EXISTS aodn_uuid TEXT UNIQUE;
+
+-- Leave NULL for existing AODN datasets
+-- New ingestions will populate automatically
+```
+
+**Option 2: Backfill Known AODN UUIDs**
+```sql
+-- Only if all existing data is AODN-sourced
+UPDATE metadata SET aodn_uuid = uuid WHERE aodn_uuid IS NULL;
+```
+
+**Option 3: Mark Non-AODN Data Explicitly**
+```sql
+-- Mark specific datasets as non-AODN
+UPDATE metadata 
+SET aodn_uuid = NULL 
+WHERE dataset_name IN ('custom_dataset1', 'custom_dataset2');
+```
+
+### For New Deployments
+
+1. Run `init.sql` (includes `aodn_uuid` field)
+2. Deduplication works automatically
+3. No additional setup needed
+
+---
+
+## Performance Considerations
+
+### Deduplication Check Cost
+
+- **Single UUID check**: ~1-5ms (indexed lookup)
+- **Batch 100 UUIDs**: ~10-20ms (more efficient than 100 individual checks)
+- **Index**: Sparse index only on non-NULL values (minimal overhead)
+
+### Query Optimization
+
+```sql
+-- Fast: Uses index
+SELECT id FROM metadata WHERE aodn_uuid = '550e8400-e29b-41d4-a716-446655440000';
+
+-- Fast: Batch query with index
+SELECT aodn_uuid FROM metadata WHERE aodn_uuid = ANY(ARRAY['uuid1', 'uuid2', 'uuid3']);
+
+-- Fast: Find duplicates with grouping
+SELECT aodn_uuid, COUNT(*) FROM metadata WHERE aodn_uuid IS NOT NULL GROUP BY aodn_uuid HAVING COUNT(*) > 1;
+```
+
+---
+
+## Backward Compatibility
+
+✅ **Fully backward compatible**
+- New `aodn_uuid` field is optional (nullable)
+- Existing queries unaffected
+- Non-AODN datasets work normally
+- No cascading changes required
+
+---
+
+## Future Enhancements
+
+1. **Dedup Log Table**: Optional audit trail of all deduplication events
+2. **Batch Ingest Mode**: Process multiple datasets with single dedup query
+3. **AODN API Integration**: Auto-fetch metadata from AODN portal
+4. **Conflict Resolution**: Handle UUID mismatches between systems
+5. **Metrics Dashboard**: Track deduplication rates and success rates
+
+---
+
+## Support & Questions
+
+For questions about AODN UUID implementation:
+1. Check logs for deduplication messages
+2. Run diagnostic queries to check UUID state
+3. Use utility functions to analyze dedup behavior
+4. See troubleshooting section above
