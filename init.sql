@@ -426,6 +426,23 @@ GROUP BY
 ORDER BY time DESC, parameter_code;
 
 -- =============================================================================
+-- ETL QA/QC SUMMARY VIEW
+-- =============================================================================
+
+CREATE OR REPLACE VIEW parameter_summary AS
+SELECT 
+    parameter_code,
+    COUNT(*) as count,
+    AVG(value) as mean,
+    STDDEV(value) as std_dev,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value) as median,
+    MIN(time) as earliest,
+    MAX(time) as latest
+FROM measurements
+GROUP BY parameter_code;
+
+
+-- =============================================================================
 -- SPATIAL & BIOLOGICAL FEATURES (Pure PostgreSQL - lat/lon)
 -- =============================================================================
 
