@@ -215,10 +215,10 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         
         # === DESCRIPTIVE FIELDS ===
         
-        # Abstract
         if verbose:
             logger.debug("  Extracting descriptive fields...")
         
+        # Abstract
         abstract_xpaths = [
             './/gmd:identificationInfo//gmd:abstract/gco:CharacterString',
             './/mdb:identificationInfo//mri:abstract/gco:CharacterString'
@@ -598,11 +598,13 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     
     for idx, dataset in enumerate(datasets, 1):
         try:
-            logger.info(f"\n[{idx}/{len(datasets)}] Inserting: {dataset['title'][:60]}...")
-            logger.debug(f"  UUID: {dataset['uuid']}")
+            logger.info(f"\n[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
+            logger.debug(f"  UUID: {dataset.get('uuid', 'None')}")
             
-            # Prepare values tuple in correct order
-            values = tuple(dataset.get(field) for field in fields[:-1]) + (datetime.now(),)
+            # Prepare values tuple in correct order, using .get() with None default
+            values = tuple(
+                dataset.get(field) for field in fields[:-1]  # All fields except 'extracted_at'
+            ) + (datetime.now(),)  # Add extracted_at timestamp
             
             cursor.execute(insert_sql, values)
             
@@ -705,6 +707,8 @@ def main():
         
     except Exception as e:
         logger.error(f"\n✗ Failed: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return 1
 
 
