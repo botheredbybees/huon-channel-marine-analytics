@@ -37,11 +37,12 @@ from datetime import datetime
 import argparse
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional
+import traceback
 
 # Configure detailed logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - [%(levelname)s] [%(funcName)s] %(message)s',
+    format='%(asctime)s - [%(levelname)s] [%(funcName)s:%(lineno)d] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
@@ -110,30 +111,56 @@ def find_metadata_xml(dataset_dir: Path) -> Optional[Path]:
 def extract_text(element, xpath: str, namespaces: dict) -> Optional[str]:
     """Extract text from XML element using XPath."""
     try:
+        logger.debug(f"    Attempting to extract text from xpath: {xpath}")
+        logger.debug(f"    Element type: {type(element)}, Element: {element}")
+        
+        if element is None:
+            logger.debug(f"    Element is None, cannot extract")
+            return None
+            
         found = element.find(xpath, namespaces)
-        if found is not None and found.text:
-            return found.text.strip()
+        logger.debug(f"    find() returned: {type(found)}")
+        
+        if found is not None:
+            logger.debug(f"    found.text type: {type(found.text) if hasattr(found, 'text') else 'no text attr'}")
+            if hasattr(found, 'text') and found.text:
+                result = found.text.strip()
+                logger.debug(f"    Extracted text: {result[:50] if len(result) > 50 else result}")
+                return result
+        logger.debug(f"    No text found at xpath: {xpath}")
     except Exception as e:
-        logger.debug(f"Error extracting {xpath}: {e}")
+        logger.error(f"    Error extracting {xpath}: {e}")
+        logger.error(f"    Stack trace: {traceback.format_exc()}")
     return None
 
 
 def extract_date(root, xpaths: List[str], namespaces: dict, verbose: bool = False) -> Optional[str]:
     """Extract date from XML using multiple XPath patterns."""
-    for xpath in xpaths:
-        date_text = extract_text(root, xpath, namespaces)
-        if date_text:
-            # Handle ISO format dates
-            if 'T' in date_text:
-                date_text = date_text.split('T')[0]
-            if verbose:
-                logger.debug(f"    Found date: {date_text} (xpath: {xpath})")
-            return date_text
+    logger.debug(f"  extract_date called with {len(xpaths)} xpath patterns")
+    logger.debug(f"  root type: {type(root)}, root: {root}")
+    
+    for idx, xpath in enumerate(xpaths):
+        logger.debug(f"  Trying xpath {idx+1}/{len(xpaths)}: {xpath}")
+        try:
+            date_text = extract_text(root, xpath, namespaces)
+            if date_text:
+                # Handle ISO format dates
+                if 'T' in date_text:
+                    date_text = date_text.split('T')[0]
+                if verbose:
+                    logger.debug(f"    Found date: {date_text} (xpath: {xpath})")
+                return date_text
+        except Exception as e:
+            logger.error(f"  Exception in extract_date for xpath {xpath}: {e}")
+            logger.error(f"  Stack trace: {traceback.format_exc()}")
     return None
 
 
 def extract_temporal_extent(root, namespaces: dict, verbose: bool = False) -> Dict[str, Optional[str]]:
     """Extract temporal extent (time start and end)."""
+    logger.debug(f"extract_temporal_extent called")
+    logger.debug(f"  root type: {type(root)}")
+    
     temporal = {'time_start': None, 'time_end': None}
     
     # Try different XPath patterns for temporal extent
@@ -142,36 +169,49 @@ def extract_temporal_extent(root, namespaces: dict, verbose: bool = False) -> Di
         './/gex:EX_TemporalExtent'
     ]
     
-    for pattern in patterns:
-        temp_elem = root.find(pattern, namespaces)
-        if temp_elem is not None:
-            begin = extract_text(temp_elem, './/gml:beginPosition', namespaces)
-            end = extract_text(temp_elem, './/gml:endPosition', namespaces)
+    for idx, pattern in enumerate(patterns):
+        logger.debug(f"  Trying temporal pattern {idx+1}/{len(patterns)}: {pattern}")
+        try:
+            temp_elem = root.find(pattern, namespaces)
+            logger.debug(f"  temp_elem type: {type(temp_elem)}")
             
-            if begin:
-                # Handle ISO format dates
-                if 'T' in begin:
-                    begin = begin.split('T')[0]
-                temporal['time_start'] = begin
-                if verbose:
-                    logger.debug(f"    Found time_start: {begin}")
-            
-            if end:
-                if 'T' in end:
-                    end = end.split('T')[0]
-                temporal['time_end'] = end
-                if verbose:
-                    logger.debug(f"    Found time_end: {end}")
-            
-            if temporal['time_start'] or temporal['time_end']:
-                break
+            if temp_elem is not None:
+                logger.debug(f"  Found temporal element, extracting begin/end positions")
+                begin = extract_text(temp_elem, './/gml:beginPosition', namespaces)
+                end = extract_text(temp_elem, './/gml:endPosition', namespaces)
+                
+                logger.debug(f"  begin result: {begin}")
+                logger.debug(f"  end result: {end}")
+                
+                if begin:
+                    # Handle ISO format dates
+                    if 'T' in begin:
+                        begin = begin.split('T')[0]
+                    temporal['time_start'] = begin
+                    if verbose:
+                        logger.debug(f"    Found time_start: {begin}")
+                
+                if end:
+                    if 'T' in end:
+                        end = end.split('T')[0]
+                    temporal['time_end'] = end
+                    if verbose:
+                        logger.debug(f"    Found time_end: {end}")
+                
+                if temporal['time_start'] or temporal['time_end']:
+                    break
+        except Exception as e:
+            logger.error(f"  Exception in extract_temporal_extent for pattern {pattern}: {e}")
+            logger.error(f"  Stack trace: {traceback.format_exc()}")
     
+    logger.debug(f"  Returning temporal: {temporal}")
     return temporal
 
 
 def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
     """Parse ISO 19115 XML metadata file and extract all available fields."""
-    logger.info(f"Parsing XML: {xml_path.name}")
+    logger.info(f"parse_xml_metadata called for: {xml_path.name}")
+    logger.debug(f"  xml_path type: {type(xml_path)}, full path: {xml_path}")
     
     metadata = {
         'uuid': None, 'title': None, 'abstract': None, 'credit': None,
@@ -183,212 +223,296 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         'time_start': None, 'time_end': None
     }
     
+    logger.debug(f"  Initial metadata dict created with {len(metadata)} keys")
+    
     try:
+        logger.debug(f"  Attempting to parse XML file...")
         tree = ET.parse(xml_path)
+        logger.debug(f"  XML parsed successfully, tree type: {type(tree)}")
+        
         root = tree.getroot()
+        logger.debug(f"  Got root element, type: {type(root)}, tag: {root.tag if hasattr(root, 'tag') else 'no tag'}")
         
         if verbose:
             logger.debug(f"  XML root tag: {root.tag}")
         
         # === CORE IDENTIFIERS ===
+        logger.debug("  === Extracting CORE IDENTIFIERS ===")
         
         # Extract UUID
+        logger.debug("  Extracting UUID...")
         for xpath in ['./gmd:fileIdentifier/gco:CharacterString', './fileIdentifier/CharacterString']:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['uuid'] = elem.text.strip()
-                logger.info(f"  ✓ UUID: {metadata['uuid']}")
-                break
+            logger.debug(f"    Trying UUID xpath: {xpath}")
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                logger.debug(f"    elem type: {type(elem)}, elem: {elem}")
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['uuid'] = elem.text.strip()
+                    logger.info(f"  ✓ UUID: {metadata['uuid']}")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting UUID: {e}")
+                logger.error(f"    Stack trace: {traceback.format_exc()}")
         
         # Extract title
+        logger.debug("  Extracting title...")
         title_xpaths = [
             './/gmd:title/gco:CharacterString',
             './/title/CharacterString',
             './/mdb:identificationInfo//mri:citation//cit:title/gco:CharacterString'
         ]
-        for xpath in title_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['title'] = elem.text.strip()
-                logger.info(f"  ✓ Title: {metadata['title'][:60]}...")
-                break
+        for idx, xpath in enumerate(title_xpaths):
+            logger.debug(f"    Trying title xpath {idx+1}/{len(title_xpaths)}: {xpath}")
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                logger.debug(f"    elem type: {type(elem)}")
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['title'] = elem.text.strip()
+                    logger.info(f"  ✓ Title: {metadata['title'][:60]}...")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting title: {e}")
+                logger.error(f"    Stack trace: {traceback.format_exc()}")
         
         # === DESCRIPTIVE FIELDS ===
+        logger.debug("  === Extracting DESCRIPTIVE FIELDS ===")
         
         if verbose:
             logger.debug("  Extracting descriptive fields...")
         
         # Abstract
+        logger.debug("  Extracting abstract...")
         abstract_xpaths = [
             './/gmd:identificationInfo//gmd:abstract/gco:CharacterString',
             './/mdb:identificationInfo//mri:abstract/gco:CharacterString'
         ]
         for xpath in abstract_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['abstract'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Abstract: {metadata['abstract'][:80]}...")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['abstract'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Abstract: {metadata['abstract'][:80]}...")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting abstract: {e}")
         
         # Credit
+        logger.debug("  Extracting credit...")
         credit_xpaths = [
             './/gmd:identificationInfo//gmd:credit/gco:CharacterString',
             './/mdb:identificationInfo//mri:credit/gco:CharacterString'
         ]
         for xpath in credit_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['credit'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Credit: {metadata['credit'][:80]}...")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['credit'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Credit: {metadata['credit'][:80]}...")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting credit: {e}")
         
         # Supplemental information
+        logger.debug("  Extracting supplemental info...")
         supp_xpaths = [
             './/gmd:identificationInfo//gmd:supplementalInformation/gco:CharacterString',
             './/mdb:identificationInfo//mri:supplementalInformation/gco:CharacterString'
         ]
         for xpath in supp_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['supplemental_info'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Supplemental info: {metadata['supplemental_info'][:80]}...")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['supplemental_info'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Supplemental info: {metadata['supplemental_info'][:80]}...")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting supplemental_info: {e}")
         
         # Lineage
+        logger.debug("  Extracting lineage...")
         lineage_xpaths = [
             './/gmd:dataQualityInfo//gmd:lineage//gmd:statement/gco:CharacterString',
             './/mdb:dataQualityInfo//gmd:lineage//gmd:statement/gco:CharacterString'
         ]
         for xpath in lineage_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['lineage'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Lineage: {metadata['lineage'][:80]}...")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['lineage'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Lineage: {metadata['lineage'][:80]}...")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting lineage: {e}")
         
         # === CONSTRAINTS ===
+        logger.debug("  === Extracting CONSTRAINTS ===")
         
         if verbose:
             logger.debug("  Extracting constraints...")
         
         # Use limitation
+        logger.debug("  Extracting use limitation...")
         use_lim_xpaths = [
             './/gmd:identificationInfo//gmd:resourceConstraints//gmd:useLimitation/gco:CharacterString',
             './/mdb:identificationInfo//mri:resourceConstraints//gmd:useLimitation/gco:CharacterString'
         ]
         for xpath in use_lim_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['use_limitation'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Use limitation: {metadata['use_limitation'][:80]}...")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['use_limitation'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Use limitation: {metadata['use_limitation'][:80]}...")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting use_limitation: {e}")
         
         # License URL (from otherConstraints)
+        logger.debug("  Extracting license URL...")
         license_xpaths = [
             './/gmd:identificationInfo//gmd:resourceConstraints//gmd:otherConstraints/gco:CharacterString',
             './/mdb:identificationInfo//mri:resourceConstraints//gmd:otherConstraints/gco:CharacterString'
         ]
         for xpath in license_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text and 'http' in elem.text:
-                metadata['license_url'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    License URL: {metadata['license_url']}")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text and 'http' in elem.text:
+                    metadata['license_url'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    License URL: {metadata['license_url']}")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting license_url: {e}")
         
         # === CLASSIFICATION FIELDS ===
+        logger.debug("  === Extracting CLASSIFICATION FIELDS ===")
         
         if verbose:
             logger.debug("  Extracting classification fields...")
         
         # Topic category
+        logger.debug("  Extracting topic category...")
         topic_xpaths = [
             './/gmd:identificationInfo//gmd:topicCategory/gmd:MD_TopicCategoryCode',
             './/mdb:identificationInfo//mri:topicCategory/mri:MD_TopicCategoryCode'
         ]
         for xpath in topic_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['topic_category'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Topic category: {metadata['topic_category']}")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['topic_category'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Topic category: {metadata['topic_category']}")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting topic_category: {e}")
         
         # Language
+        logger.debug("  Extracting language...")
         lang_xpaths = [
             './/gmd:identificationInfo//gmd:language/gco:CharacterString',
             './/gmd:identificationInfo//gmd:language/gmd:LanguageCode',
             './/mdb:identificationInfo//mri:defaultLocale//gco:CharacterString'
         ]
         for xpath in lang_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['language'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Language: {metadata['language']}")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['language'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Language: {metadata['language']}")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting language: {e}")
         
         # Character set
+        logger.debug("  Extracting character set...")
         charset_xpaths = [
             './/gmd:characterSet/gmd:MD_CharacterSetCode',
             './/mdb:metadataScope//gmd:MD_CharacterSetCode'
         ]
         for xpath in charset_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['character_set'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Character set: {metadata['character_set']}")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['character_set'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Character set: {metadata['character_set']}")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting character_set: {e}")
         
         # Status
+        logger.debug("  Extracting status...")
         status_xpaths = [
             './/gmd:identificationInfo//gmd:status/gmd:MD_ProgressCode',
             './/mdb:identificationInfo//mri:status/mri:MD_ProgressCode'
         ]
         for xpath in status_xpaths:
-            elem = root.find(xpath, XML_NAMESPACES)
-            if elem is not None and elem.text:
-                metadata['status'] = elem.text.strip()
-                if verbose:
-                    logger.debug(f"    Status: {metadata['status']}")
-                break
+            try:
+                elem = root.find(xpath, XML_NAMESPACES)
+                if elem is not None and hasattr(elem, 'text') and elem.text:
+                    metadata['status'] = elem.text.strip()
+                    if verbose:
+                        logger.debug(f"    Status: {metadata['status']}")
+                    break
+            except Exception as e:
+                logger.error(f"    Exception extracting status: {e}")
         
         # === DATES ===
+        logger.debug("  === Extracting DATES ===")
         
         if verbose:
             logger.debug("  Extracting dates...")
         
         # Metadata creation date
+        logger.debug("  Extracting metadata creation date...")
         creation_xpaths = [
             './/gmd:dateStamp/gco:DateTime',
             './/gmd:dateStamp/gco:Date',
             './/mdb:dateInfo//cit:date/gco:DateTime'
         ]
-        metadata['metadata_creation_date'] = extract_date(root, creation_xpaths, XML_NAMESPACES, verbose)
+        try:
+            metadata['metadata_creation_date'] = extract_date(root, creation_xpaths, XML_NAMESPACES, verbose)
+            logger.debug(f"    metadata_creation_date result: {metadata['metadata_creation_date']}")
+        except Exception as e:
+            logger.error(f"    Exception extracting metadata_creation_date: {e}")
+            logger.error(f"    Stack trace: {traceback.format_exc()}")
         
         # Metadata revision date (look for dateType="revision")
-        for date_elem in root.findall('.//gmd:dateInfo//gmd:CI_Date', XML_NAMESPACES):
-            date_type = extract_text(date_elem, './/gmd:dateType/gmd:CI_DateTypeCode', XML_NAMESPACES)
-            if date_type == 'revision':
-                revision_xpaths = ['.//gmd:date/gco:DateTime', './/gmd:date/gco:Date']
-                metadata['metadata_revision_date'] = extract_date(date_elem, revision_xpaths, XML_NAMESPACES, verbose)
-                break
+        logger.debug("  Extracting metadata revision date...")
+        try:
+            for date_elem in root.findall('.//gmd:dateInfo//gmd:CI_Date', XML_NAMESPACES):
+                date_type = extract_text(date_elem, './/gmd:dateType/gmd:CI_DateTypeCode', XML_NAMESPACES)
+                if date_type == 'revision':
+                    revision_xpaths = ['.//gmd:date/gco:DateTime', './/gmd:date/gco:Date']
+                    metadata['metadata_revision_date'] = extract_date(date_elem, revision_xpaths, XML_NAMESPACES, verbose)
+                    break
+            logger.debug(f"    metadata_revision_date result: {metadata['metadata_revision_date']}")
+        except Exception as e:
+            logger.error(f"    Exception extracting metadata_revision_date: {e}")
+            logger.error(f"    Stack trace: {traceback.format_exc()}")
         
         # Citation date
+        logger.debug("  Extracting citation date...")
         citation_xpaths = [
             './/gmd:identificationInfo//gmd:citation//gmd:date//gco:Date',
             './/gmd:identificationInfo//gmd:citation//gmd:date//gco:DateTime',
             './/mdb:identificationInfo//mri:citation//cit:date//gco:DateTime'
         ]
-        metadata['citation_date'] = extract_date(root, citation_xpaths, XML_NAMESPACES, verbose)
+        try:
+            metadata['citation_date'] = extract_date(root, citation_xpaths, XML_NAMESPACES, verbose)
+            logger.debug(f"    citation_date result: {metadata['citation_date']}")
+        except Exception as e:
+            logger.error(f"    Exception extracting citation_date: {e}")
+            logger.error(f"    Stack trace: {traceback.format_exc()}")
         
         # === SPATIAL EXTENT (Bounding Box) ===
+        logger.debug("  === Extracting BOUNDING BOX ===")
         
         if verbose:
             logger.debug("  Extracting bounding box...")
@@ -399,63 +523,87 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         ]
         
         for pattern, ns in bbox_patterns:
-            bbox_elem = root.find(pattern, XML_NAMESPACES)
-            if bbox_elem is not None:
-                west = extract_text(bbox_elem, f'.//{ns}:westBoundLongitude/gco:Decimal', XML_NAMESPACES)
-                east = extract_text(bbox_elem, f'.//{ns}:eastBoundLongitude/gco:Decimal', XML_NAMESPACES)
-                south = extract_text(bbox_elem, f'.//{ns}:southBoundLatitude/gco:Decimal', XML_NAMESPACES)
-                north = extract_text(bbox_elem, f'.//{ns}:northBoundLatitude/gco:Decimal', XML_NAMESPACES)
+            logger.debug(f"  Trying bbox pattern: {pattern} (namespace: {ns})")
+            try:
+                bbox_elem = root.find(pattern, XML_NAMESPACES)
+                logger.debug(f"    bbox_elem type: {type(bbox_elem)}")
                 
-                if west:
-                    try:
-                        metadata['west'] = float(west)
-                    except ValueError:
-                        pass
-                if east:
-                    try:
-                        metadata['east'] = float(east)
-                    except ValueError:
-                        pass
-                if south:
-                    try:
-                        metadata['south'] = float(south)
-                    except ValueError:
-                        pass
-                if north:
-                    try:
-                        metadata['north'] = float(north)
-                    except ValueError:
-                        pass
-                
-                if all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):
-                    logger.info(f"  ✓ Bounding box: [{metadata['west']:.2f}, {metadata['east']:.2f}, {metadata['south']:.2f}, {metadata['north']:.2f}]")
-                    break
+                if bbox_elem is not None:
+                    logger.debug(f"    Found bbox element, extracting coordinates...")
+                    west = extract_text(bbox_elem, f'.//{ns}:westBoundLongitude/gco:Decimal', XML_NAMESPACES)
+                    east = extract_text(bbox_elem, f'.//{ns}:eastBoundLongitude/gco:Decimal', XML_NAMESPACES)
+                    south = extract_text(bbox_elem, f'.//{ns}:southBoundLatitude/gco:Decimal', XML_NAMESPACES)
+                    north = extract_text(bbox_elem, f'.//{ns}:northBoundLatitude/gco:Decimal', XML_NAMESPACES)
+                    
+                    logger.debug(f"    west: {west}, east: {east}, south: {south}, north: {north}")
+                    
+                    if west:
+                        try:
+                            metadata['west'] = float(west)
+                        except ValueError as e:
+                            logger.error(f"    ValueError converting west to float: {e}")
+                    if east:
+                        try:
+                            metadata['east'] = float(east)
+                        except ValueError as e:
+                            logger.error(f"    ValueError converting east to float: {e}")
+                    if south:
+                        try:
+                            metadata['south'] = float(south)
+                        except ValueError as e:
+                            logger.error(f"    ValueError converting south to float: {e}")
+                    if north:
+                        try:
+                            metadata['north'] = float(north)
+                        except ValueError as e:
+                            logger.error(f"    ValueError converting north to float: {e}")
+                    
+                    if all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):
+                        logger.info(f"  ✓ Bounding box: [{metadata['west']:.2f}, {metadata['east']:.2f}, {metadata['south']:.2f}, {metadata['north']:.2f}]")
+                        break
+            except Exception as e:
+                logger.error(f"    Exception extracting bounding box: {e}")
+                logger.error(f"    Stack trace: {traceback.format_exc()}")
         
         if not all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):
             if verbose:
                 logger.warning(f"  ⚠ Incomplete bounding box, will use defaults")
         
         # === TEMPORAL EXTENT ===
+        logger.debug("  === Extracting TEMPORAL EXTENT ===")
         
         if verbose:
             logger.debug("  Extracting temporal extent...")
         
-        temporal = extract_temporal_extent(root, XML_NAMESPACES, verbose)
-        metadata.update(temporal)
+        try:
+            temporal = extract_temporal_extent(root, XML_NAMESPACES, verbose)
+            logger.debug(f"  temporal result: {temporal}")
+            logger.debug(f"  Updating metadata with temporal data...")
+            metadata.update(temporal)
+            logger.debug(f"  metadata after update: time_start={metadata.get('time_start')}, time_end={metadata.get('time_end')}")
+        except Exception as e:
+            logger.error(f"  Exception extracting temporal extent: {e}")
+            logger.error(f"  Stack trace: {traceback.format_exc()}")
         
-        if metadata['time_start'] or metadata['time_end']:
-            logger.info(f"  ✓ Temporal extent: {metadata['time_start'] or 'N/A'} to {metadata['time_end'] or 'N/A'}")
+        if metadata.get('time_start') or metadata.get('time_end'):
+            logger.info(f"  ✓ Temporal extent: {metadata.get('time_start') or 'N/A'} to {metadata.get('time_end') or 'N/A'}")
         
         # === SUMMARY ===
+        logger.debug("  === PARSING SUMMARY ===")
         
         fields_extracted = sum(1 for v in metadata.values() if v is not None)
         logger.info(f"  ✓ XML parsing completed: {fields_extracted} fields extracted")
+        logger.debug(f"  Final metadata keys: {list(metadata.keys())}")
+        logger.debug(f"  Final metadata values summary: {[(k, type(v)) for k, v in metadata.items()]}")
         
     except ET.ParseError as e:
         logger.error(f"  ✗ XML parsing error: {e}")
+        logger.error(f"  Stack trace: {traceback.format_exc()}")
     except Exception as e:
-        logger.error(f"  ✗ Unexpected error: {e}")
+        logger.error(f"  ✗ Unexpected error in parse_xml_metadata: {e}")
+        logger.error(f"  Stack trace: {traceback.format_exc()}")
     
+    logger.debug(f"parse_xml_metadata returning metadata dict with {len(metadata)} keys")
     return metadata
 
 
@@ -469,6 +617,7 @@ def generate_uuid_from_path(dataset_path: Path) -> str:
 
 def extract_bounding_box_from_name(dataset_name: str) -> Dict[str, float]:
     """Extract bounding box hints from dataset name."""
+    logger.debug(f"extract_bounding_box_from_name called for: {dataset_name}")
     name_lower = dataset_name.lower()
     
     if any(x in name_lower for x in ['huon', 'dentrecasteaux', "d'entrecasteaux"]):
@@ -492,7 +641,9 @@ def clean_dataset_name(directory_name: str) -> str:
 
 def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> List[Dict]:
     """Scan AODN_data directory with comprehensive XML metadata parsing."""
+    logger.info(f"scan_aodn_directory called with base_path: {base_path}")
     base_path = Path(base_path)
+    logger.debug(f"  base_path type: {type(base_path)}, value: {base_path}")
     
     if not base_path.exists():
         logger.error(f"✗ Directory not found: {base_path}")
@@ -501,68 +652,107 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
     logger.info(f"Scanning: {base_path}")
     subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
     logger.info(f"Found {len(subdirs)} potential datasets")
+    logger.debug(f"  subdirs: {[d.name for d in subdirs]}")
     
     datasets = []
     
     for idx, dataset_dir in enumerate(subdirs, 1):
         logger.info(f"\n[{idx}/{len(subdirs)}] Processing: {dataset_dir.name}")
+        logger.debug(f"  dataset_dir type: {type(dataset_dir)}, value: {dataset_dir}")
         
-        # Try to find and parse metadata.xml
-        xml_path = find_metadata_xml(dataset_dir)
-        
-        if xml_path:
-            xml_metadata = parse_xml_metadata(xml_path, verbose=verbose)
-            dataset_uuid = xml_metadata.get('uuid') or generate_uuid_from_path(dataset_dir)
-            title = xml_metadata.get('title') or dataset_dir.name
+        try:
+            # Try to find and parse metadata.xml
+            xml_path = find_metadata_xml(dataset_dir)
+            logger.debug(f"  xml_path: {xml_path}")
             
-            # Use bounding box from XML if complete, otherwise estimate
-            if all(xml_metadata.get(c) for c in ['west', 'east', 'south', 'north']):
-                bbox = {k: xml_metadata[k] for k in ['west', 'east', 'south', 'north']}
-                logger.info(f"  Using bounding box from XML")
+            if xml_path:
+                logger.debug(f"  Calling parse_xml_metadata...")
+                xml_metadata = parse_xml_metadata(xml_path, verbose=verbose)
+                logger.debug(f"  parse_xml_metadata returned type: {type(xml_metadata)}")
+                logger.debug(f"  xml_metadata keys: {list(xml_metadata.keys()) if xml_metadata else 'None'}")
+                
+                if xml_metadata is None:
+                    logger.error(f"  ✗ parse_xml_metadata returned None!")
+                    xml_metadata = {}
+                
+                logger.debug(f"  Getting 'uuid' from xml_metadata...")
+                dataset_uuid = xml_metadata.get('uuid') or generate_uuid_from_path(dataset_dir)
+                logger.debug(f"  dataset_uuid: {dataset_uuid}")
+                
+                logger.debug(f"  Getting 'title' from xml_metadata...")
+                title = xml_metadata.get('title') or dataset_dir.name
+                logger.debug(f"  title: {title}")
+                
+                # Use bounding box from XML if complete, otherwise estimate
+                logger.debug(f"  Checking bbox completeness...")
+                logger.debug(f"  west: {xml_metadata.get('west')}, east: {xml_metadata.get('east')}, south: {xml_metadata.get('south')}, north: {xml_metadata.get('north')}")
+                
+                if all(xml_metadata.get(c) for c in ['west', 'east', 'south', 'north']):
+                    logger.debug(f"  Extracting bbox from xml_metadata...")
+                    bbox = {k: xml_metadata.get(k, None) for k in ['west', 'east', 'south', 'north']}
+                    logger.debug(f"  bbox: {bbox}")
+                    logger.info(f"  Using bounding box from XML")
+                else:
+                    logger.debug(f"  Calling extract_bounding_box_from_name...")
+                    bbox = extract_bounding_box_from_name(dataset_dir.name)
+                    logger.debug(f"  bbox from name: {bbox}")
+                    logger.info(f"  Using estimated bounding box")
+                    # Update xml_metadata with estimated bbox
+                    logger.debug(f"  Updating xml_metadata with bbox...")
+                    xml_metadata.update(bbox)
+                
+                # Merge all metadata fields
+                logger.debug(f"  Creating dataset_info dict...")
+                dataset_info = {
+                    'uuid': dataset_uuid,
+                    'title': title,
+                    'dataset_name': clean_dataset_name(dataset_dir.name),
+                    'dataset_path': str(dataset_dir),
+                }
+                logger.debug(f"  dataset_info before merge: {list(dataset_info.keys())}")
+                logger.debug(f"  Merging xml_metadata into dataset_info...")
+                dataset_info.update(xml_metadata)
+                logger.debug(f"  dataset_info after merge: {list(dataset_info.keys())}")
             else:
+                logger.warning(f"  No metadata.xml found, using directory-based metadata")
+                dataset_uuid = generate_uuid_from_path(dataset_dir)
+                title = dataset_dir.name
                 bbox = extract_bounding_box_from_name(dataset_dir.name)
-                logger.info(f"  Using estimated bounding box")
-                # Update xml_metadata with estimated bbox
-                xml_metadata.update(bbox)
+                
+                dataset_info = {
+                    'uuid': dataset_uuid,
+                    'title': title,
+                    'dataset_name': clean_dataset_name(dataset_dir.name),
+                    'dataset_path': str(dataset_dir),
+                }
+                dataset_info.update(bbox)
             
-            # Merge all metadata fields
-            dataset_info = {
-                'uuid': dataset_uuid,
-                'title': title,
-                'dataset_name': clean_dataset_name(dataset_dir.name),
-                'dataset_path': str(dataset_dir),
-                **xml_metadata  # Include all extracted fields
-            }
-        else:
-            logger.warning(f"  No metadata.xml found, using directory-based metadata")
-            dataset_uuid = generate_uuid_from_path(dataset_dir)
-            title = dataset_dir.name
-            bbox = extract_bounding_box_from_name(dataset_dir.name)
+            file_count = sum(1 for _ in dataset_dir.rglob('*') if _.is_file())
+            logger.info(f"  File count: {file_count}")
+            dataset_info['file_count'] = file_count
             
-            dataset_info = {
-                'uuid': dataset_uuid,
-                'title': title,
-                'dataset_name': clean_dataset_name(dataset_dir.name),
-                'dataset_path': str(dataset_dir),
-                **bbox
-            }
-        
-        file_count = sum(1 for _ in dataset_dir.rglob('*') if _.is_file())
-        logger.info(f"  File count: {file_count}")
-        dataset_info['file_count'] = file_count
-        
-        datasets.append(dataset_info)
-        logger.info(f"  ✓ Dataset processed successfully")
+            logger.debug(f"  Appending dataset_info to datasets list...")
+            datasets.append(dataset_info)
+            logger.info(f"  ✓ Dataset processed successfully")
+            logger.debug(f"  Current datasets count: {len(datasets)}")
+            
+        except Exception as e:
+            logger.error(f"  ✗ Exception processing dataset {dataset_dir.name}: {e}")
+            logger.error(f"  Stack trace: {traceback.format_exc()}")
     
     logger.info(f"\n{'='*60}")
     logger.info(f"Scan complete: {len(datasets)} datasets identified")
     logger.info(f"{'='*60}")
+    logger.debug(f"Returning datasets list with {len(datasets)} items")
     
     return datasets
 
 
 def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     """Populate metadata table with all extracted fields."""
+    logger.info(f"populate_metadata_table called with {len(datasets)} datasets")
+    logger.debug(f"  force: {force}")
+    
     cursor = conn.cursor()
     logger.info(f"\nPopulating metadata (mode: {'UPDATE' if force else 'INSERT ONLY'})")
     
@@ -577,8 +767,12 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
         'time_start', 'time_end', 'extracted_at'
     ]
     
+    logger.debug(f"  fields list: {fields}")
+    
     placeholders = ', '.join(['%s'] * len(fields))
     field_names = ', '.join(fields)
+    
+    logger.debug(f"  Building SQL statement...")
     
     if force:
         update_set = ', '.join([f"{field} = EXCLUDED.{field}" for field in fields if field != 'uuid'])
@@ -594,19 +788,36 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
             ON CONFLICT (uuid) DO NOTHING;
         """
     
+    logger.debug(f"  SQL prepared (length: {len(insert_sql)})")
+    
     inserted, updated, skipped, failed = 0, 0, 0, 0
     
     for idx, dataset in enumerate(datasets, 1):
         try:
             logger.info(f"\n[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
+            logger.debug(f"  dataset type: {type(dataset)}")
+            logger.debug(f"  dataset keys: {list(dataset.keys())}")
             logger.debug(f"  UUID: {dataset.get('uuid', 'None')}")
             
+            logger.debug(f"  Preparing values tuple...")
             # Prepare values tuple in correct order, using .get() with None default
-            values = tuple(
-                dataset.get(field, None) for field in fields[:-1]  # All fields except 'extracted_at'
-            ) + (datetime.now(),)  # Add extracted_at timestamp
+            values_list = []
+            for field_idx, field in enumerate(fields[:-1]):  # All fields except 'extracted_at'
+                logger.debug(f"    Getting field {field_idx}: {field}")
+                value = dataset.get(field, None)
+                logger.debug(f"      Value type: {type(value)}, Value: {value}")
+                values_list.append(value)
             
+            logger.debug(f"  Adding extracted_at timestamp...")
+            values_list.append(datetime.now())
+            
+            values = tuple(values_list)
+            logger.debug(f"  values tuple length: {len(values)}")
+            logger.debug(f"  values summary: {[(i, type(v)) for i, v in enumerate(values[:5])]}")
+            
+            logger.debug(f"  Executing SQL...")
             cursor.execute(insert_sql, values)
+            logger.debug(f"  SQL executed, rowcount: {cursor.rowcount}")
             
             if cursor.rowcount > 0:
                 if force:
@@ -621,8 +832,14 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                 
         except psycopg2.Error as e:
             failed += 1
-            logger.error(f"  ✗ Failed: {e}")
+            logger.error(f"  ✗ Database error: {e}")
+            logger.error(f"  Stack trace: {traceback.format_exc()}")
+        except Exception as e:
+            failed += 1
+            logger.error(f"  ✗ Unexpected error: {e}")
+            logger.error(f"  Stack trace: {traceback.format_exc()}")
     
+    logger.debug(f"Committing transaction...")
     conn.commit()
     logger.info(f"\n✓ Transaction committed")
     
@@ -685,30 +902,43 @@ def main():
     
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("Debug logging enabled")
     
     logger.info("="*60)
-    logger.info("METADATA POPULATION SCRIPT (Enhanced)")
+    logger.info("METADATA POPULATION SCRIPT (Enhanced with Debug Logging)")
     logger.info("="*60)
     
     try:
+        logger.debug("Calling scan_aodn_directory...")
         datasets = scan_aodn_directory(args.path, verbose=args.verbose)
+        logger.debug(f"scan_aodn_directory returned {len(datasets) if datasets else 0} datasets")
         
         if not datasets:
             logger.warning("⚠ No datasets found")
             return 1
         
+        logger.debug("Connecting to database...")
         conn = connect_to_database()
+        logger.debug("Connected successfully")
+        
+        logger.debug("Calling populate_metadata_table...")
         populate_metadata_table(conn, datasets, force=args.force)
+        logger.debug("populate_metadata_table completed")
+        
+        logger.debug("Calling verify_population...")
         verify_population(conn)
+        logger.debug("verify_population completed")
+        
+        logger.debug("Closing database connection...")
         conn.close()
+        logger.debug("Database connection closed")
         
         logger.info("\n✓ METADATA POPULATION COMPLETED SUCCESSFULLY")
         return 0
         
     except Exception as e:
         logger.error(f"\n✗ Failed: {e}")
-        import traceback
-        logger.debug(traceback.format_exc())
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         return 1
 
 
