@@ -6,9 +6,10 @@ This script:
 1. Scans AODN_data/ directory for datasets
 2. Extracts comprehensive metadata from ISO 19115 XML files
 3. Populates the metadata table with UUID, title, paths, bbox, and enriched fields
-4. Generates UUIDs for datasets without ISO 19115 XML metadata
+4. Extracts AODN UUID from directory structure (no fallback generation)
 
 Enhanced with:
+- AODN UUID extraction from directory structure: [dataset_name]/[aodn_uuid]/metadata/metadata.xml
 - Namespace-agnostic XML parsing for ISO 19115-1 and ISO 19115-3
 - Extraction of 20+ metadata fields:
   * Descriptive: abstract, credit, supplemental_info, lineage
@@ -21,6 +22,7 @@ Enhanced with:
 - Detailed progress tracking with console and file output separation
 - Better error handling and reporting
 - Normalized date handling for year-only temporal extents
+- UUID validation with regex pattern matching
 
 Usage:
     python populate_metadata.py
@@ -164,6 +166,43 @@ def find_metadata_xml(dataset_dir: Path) -> Optional[Path]:
     return None
 
 
+def extract_aodn_uuid_from_path(xml_path: Path) -> Optional[str]:
+    """
+    Extract AODN UUID from directory structure.
+    
+    Expected structure: [dataset_name]/[aodn_uuid]/metadata/metadata.xml
+    The AODN UUID is the parent directory of the metadata folder.
+    
+    Args:
+        xml_path: Path to metadata.xml file
+        
+    Returns:
+        AODN UUID string or None if not found
+    """
+    try:
+        # metadata.xml -> metadata/ -> [UUID]/ -> [Dataset Name]/
+        # So we need to go up 2 levels to get the UUID directory
+        uuid_dir = xml_path.parent.parent
+        potential_uuid = uuid_dir.name
+        
+        # Validate that it looks like a UUID (8-4-4-4-12 format)
+        uuid_pattern = re.compile(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            re.IGNORECASE
+        )
+        
+        if uuid_pattern.match(potential_uuid):
+            logger.debug(f"  ✓ Extracted AODN UUID from path: {potential_uuid}")
+            return potential_uuid
+        else:
+            logger.debug(f"  ✗ Directory name doesn't match UUID pattern: {potential_uuid}")
+            return None
+            
+    except Exception as e:
+        logger.debug(f"  ✗ Error extracting UUID from path: {e}")
+        return None
+
+
 def find_element_by_tag_suffix(root, tag_suffix: str):
     """Find first element whose tag ends with the given suffix (namespace-agnostic)."""
     for elem in root.iter():
@@ -239,13 +278,15 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         
         # === CORE IDENTIFIERS ===
         
-        # UUID - try multiple patterns
-        for pattern in [['fileIdentifier'], ['MD_Metadata', 'fileIdentifier']]:
-            uuid_text = extract_field_by_path(root, pattern)
-            if uuid_text:
-                metadata['uuid'] = uuid_text
-                logger.info(f"  ✓ UUID: {metadata['uuid']}")
-                break
+        # Extract AODN UUID from directory structure (ONLY source for uuid field)
+        aodn_uuid = extract_aodn_uuid_from_path(xml_path)
+        if aodn_uuid:
+            metadata['uuid'] = aodn_uuid
+            logger.info(f"  ✓ UUID (AODN from path): {metadata['uuid']}")
+        else:
+            # No fallback - leave as None
+            metadata['uuid'] = None
+            logger.warning("  ⚠ No AODN UUID found in directory structure - uuid will be NULL")
         
         # Title - navigate through identificationInfo -> citation -> title
         for base_patterns in [
@@ -462,6 +503,9 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         fields_extracted = sum(1 for v in metadata.values() if v is not None)
         logger.info(f"  ✓ XML parsing completed: {fields_extracted} fields extracted")
         
+        if not metadata.get('uuid'):
+            logger.warning(f"  ⚠ No UUID - record cannot be inserted (missing PRIMARY KEY)")
+        
         if not all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):
             logger.warning(f"  ⚠ Incomplete bounding box, will use defaults")
         
@@ -472,14 +516,6 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         logger.debug(traceback.format_exc())
     
     return metadata
-
-
-def generate_uuid_from_path(dataset_path: Path) -> str:
-    """Generate a deterministic UUID from dataset path."""
-    namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
-    dataset_uuid = uuid.uuid5(namespace, str(dataset_path))
-    logger.debug(f"Generated UUID: {dataset_uuid}")
-    return str(dataset_uuid)
 
 
 def extract_bounding_box_from_name(dataset_name: str) -> Dict[str, float]:
@@ -519,6 +555,7 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
     logger.info(f"Found {len(subdirs)} potential datasets")
     
     datasets = []
+    skipped_no_uuid = 0
     
     for idx, dataset_dir in enumerate(subdirs, 1):
         logger.info(f"\n[{idx}/{len(subdirs)}] Processing: {dataset_dir.name}")
@@ -530,12 +567,14 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
             if xml_path:
                 xml_metadata = parse_xml_metadata(xml_path, verbose=verbose)
                 
-                # Determine which UUID and title to use
-                dataset_uuid = xml_metadata.get('uuid') or generate_uuid_from_path(dataset_dir)
-                title = xml_metadata.get('title') or dataset_dir.name
+                # Check if we got an AODN UUID
+                if not xml_metadata.get('uuid'):
+                    logger.error(f"  ✗ Skipping dataset - no AODN UUID found in directory structure")
+                    skipped_no_uuid += 1
+                    continue
                 
-                # Update xml_metadata with the final UUID and title we're using
-                xml_metadata['uuid'] = dataset_uuid
+                # Use title from XML or fallback to directory name
+                title = xml_metadata.get('title') or dataset_dir.name
                 xml_metadata['title'] = title
                 
                 # Use bounding box from XML if complete, otherwise estimate
@@ -552,39 +591,33 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
                     'dataset_path': str(dataset_dir),
                 }
                 
-                # Merge all metadata fields (includes uuid, title, bbox, and all extracted fields)
+                # Merge all metadata fields
                 dataset_info.update(xml_metadata)
             else:
-                logger.warning(f"  No metadata.xml found, using directory-based metadata")
-                dataset_uuid = generate_uuid_from_path(dataset_dir)
-                title = dataset_dir.name
-                bbox = extract_bounding_box_from_name(dataset_dir.name)
-                
-                dataset_info = {
-                    'uuid': dataset_uuid,
-                    'title': title,
-                    'dataset_name': clean_dataset_name(dataset_dir.name),
-                    'dataset_path': str(dataset_dir),
-                }
-                dataset_info.update(bbox)
+                logger.error(f"  ✗ Skipping dataset - no metadata.xml found")
+                skipped_no_uuid += 1
+                continue
             
             file_count = sum(1 for _ in dataset_dir.rglob('*') if _.is_file())
             logger.info(f"  File count: {file_count}")
             dataset_info['file_count'] = file_count
             
-            # Only add datasets with at least a UUID and title
+            # Only add datasets with UUID and title (UUID is now mandatory)
             if dataset_info.get('uuid') and dataset_info.get('title'):
                 datasets.append(dataset_info)
                 logger.info(f"  ✓ Dataset processed successfully")
             else:
-                logger.warning(f"  ⚠ Skipping dataset with incomplete data (UUID: {dataset_info.get('uuid')}, Title: {dataset_info.get('title')})")
-            
+                logger.error(f"  ✗ Skipping dataset - missing required fields (UUID: {dataset_info.get('uuid')}, Title: {dataset_info.get('title')})")
+                skipped_no_uuid += 1
+        
         except Exception as e:
             logger.error(f"  ✗ Error processing dataset: {e}")
             logger.debug(traceback.format_exc())
+            skipped_no_uuid += 1
     
     logger.info(f"\n{'='*60}")
     logger.info(f"Scan complete: {len(datasets)} datasets identified")
+    logger.info(f"Skipped (no AODN UUID): {skipped_no_uuid}")
     logger.info(f"{'='*60}")
     
     return datasets
@@ -628,7 +661,14 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     
     for idx, dataset in enumerate(datasets, 1):
         try:
+            # Skip if no UUID (should have been filtered earlier, but double-check)
+            if not dataset.get('uuid'):
+                logger.error(f"\n[{idx}/{len(datasets)}] ✗ Skipping - no UUID")
+                failed += 1
+                continue
+                
             logger.info(f"\n[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
+            logger.info(f"  UUID: {dataset.get('uuid')}")
             
             # Prepare values tuple in correct order
             values = tuple([dataset.get(field, None) for field in fields[:-1]] + [datetime.now()])
@@ -646,6 +686,9 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                 skipped += 1
                 logger.info(f"  ○ Skipped (already exists)")
                 
+        except psycopg2.IntegrityError as e:
+            failed += 1
+            logger.error(f"  ✗ Integrity error (likely NULL uuid): {e}")
         except psycopg2.Error as e:
             failed += 1
             logger.error(f"  ✗ Database error: {e}")
@@ -719,7 +762,7 @@ def main():
     logger = setup_logging(debug=args.debug)
     
     logger.info("="*60)
-    logger.info("METADATA POPULATION SCRIPT (Fixed Date Normalization)")
+    logger.info("METADATA POPULATION SCRIPT (AODN UUID Extraction)")
     logger.info("="*60)
     
     try:
