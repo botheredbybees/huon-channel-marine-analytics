@@ -142,7 +142,7 @@ def find_element_by_tag_suffix(root, tag_suffix: str):
 
 
 def get_element_text(element) -> Optional[str]:
-    """Extract text from element, checking both direct text and gco:CharacterString child."""
+    """Extract text from element, checking both direct text and gco:CharacterString/gco:Decimal children."""
     if element is None:
         return None
     
@@ -150,9 +150,9 @@ def get_element_text(element) -> Optional[str]:
     if element.text and element.text.strip():
         return element.text.strip()
     
-    # Try gco:CharacterString child
+    # Try gco:CharacterString or gco:Decimal children
     for child in element:
-        if child.tag.endswith('}CharacterString'):
+        if child.tag.endswith('}CharacterString') or child.tag.endswith('}Decimal'):
             if child.text and child.text.strip():
                 return child.text.strip()
     
@@ -390,17 +390,23 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     try:
                         if tag.endswith('}westBoundLongitude') or tag == 'westBoundLongitude':
                             metadata['west'] = float(value_text)
+                            logger.debug(f"    westBoundLongitude: {value_text}")
                         elif tag.endswith('}eastBoundLongitude') or tag == 'eastBoundLongitude':
                             metadata['east'] = float(value_text)
+                            logger.debug(f"    eastBoundLongitude: {value_text}")
                         elif tag.endswith('}southBoundLatitude') or tag == 'southBoundLatitude':
                             metadata['south'] = float(value_text)
+                            logger.debug(f"    southBoundLatitude: {value_text}")
                         elif tag.endswith('}northBoundLatitude') or tag == 'northBoundLatitude':
                             metadata['north'] = float(value_text)
+                            logger.debug(f"    northBoundLatitude: {value_text}")
                     except ValueError as e:
-                        logger.error(f"    Error converting coordinate: {e}")
+                        logger.error(f"    Error converting coordinate {tag}: {e}")
             
             if all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):
                 logger.info(f"  ✓ Bounding box: [{metadata['west']:.2f}, {metadata['east']:.2f}, {metadata['south']:.2f}, {metadata['north']:.2f}]")
+            else:
+                logger.warning(f"  ⚠ Incomplete bounding box: W={metadata.get('west')}, E={metadata.get('east')}, S={metadata.get('south')}, N={metadata.get('north')}")
         
         # === TEMPORAL EXTENT ===
         
@@ -685,7 +691,7 @@ def main():
     logger = setup_logging(debug=args.debug)
     
     logger.info("="*60)
-    logger.info("METADATA POPULATION SCRIPT (Fixed XML Parsing)")
+    logger.info("METADATA POPULATION SCRIPT (Fixed Bounding Box Extraction)")
     logger.info("="*60)
     
     try:
