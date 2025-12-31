@@ -2,8 +2,8 @@
 -- Huon Channel Marine Analytics - Database Initialization Script (PostGIS-Free)
 -- =============================================================================
 -- Purpose: Creates PostgreSQL database schema for AODN marine data
--- Version: 3.1 (Pure PostgreSQL - no PostGIS dependency, with AODN UUID tracking)
--- Last Updated: December 30, 2025
+-- Version: 3.2 (Pure PostgreSQL - no PostGIS, removed uuid field)
+-- Last Updated: January 1, 2026
 --
 -- IMPORTANT NOTES:
 -- 1. Removed ALL PostGIS dependencies (GEOMETRY, ST_* functions, BOX2D, GIST on geometry)
@@ -11,7 +11,8 @@
 -- 3. Compatible with timescale/timescaledb:latest-pg18 (Community license)
 -- 4. All spatial queries work with DECIMAL bbox columns
 -- 5. TimescaleDB hypertable enabled for measurements table
--- 6. Added aodn_uuid field to track AODN source identifiers (non-AODN datasets supported)
+-- 6. Removed confusing 'uuid' field - now using aodn_uuid for AODN catalog IDs
+-- 7. dataset_path is now the primary stable identifier for upserts
 -- =============================================================================
 
 -- Enable extensions (NO PostGIS)
@@ -149,12 +150,12 @@ CREATE INDEX IF NOT EXISTS idx_locations_lat_lon_partial
 
 -- =============================================================================
 -- METADATA TABLES (normalized structure for 38+ IMOS datasets)
+-- CHANGED: Removed uuid field, made dataset_path UNIQUE NOT NULL
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS metadata (
   id SERIAL PRIMARY KEY,
-  uuid TEXT UNIQUE NOT NULL,
-  aodn_uuid TEXT UNIQUE,
+  aodn_uuid TEXT UNIQUE,  -- AODN catalog UUID from directory structure (nullable for non-AODN datasets)
   parent_uuid TEXT,
   title TEXT NOT NULL,
   abstract TEXT,
@@ -184,36 +185,33 @@ CREATE TABLE IF NOT EXISTS metadata (
   distribution_portal_url TEXT,
   distribution_publication_url TEXT,
   dataset_name TEXT,
-  dataset_path TEXT,
+  dataset_path TEXT UNIQUE NOT NULL,  -- Primary stable identifier for upserts
   extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   date_created DATE
 );
 
 -- Metadata indexes (pure PostgreSQL)
-CREATE INDEX IF NOT EXISTS idx_metadata_uuid ON metadata(uuid);
 CREATE INDEX IF NOT EXISTS idx_metadata_aodn_uuid ON metadata(aodn_uuid)
   WHERE aodn_uuid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_metadata_bbox ON metadata(west, east, south, north);
 CREATE INDEX IF NOT EXISTS idx_metadata_time ON metadata(time_start, time_end);
 CREATE INDEX IF NOT EXISTS idx_metadata_dataset_name ON metadata(dataset_name);
-CREATE INDEX IF NOT EXISTS idx_metadata_dataset_path ON metadata(dataset_path)
-  WHERE dataset_path IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_metadata_dataset_path ON metadata(dataset_path);
 
 CREATE TABLE IF NOT EXISTS public.spatial_ref_system (
   id SERIAL PRIMARY KEY,
-  uuid text NOT NULL REFERENCES metadata(uuid) ON DELETE CASCADE,
+  metadata_id INTEGER NOT NULL REFERENCES metadata(id) ON DELETE CASCADE,
   srid integer NOT NULL,
   auth_name text DEFAULT 'EPSG'::text,
   crs_name text,
   is_primary boolean DEFAULT true,
   created_at timestamp without time zone DEFAULT now(),
-  UNIQUE (uuid, srid)
+  UNIQUE (metadata_id, srid)
 );
 
 CREATE TABLE IF NOT EXISTS parameters (
   id SERIAL PRIMARY KEY,
   metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
-  uuid TEXT NOT NULL REFERENCES metadata(uuid) ON DELETE CASCADE,
   parameter_code TEXT NOT NULL,
   parameter_label TEXT,
   standard_name TEXT,
@@ -229,7 +227,7 @@ CREATE TABLE IF NOT EXISTS parameters (
   created_at TIMESTAMP DEFAULT NOW(),
   imos_parameter_uri TEXT REFERENCES imos_vocab_parameters(uri),
   imos_unit_uri TEXT REFERENCES imos_vocab_units(uri),
-  UNIQUE(uuid, parameter_code)
+  UNIQUE(metadata_id, parameter_code)
 );
 
 CREATE INDEX IF NOT EXISTS idx_parameters_metadata_id ON parameters(metadata_id);
@@ -240,7 +238,6 @@ CREATE INDEX IF NOT EXISTS idx_parameters_imos_uri ON parameters(imos_parameter_
 CREATE TABLE IF NOT EXISTS keywords (
   id SERIAL PRIMARY KEY,
   metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
-  uuid TEXT REFERENCES metadata(uuid) ON DELETE CASCADE,
   keyword TEXT NOT NULL,
   keyword_type TEXT,
   thesaurus_name TEXT,
@@ -259,7 +256,7 @@ CREATE INDEX IF NOT EXISTS idx_keywords_thesaurus ON keywords(thesaurus_uri);
 CREATE TABLE IF NOT EXISTS measurements (
   time TIMESTAMPTZ NOT NULL,
   data_id BIGSERIAL,
-  uuid TEXT REFERENCES metadata(uuid) ON DELETE CASCADE,
+  metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
   parameter_code TEXT NOT NULL,
   namespace TEXT NOT NULL DEFAULT 'custom',
   value DOUBLE PRECISION NOT NULL,
@@ -268,7 +265,6 @@ CREATE TABLE IF NOT EXISTS measurements (
   uncertainty DOUBLE PRECISION,
   depth_m NUMERIC,
   location_id BIGINT REFERENCES locations(id),
-  metadata_id INTEGER REFERENCES metadata(id),
   quality_flag SMALLINT DEFAULT 1
 );
 
@@ -306,7 +302,6 @@ CREATE INDEX IF NOT EXISTS idx_measurements_location_time ON measurements (locat
   WHERE location_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_measurements_namespace ON measurements (namespace);
 CREATE INDEX IF NOT EXISTS idx_measurements_metadata_id ON measurements (metadata_id);
-CREATE INDEX IF NOT EXISTS idx_measurements_uuid ON measurements (uuid);
 CREATE INDEX IF NOT EXISTS idx_measurements_time_brin ON measurements USING BRIN (time);
 CREATE INDEX IF NOT EXISTS idx_measurements_param_gin ON measurements USING GIN (to_tsvector('english', parameter_code));
 CREATE INDEX IF NOT EXISTS idx_measurements_good_data ON measurements (time DESC, parameter_code)
@@ -451,7 +446,6 @@ GROUP BY parameter_code;
 CREATE TABLE IF NOT EXISTS spatial_features (
   id SERIAL PRIMARY KEY,
   metadata_id INTEGER REFERENCES metadata(id),
-  uuid TEXT,
   latitude DOUBLE PRECISION,
   longitude DOUBLE PRECISION,
   properties JSONB
@@ -516,14 +510,15 @@ GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO marine_user;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO marine_user;
 
 -- =============================================================================
--- DATABASE STATISTICS (Post-Cleanup, December 30, 2025)
+-- DATABASE STATISTICS (Post-Cleanup, January 1, 2026)
 -- =============================================================================
--- Schema Version: 3.1 (Pure PostgreSQL, no PostGIS, with AODN UUID tracking)
+-- Schema Version: 3.2 (Pure PostgreSQL, no PostGIS, removed uuid field)
 -- Total measurements capacity: 12M+ (quality-controlled)
 -- Unique parameters: 125+
--- Datasets: 25+
+-- Datasets: 38+
 -- Compatible with: timescale/timescaledb:latest-pg18 (Community license)
--- NEW: aodn_uuid field for tracking AODN source identifiers (supports future non-AODN datasets)
+-- CHANGED: Removed uuid field, aodn_uuid is now sole AODN identifier
+-- dataset_path is primary stable identifier for upserts
 -- =============================================================================
 
 VACUUM ANALYZE;
