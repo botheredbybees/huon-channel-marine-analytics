@@ -506,25 +506,29 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
             if xml_path:
                 xml_metadata = parse_xml_metadata(xml_path, verbose=verbose)
                 
+                # Determine which UUID and title to use
                 dataset_uuid = xml_metadata.get('uuid') or generate_uuid_from_path(dataset_dir)
                 title = xml_metadata.get('title') or dataset_dir.name
                 
+                # Update xml_metadata with the final UUID and title we're using
+                xml_metadata['uuid'] = dataset_uuid
+                xml_metadata['title'] = title
+                
                 # Use bounding box from XML if complete, otherwise estimate
                 if all(xml_metadata.get(c) for c in ['west', 'east', 'south', 'north']):
-                    bbox = {k: xml_metadata.get(k, None) for k in ['west', 'east', 'south', 'north']}
                     logger.info(f"  Using bounding box from XML")
                 else:
                     bbox = extract_bounding_box_from_name(dataset_dir.name)
                     logger.info(f"  Using estimated bounding box")
                     xml_metadata.update(bbox)
                 
-                # Merge all metadata fields
+                # Create dataset info with base fields
                 dataset_info = {
-                    'uuid': dataset_uuid,
-                    'title': title,
                     'dataset_name': clean_dataset_name(dataset_dir.name),
                     'dataset_path': str(dataset_dir),
                 }
+                
+                # Merge all metadata fields (includes uuid, title, bbox, and all extracted fields)
                 dataset_info.update(xml_metadata)
             else:
                 logger.warning(f"  No metadata.xml found, using directory-based metadata")
@@ -549,7 +553,7 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
                 datasets.append(dataset_info)
                 logger.info(f"  ✓ Dataset processed successfully")
             else:
-                logger.warning(f"  ⚠ Skipping dataset with incomplete data")
+                logger.warning(f"  ⚠ Skipping dataset with incomplete data (UUID: {dataset_info.get('uuid')}, Title: {dataset_info.get('title')})")
             
         except Exception as e:
             logger.error(f"  ✗ Error processing dataset: {e}")
@@ -691,7 +695,7 @@ def main():
     logger = setup_logging(debug=args.debug)
     
     logger.info("="*60)
-    logger.info("METADATA POPULATION SCRIPT (Fixed Bounding Box Extraction)")
+    logger.info("METADATA POPULATION SCRIPT (Fixed Dataset Merging)")
     logger.info("="*60)
     
     try:
