@@ -603,7 +603,7 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
             
             # Prepare values tuple in correct order, using .get() with None default
             values = tuple(
-                dataset.get(field) for field in fields[:-1]  # All fields except 'extracted_at'
+                dataset.get(field, None) for field in fields[:-1]  # All fields except 'extracted_at'
             ) + (datetime.now(),)  # Add extracted_at timestamp
             
             cursor.execute(insert_sql, values)
