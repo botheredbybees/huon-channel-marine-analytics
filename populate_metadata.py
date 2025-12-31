@@ -20,6 +20,7 @@ Enhanced with:
 - File-based debug logging to logs/ directory
 - Detailed progress tracking with console and file output separation
 - Better error handling and reporting
+- Normalized date handling for year-only temporal extents
 
 Usage:
     python populate_metadata.py
@@ -100,6 +101,36 @@ def setup_logging(debug: bool = False) -> logging.Logger:
 
 # Will be initialized in main()
 logger = None
+
+
+def normalize_date(date_str: Optional[str]) -> Optional[str]:
+    """
+    Normalize date string to PostgreSQL DATE format (YYYY-MM-DD).
+    
+    Handles:
+    - Year only: '1984' -> '1984-01-01'
+    - Already formatted: '2020-05-15' -> '2020-05-15'
+    - With time component: '2020-05-15T12:30:00' -> '2020-05-15'
+    
+    Args:
+        date_str: Input date string or None
+    
+    Returns:
+        Normalized date string or None
+    """
+    if not date_str or date_str == 'NA':
+        return None
+    
+    # Remove time component if present
+    if 'T' in date_str:
+        date_str = date_str.split('T')[0]
+    
+    # If it's just a year (4 digits), pad with -01-01
+    if re.match(r'^\d{4}$', date_str):
+        return f"{date_str}-01-01"
+    
+    # Return as-is if already in YYYY-MM-DD format
+    return date_str
 
 
 def connect_to_database():
@@ -354,25 +385,21 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         ]:
             date_text = extract_field_by_path(root, pattern)
             if date_text:
-                if 'T' in date_text:
-                    date_text = date_text.split('T')[0]
-                metadata['metadata_creation_date'] = date_text
+                metadata['metadata_creation_date'] = normalize_date(date_text)
                 if verbose:
-                    logger.debug(f"    Creation date: {date_text}")
+                    logger.debug(f"    Creation date: {metadata['metadata_creation_date']}")
                 break
         
         # Citation date
         for pattern in [
             ['identificationInfo', 'MD_DataIdentification', 'citation', 'CI_Citation', 'date', 'CI_Date', 'date'],
             ['identificationInfo', 'citation', 'date']
-        ]:
+        ]:  
             date_text = extract_field_by_path(root, pattern)
             if date_text:
-                if 'T' in date_text:
-                    date_text = date_text.split('T')[0]
-                metadata['citation_date'] = date_text
+                metadata['citation_date'] = normalize_date(date_text)
                 if verbose:
-                    logger.debug(f"    Citation date: {date_text}")
+                    logger.debug(f"    Citation date: {metadata['citation_date']}")
                 break
         
         # === BOUNDING BOX ===
@@ -403,7 +430,7 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     except ValueError as e:
                         logger.error(f"    Error converting coordinate {tag}: {e}")
             
-            if all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):
+            if all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):  
                 logger.info(f"  ✓ Bounding box: [{metadata['west']:.2f}, {metadata['east']:.2f}, {metadata['south']:.2f}, {metadata['north']:.2f}]")
             else:
                 logger.warning(f"  ⚠ Incomplete bounding box: W={metadata.get('west')}, E={metadata.get('east')}, S={metadata.get('south')}, N={metadata.get('north')}")
@@ -421,13 +448,10 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     for child in elem:
                         text = get_element_text(child)
                         if text:
-                            if 'T' in text:
-                                text = text.split('T')[0]
-                            
                             if child.tag.endswith('}beginPosition') or child.tag == 'beginPosition':
-                                metadata['time_start'] = text
+                                metadata['time_start'] = normalize_date(text)
                             elif child.tag.endswith('}endPosition') or child.tag == 'endPosition':
-                                metadata['time_end'] = text
+                                metadata['time_end'] = normalize_date(text)
                     break
         
         if metadata.get('time_start') or metadata.get('time_end'):
@@ -695,7 +719,7 @@ def main():
     logger = setup_logging(debug=args.debug)
     
     logger.info("="*60)
-    logger.info("METADATA POPULATION SCRIPT (Fixed Dataset Merging)")
+    logger.info("METADATA POPULATION SCRIPT (Fixed Date Normalization)")
     logger.info("="*60)
     
     try:
