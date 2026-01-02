@@ -577,7 +577,7 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
         logger.error(f"✗ Directory not found: {base_path}")
         return []
     
-    subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]]
+    subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
     logger.info(f"Found {len(subdirs)} potential datasets")
     
     datasets = []
