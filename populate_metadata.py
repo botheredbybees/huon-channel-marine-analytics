@@ -6,10 +6,11 @@ This script:
 1. Scans AODN_data/ directory for datasets
 2. Extracts comprehensive metadata from ISO 19115 XML files
 3. Populates the metadata table with UUID, title, paths, bbox, and enriched fields
-4. Extracts AODN UUID from directory structure (no fallback generation)
+4. Extracts AODN UUID from XML metadata (ISO 19115-3) with directory fallback
 
 Enhanced with:
-- AODN UUID extraction from directory structure: [dataset_name]/[aodn_uuid]/metadata/metadata.xml
+- AODN UUID extraction from XML metadataIdentifier (ISO 19115-3)
+- Fallback to fileIdentifier (ISO 19115-1) and directory structure
 - Namespace-agnostic XML parsing for ISO 19115-1 and ISO 19115-3
 - Extraction of 20+ metadata fields:
   * Descriptive: abstract, credit, supplemental_info, lineage
@@ -166,43 +167,6 @@ def find_metadata_xml(dataset_dir: Path) -> Optional[Path]:
     return None
 
 
-def extract_aodn_uuid_from_path(xml_path: Path) -> Optional[str]:
-    """
-    Extract AODN UUID from directory structure.
-    
-    Expected structure: [dataset_name]/[aodn_uuid]/metadata/metadata.xml
-    The AODN UUID is the parent directory of the metadata folder.
-    
-    Args:
-        xml_path: Path to metadata.xml file
-        
-    Returns:
-        AODN UUID string or None if not found
-    """
-    try:
-        # metadata.xml -> metadata/ -> [UUID]/ -> [Dataset Name]/
-        # So we need to go up 2 levels to get the UUID directory
-        uuid_dir = xml_path.parent.parent
-        potential_uuid = uuid_dir.name
-        
-        # Validate that it looks like a UUID (8-4-4-4-12 format)
-        uuid_pattern = re.compile(
-            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-            re.IGNORECASE
-        )
-        
-        if uuid_pattern.match(potential_uuid):
-            logger.debug(f"  ✓ Extracted AODN UUID from path: {potential_uuid}")
-            return potential_uuid
-        else:
-            logger.debug(f"  ✗ Directory name doesn't match UUID pattern: {potential_uuid}")
-            return None
-            
-    except Exception as e:
-        logger.debug(f"  ✗ Error extracting UUID from path: {e}")
-        return None
-
-
 def find_element_by_tag_suffix(root, tag_suffix: str):
     """Find first element whose tag ends with the given suffix (namespace-agnostic)."""
     for elem in root.iter():
@@ -227,6 +191,69 @@ def get_element_text(element) -> Optional[str]:
                 return child.text.strip()
     
     return None
+
+
+def extract_uuid_from_xml(xml_path: Path) -> Optional[str]:
+    """
+    Extract UUID from ISO 19115-3 or ISO 19115-1 metadata XML file.
+    
+    Looks for UUID in multiple locations (in priority order):
+    1. mdb:metadataIdentifier/mcc:MD_Identifier/mcc:code (ISO 19115-3)
+    2. gmd:fileIdentifier (ISO 19115-1)
+    3. Directory structure fallback
+    
+    Args:
+        xml_path: Path to metadata.xml file
+        
+    Returns:
+        UUID string or None if not found
+    """
+    uuid_pattern = re.compile(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+        re.IGNORECASE
+    )
+    
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        
+        # Method 1: ISO 19115-3 (mdb:metadataIdentifier)
+        for elem in root.iter():
+            if elem.tag.endswith('}metadataIdentifier'):
+                # Look for code element
+                for child in elem.iter():
+                    if child.tag.endswith('}code'):
+                        uuid_text = get_element_text(child)
+                        if uuid_text and uuid_pattern.match(uuid_text):
+                            logger.debug(f"  ✓ Extracted UUID from metadataIdentifier: {uuid_text}")
+                            return uuid_text
+        
+        # Method 2: ISO 19115-1 (gmd:fileIdentifier)
+        file_id_elem = find_element_by_tag_suffix(root, 'fileIdentifier')
+        if file_id_elem is not None:
+            uuid_text = get_element_text(file_id_elem)
+            if uuid_text and uuid_pattern.match(uuid_text):
+                logger.debug(f"  ✓ Extracted UUID from fileIdentifier: {uuid_text}")
+                return uuid_text
+        
+        # Method 3: Directory structure fallback
+        logger.debug(f"  ⚠ No UUID found in XML, trying directory structure...")
+        uuid_dir = xml_path.parent.parent
+        potential_uuid = uuid_dir.name
+        
+        if uuid_pattern.match(potential_uuid):
+            logger.debug(f"  ✓ Extracted UUID from directory path: {potential_uuid}")
+            return potential_uuid
+        
+        logger.warning(f"  ✗ No UUID found in XML or directory structure")
+        return None
+            
+    except ET.ParseError as e:
+        logger.error(f"  ✗ XML parsing error during UUID extraction: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"  ✗ Error extracting UUID: {e}")
+        return None
 
 
 def extract_field_by_path(root, path_components: List[str]) -> Optional[str]:
@@ -278,15 +305,14 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         
         # === CORE IDENTIFIERS ===
         
-        # Extract AODN UUID from directory structure (ONLY source for uuid field)
-        aodn_uuid = extract_aodn_uuid_from_path(xml_path)
+        # Extract UUID from XML metadata (primary) or directory structure (fallback)
+        aodn_uuid = extract_uuid_from_xml(xml_path)
         if aodn_uuid:
             metadata['uuid'] = aodn_uuid
-            logger.info(f"  ✓ UUID (AODN from path): {metadata['uuid']}")
+            logger.info(f"  ✓ UUID: {metadata['uuid']}")
         else:
-            # No fallback - leave as None
             metadata['uuid'] = None
-            logger.warning("  ⚠ No AODN UUID found in directory structure - uuid will be NULL")
+            logger.warning("  ⚠ No UUID found - uuid will be NULL")
         
         # Title - navigate through identificationInfo -> citation -> title
         for base_patterns in [
@@ -551,7 +577,7 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
         logger.error(f"✗ Directory not found: {base_path}")
         return []
     
-    subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]]
     logger.info(f"Found {len(subdirs)} potential datasets")
     
     datasets = []
@@ -567,9 +593,9 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
             if xml_path:
                 xml_metadata = parse_xml_metadata(xml_path, verbose=verbose)
                 
-                # Check if we got an AODN UUID
+                # Check if we got a UUID
                 if not xml_metadata.get('uuid'):
-                    logger.error(f"  ✗ Skipping dataset - no AODN UUID found in directory structure")
+                    logger.error(f"  ✗ Skipping dataset - no UUID found in XML or directory structure")
                     skipped_no_uuid += 1
                     continue
                 
@@ -602,7 +628,7 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
             logger.info(f"  File count: {file_count}")
             dataset_info['file_count'] = file_count
             
-            # Only add datasets with UUID and title (UUID is now mandatory)
+            # Only add datasets with UUID and title
             if dataset_info.get('uuid') and dataset_info.get('title'):
                 datasets.append(dataset_info)
                 logger.info(f"  ✓ Dataset processed successfully")
@@ -617,7 +643,7 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
     
     logger.info(f"\n{'='*60}")
     logger.info(f"Scan complete: {len(datasets)} datasets identified")
-    logger.info(f"Skipped (no AODN UUID): {skipped_no_uuid}")
+    logger.info(f"Skipped (no UUID): {skipped_no_uuid}")
     logger.info(f"{'='*60}")
     
     return datasets
@@ -688,7 +714,7 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                 
         except psycopg2.IntegrityError as e:
             failed += 1
-            logger.error(f"  ✗ Integrity error (likely NULL uuid): {e}")
+            logger.error(f"  ✗ Integrity error: {e}")
         except psycopg2.Error as e:
             failed += 1
             logger.error(f"  ✗ Database error: {e}")
@@ -762,7 +788,7 @@ def main():
     logger = setup_logging(debug=args.debug)
     
     logger.info("="*60)
-    logger.info("METADATA POPULATION SCRIPT (AODN UUID Extraction)")
+    logger.info("METADATA POPULATION SCRIPT (XML UUID Extraction)")
     logger.info("="*60)
     
     try:
