@@ -652,12 +652,11 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
 def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     """Populate metadata table with all extracted fields."""
     logger.info(f"\nPopulating metadata (mode: {'UPDATE' if force else 'INSERT ONLY'})")
-    
     cursor = conn.cursor()
     
     # Build SQL with all possible fields
     fields = [
-        'uuid', 'title', 'dataset_name', 'dataset_path',
+        'aodn_uuid', 'title', 'dataset_name', 'dataset_path',  # CHANGED: uuid -> aodn_uuid
         'abstract', 'credit', 'supplemental_info', 'lineage',
         'use_limitation', 'license_url', 'topic_category', 'language',
         'character_set', 'status', 'metadata_creation_date',
@@ -670,36 +669,45 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     field_names = ', '.join(fields)
     
     if force:
-        update_set = ', '.join([f"{field} = EXCLUDED.{field}" for field in fields if field != 'uuid'])
+        # CHANGED: Conflict on dataset_path, not uuid
+        update_set = ', '.join([f"{field} = EXCLUDED.{field}" for field in fields if field != 'dataset_path'])
         insert_sql = f"""
-            INSERT INTO metadata ({field_names})
-            VALUES ({placeholders})
-            ON CONFLICT (uuid) DO UPDATE SET {update_set};
+        INSERT INTO metadata ({field_names})
+        VALUES ({placeholders})
+        ON CONFLICT (dataset_path) DO UPDATE SET {update_set};
         """
     else:
+        # CHANGED: Conflict on dataset_path, not uuid
         insert_sql = f"""
-            INSERT INTO metadata ({field_names})
-            VALUES ({placeholders})
-            ON CONFLICT (uuid) DO NOTHING;
+        INSERT INTO metadata ({field_names})
+        VALUES ({placeholders})
+        ON CONFLICT (dataset_path) DO NOTHING;
         """
     
     inserted, updated, skipped, failed = 0, 0, 0, 0
     
     for idx, dataset in enumerate(datasets, 1):
         try:
-            # Skip if no UUID (should have been filtered earlier, but double-check)
-            if not dataset.get('uuid'):
-                logger.error(f"\n[{idx}/{len(datasets)}] ✗ Skipping - no UUID")
+            # CHANGED: Don't require UUID (it can be NULL), but require dataset_path
+            if not dataset.get('dataset_path'):
+                logger.error(f"\n[{idx}/{len(datasets)}] ✗ Skipping - no dataset_path")
                 failed += 1
                 continue
-                
+            
             logger.info(f"\n[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
-            logger.info(f"  UUID: {dataset.get('uuid')}")
+            if dataset.get('uuid'):  # CHANGED: Log UUID if present
+                logger.info(f"  UUID: {dataset.get('uuid')}")
             
-            # Prepare values tuple in correct order
-            values = tuple([dataset.get(field, None) for field in fields[:-1]] + [datetime.now()])
+            # Prepare values tuple - map 'uuid' key from parse to 'aodn_uuid' field
+            values = []
+            for field in fields[:-1]:
+                if field == 'aodn_uuid':
+                    values.append(dataset.get('uuid', None))  # Map uuid -> aodn_uuid
+                else:
+                    values.append(dataset.get(field, None))
+            values.append(datetime.now())  # extracted_at
             
-            cursor.execute(insert_sql, values)
+            cursor.execute(insert_sql, tuple(values))
             
             if cursor.rowcount > 0:
                 if force:
@@ -713,11 +721,16 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                 logger.info(f"  ○ Skipped (already exists)")
                 
         except psycopg2.IntegrityError as e:
+            conn.rollback()  # CRITICAL: Rollback failed transaction to continue
             failed += 1
             logger.error(f"  ✗ Integrity error: {e}")
+            logger.error(f"  DETAIL: {e.pgerror}")
+            
         except psycopg2.Error as e:
+            conn.rollback()  # CRITICAL: Rollback failed transaction to continue
             failed += 1
             logger.error(f"  ✗ Database error: {e}")
+            
         except Exception as e:
             failed += 1
             logger.error(f"  ✗ Unexpected error: {e}")
@@ -725,12 +738,12 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     
     conn.commit()
     logger.info(f"\n✓ Transaction committed")
-    
     logger.info(f"\n{'='*60}")
     logger.info(f"SUMMARY: {'Updated' if force else 'Inserted'}: {updated if force else inserted}, Skipped: {skipped}, Failed: {failed}")
     logger.info(f"{'='*60}")
     
     cursor.close()
+
 
 
 def verify_population(conn):
