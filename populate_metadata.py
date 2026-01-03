@@ -26,6 +26,7 @@ Enhanced with:
 - UUID validation with regex pattern matching
 - Attribute extraction for code list values (@codeListValue)
 - Enhanced debugging for problematic fields
+- Fixed foreign key constraint violations with column-specific UPDATE
 
 Usage:
     python populate_metadata.py
@@ -667,7 +668,7 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
         logger.error(f"✗ Directory not found: {base_path}")
         return []
     
-    subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]:
     logger.info(f"Found {len(subdirs)} potential datasets")
     
     datasets = []
@@ -740,12 +741,12 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
 
 
 def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
-    """Populate metadata table with all extracted fields."""
+    """Populate metadata table with column-specific updates to avoid FK violations."""
     logger.info(f"\nPopulating metadata (mode: {'UPDATE' if force else 'INSERT ONLY'})")
     cursor = conn.cursor()
     
-    # Build SQL with all possible fields
-    fields = [
+    # Fields for INSERT
+    insert_fields = [
         'uuid', 'title', 'dataset_name', 'dataset_path',
         'abstract', 'credit', 'supplemental_info', 'lineage',
         'use_limitation', 'license_url', 'topic_category', 'language',
@@ -755,22 +756,46 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
         'time_start', 'time_end', 'extracted_at'
     ]
     
-    placeholders = ', '.join(['%s'] * len(fields))
-    field_names = ', '.join(fields)
+    placeholders = ', '.join(['%s'] * len(insert_fields))
+    field_names = ', '.join(insert_fields)
     
-    if force:
-        update_set = ', '.join([f"{field} = EXCLUDED.{field}" for field in fields if field != 'dataset_path'])
-        insert_sql = f"""
-        INSERT INTO metadata ({field_names})
-        VALUES ({placeholders})
-        ON CONFLICT (dataset_path) DO UPDATE SET {update_set};
-        """
-    else:
-        insert_sql = f"""
-        INSERT INTO metadata ({field_names})
-        VALUES ({placeholders})
-        ON CONFLICT (dataset_path) DO NOTHING;
-        """
+    # INSERT statement for new records
+    insert_sql = f"""
+    INSERT INTO metadata ({field_names})
+    VALUES ({placeholders})
+    ON CONFLICT (dataset_path) DO NOTHING;
+    """
+    
+    # UPDATE statement for existing records - updates specific columns only
+    update_sql = """
+    UPDATE metadata SET
+        title = %s,
+        dataset_name = %s,
+        abstract = %s,
+        credit = %s,
+        supplemental_info = %s,
+        lineage = %s,
+        use_limitation = %s,
+        license_url = %s,
+        topic_category = %s,
+        language = %s,
+        character_set = %s,
+        status = %s,
+        metadata_creation_date = %s,
+        metadata_revision_date = %s,
+        citation_date = %s,
+        west = %s,
+        east = %s,
+        south = %s,
+        north = %s,
+        time_start = %s,
+        time_end = %s,
+        extracted_at = %s
+    WHERE dataset_path = %s;
+    """
+    
+    # Check if record exists
+    check_sql = "SELECT uuid FROM metadata WHERE dataset_path = %s;"
     
     inserted, updated, skipped, failed = 0, 0, 0, 0
     
@@ -788,32 +813,71 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                 failed += 1
                 continue
             
-            logger.info(f"[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
+            logger.info(f"[{idx}/{len(datasets)}] Processing: {dataset.get('title', 'Unknown')[:60]}...")
             
-            # Log the values being inserted for problematic fields
+            # Log the values being inserted/updated for problematic fields
             logger.debug(f"  [DB INSERT] language: {dataset.get('language')}")
             logger.debug(f"  [DB INSERT] character_set: {dataset.get('character_set')}")
             logger.debug(f"  [DB INSERT] status: {dataset.get('status')}")
             logger.debug(f"  [DB INSERT] lineage: {dataset.get('lineage')[:50] + '...' if dataset.get('lineage') else None}")
             
-            # Prepare values tuple
-            values = []
-            for field in fields[:-1]:
-                values.append(dataset.get(field, None))
-            values.append(datetime.now())  # extracted_at
-            
-            cursor.execute(insert_sql, tuple(values))
-            
-            if cursor.rowcount > 0:
-                if force:
+            if force:
+                # Check if record exists
+                cursor.execute(check_sql, (dataset.get('dataset_path'),))
+                exists = cursor.fetchone() is not None
+                
+                if exists:
+                    # Update existing record with specific columns
+                    update_values = [
+                        dataset.get('title'),
+                        dataset.get('dataset_name'),
+                        dataset.get('abstract'),
+                        dataset.get('credit'),
+                        dataset.get('supplemental_info'),
+                        dataset.get('lineage'),
+                        dataset.get('use_limitation'),
+                        dataset.get('license_url'),
+                        dataset.get('topic_category'),
+                        dataset.get('language'),
+                        dataset.get('character_set'),
+                        dataset.get('status'),
+                        dataset.get('metadata_creation_date'),
+                        dataset.get('metadata_revision_date'),
+                        dataset.get('citation_date'),
+                        dataset.get('west'),
+                        dataset.get('east'),
+                        dataset.get('south'),
+                        dataset.get('north'),
+                        dataset.get('time_start'),
+                        dataset.get('time_end'),
+                        datetime.now(),
+                        dataset.get('dataset_path')  # WHERE clause
+                    ]
+                    
+                    cursor.execute(update_sql, tuple(update_values))
                     updated += 1
-                    logger.info(f"  ✓ Updated existing record")
+                    logger.info(f"  ✓ Updated existing record (preserving UUID and FK references)")
                 else:
+                    # Insert new record
+                    insert_values = [dataset.get(field, None) for field in insert_fields[:-1]]
+                    insert_values.append(datetime.now())  # extracted_at
+                    
+                    cursor.execute(insert_sql, tuple(insert_values))
                     inserted += 1
                     logger.info(f"  ✓ Inserted new record")
             else:
-                skipped += 1
-                logger.info(f"  ○ Skipped (already exists)")
+                # Insert only mode
+                insert_values = [dataset.get(field, None) for field in insert_fields[:-1]]
+                insert_values.append(datetime.now())  # extracted_at
+                
+                cursor.execute(insert_sql, tuple(insert_values))
+                
+                if cursor.rowcount > 0:
+                    inserted += 1
+                    logger.info(f"  ✓ Inserted new record")
+                else:
+                    skipped += 1
+                    logger.info(f"  ○ Skipped (already exists)")
                 
         except psycopg2.IntegrityError as e:
             conn.rollback()
@@ -834,7 +898,7 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     conn.commit()
     logger.info(f"\n✓ Transaction committed")
     logger.info(f"\n{'='*60}")
-    logger.info(f"SUMMARY: {'Updated' if force else 'Inserted'}: {updated if force else inserted}, Skipped: {skipped}, Failed: {failed}")
+    logger.info(f"SUMMARY: Inserted: {inserted}, Updated: {updated}, Skipped: {skipped}, Failed: {failed}")
     logger.info(f"{'='*60}")
     
     cursor.close()
