@@ -24,6 +24,7 @@ Enhanced with:
 - Better error handling and reporting
 - Normalized date handling for year-only temporal extents
 - UUID validation with regex pattern matching
+- Attribute extraction for code list values (@codeListValue)
 
 Usage:
     python populate_metadata.py
@@ -189,6 +190,23 @@ def get_element_text(element) -> Optional[str]:
         if child.tag.endswith('}CharacterString') or child.tag.endswith('}Decimal'):
             if child.text and child.text.strip():
                 return child.text.strip()
+    
+    return None
+
+
+def get_attribute_value(element, attribute_name: str) -> Optional[str]:
+    """Extract attribute value from element (e.g., codeListValue)."""
+    if element is None:
+        return None
+    
+    # Try direct attribute
+    if attribute_name in element.attrib:
+        return element.attrib[attribute_name]
+    
+    # Try without namespace
+    for key, value in element.attrib.items():
+        if key.endswith(attribute_name):
+            return value
     
     return None
 
@@ -363,8 +381,9 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     logger.debug(f"    Supplemental: {supp_text[:80]}...")
                 break
         
-        # Lineage
+        # Lineage - AT METADATA LEVEL (mdb:resourceLineage)
         for pattern in [
+            ['resourceLineage', 'LI_Lineage', 'statement'],
             ['dataQualityInfo', 'DQ_DataQuality', 'lineage', 'LI_Lineage', 'statement'],
             ['dataQualityInfo', 'lineage', 'statement']
         ]:
@@ -412,36 +431,68 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                 if verbose:
                     logger.debug(f"    Topic: {topic_text}")
         
-        # Language
-        for pattern in [
-            ['identificationInfo', 'MD_DataIdentification', 'language'],
-            ['identificationInfo', 'language'],
-            ['identificationInfo', 'defaultLocale']
-        ]:
-            lang_text = extract_field_by_path(root, pattern)
-            if lang_text:
-                metadata['language'] = lang_text
-                if verbose:
-                    logger.debug(f"    Language: {lang_text}")
-                break
+        # Language - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:language/lan:LanguageCode)
+        # Look for defaultLocale element first
+        locale_elem = find_element_by_tag_suffix(root, 'defaultLocale')
+        if locale_elem is not None:
+            # Navigate to LanguageCode and extract codeListValue attribute
+            for elem in locale_elem.iter():
+                if elem.tag.endswith('}LanguageCode'):
+                    lang_code = get_attribute_value(elem, 'codeListValue')
+                    if lang_code:
+                        metadata['language'] = lang_code
+                        if verbose:
+                            logger.debug(f"    Language: {lang_code}")
+                        break
         
-        # Character Set
-        charset_elem = find_element_by_tag_suffix(root, 'MD_CharacterSetCode')
-        if charset_elem is not None:
-            charset_text = get_element_text(charset_elem)
-            if charset_text:
-                metadata['character_set'] = charset_text
-                if verbose:
-                    logger.debug(f"    Charset: {charset_text}")
+        # Fallback: try identification info level
+        if not metadata['language']:
+            for pattern in [
+                ['identificationInfo', 'MD_DataIdentification', 'language'],
+                ['identificationInfo', 'language']
+            ]:
+                lang_text = extract_field_by_path(root, pattern)
+                if lang_text:
+                    metadata['language'] = lang_text
+                    if verbose:
+                        logger.debug(f"    Language (fallback): {lang_text}")
+                    break
         
-        # Status
+        # Character Set - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:characterEncoding)
+        if locale_elem is not None:
+            for elem in locale_elem.iter():
+                if elem.tag.endswith('}MD_CharacterSetCode'):
+                    charset_code = get_attribute_value(elem, 'codeListValue')
+                    if charset_code:
+                        metadata['character_set'] = charset_code
+                        if verbose:
+                            logger.debug(f"    Charset: {charset_code}")
+                        break
+        
+        # Fallback for character set
+        if not metadata['character_set']:
+            charset_elem = find_element_by_tag_suffix(root, 'MD_CharacterSetCode')
+            if charset_elem is not None:
+                charset_code = get_attribute_value(charset_elem, 'codeListValue')
+                if not charset_code:
+                    charset_code = get_element_text(charset_elem)
+                if charset_code:
+                    metadata['character_set'] = charset_code
+                    if verbose:
+                        logger.debug(f"    Charset (fallback): {charset_code}")
+        
+        # Status - Extract from MD_ProgressCode element's codeListValue attribute
         status_elem = find_element_by_tag_suffix(root, 'MD_ProgressCode')
         if status_elem is not None:
-            status_text = get_element_text(status_elem)
-            if status_text:
-                metadata['status'] = status_text
+            # Try to get codeListValue attribute first
+            status_code = get_attribute_value(status_elem, 'codeListValue')
+            if not status_code:
+                # Fallback to element text
+                status_code = get_element_text(status_elem)
+            if status_code:
+                metadata['status'] = status_code
                 if verbose:
-                    logger.debug(f"    Status: {status_text}")
+                    logger.debug(f"    Status: {status_code}")
         
         # === DATES ===
         
