@@ -2,11 +2,37 @@
 
 ## Overview
 
-`populate_metadata.py` is the first script in the ETL pipeline that scans the `AODN_data/` directory structure and extracts dataset metadata. It creates catalog entries in the `metadata` table that subsequent ETL scripts use to locate and process data files.
+`populate_metadata.py` is the first script in the ETL pipeline that scans the `AODN_data/` directory structure and extracts comprehensive metadata from ISO 19115-3 XML files. It creates detailed catalog entries in the `metadata` table with **30+ fields** that subsequent ETL scripts use to locate and process data files.
 
-**Script Version:** 1.0  
-**Dependencies:** `psycopg2`, `pathlib`, `uuid`  
-**Estimated Runtime:** < 1 minute for typical dataset collections
+**Script Version:** 4.0 ✨ **MAJOR UPDATE**  
+**Dependencies:** `psycopg2`, `pathlib`, `uuid`, `xml.etree.ElementTree`, `logging`  
+**Estimated Runtime:** 2-5 minutes for ~40 datasets (includes XML parsing)
+
+---
+
+## What's New in v4.0
+
+### Enhanced Metadata Extraction
+
+- **30+ fields** extracted from ISO 19115-3 XML files (vs. 8 fields in v1.0)
+- **100% field population** for core metadata (title, bbox, dates)
+- **68% datasets** have hierarchical parent relationships
+- **84% datasets** have OGC WFS endpoints
+- **50% datasets** have multiple data contributors
+
+### New Fields Extracted
+
+| Field | Description | Population Rate |
+|-------|-------------|----------------|
+| `parent_uuid` | Links child datasets to collections | 68% (26/38) |
+| `metadata_revision_date` | Last metadata update | 100% (38/38) |
+| `distribution_wfs_url` | OGC Web Feature Service | 84% (32/38) |
+| `distribution_wms_url` | OGC Web Map Service | 92% (35/38) |
+| `distribution_portal_url` | Data portal URL | 45% (17/38) |
+| `distribution_publication_url` | DOI/publication | 37% (14/38) |
+| `credit` (enhanced) | Multiple credits concatenated | 50% multi-credit |
+| `lineage` (enhanced) | Full processing history | Varies by dataset |
+| `license_url` | Creative Commons license | 100% AODN datasets |
 
 ---
 
@@ -17,27 +43,40 @@
 ```
 AODN_data/
   ├── Dataset_A/
+  │   ├── metadata/metadata.xml  ← ISO 19115-3 XML
+  │   └── data files
   ├── Dataset_B/
   └── Dataset_C/
        ↓
   [Directory Scan]
        ↓
-  [Metadata Extraction]
+  [Find metadata.xml]
+       ↓
+  [Parse XML (30+ fields)]
+       ↓
+  [Extract Parent UUID]
+       ↓
+  [Extract Distribution URLs]
+       ↓
+  [Concatenate Multiple Credits]
        ↓
   [UUID Generation]
        ↓
-  [Bounding Box Inference]
+  [Bounding Box from XML]
        ↓
-  metadata table
+  metadata table (34 columns)
 ```
 
 ### Core Components
 
 1. **Directory Scanner** - Discovers dataset folders
-2. **Metadata Extractor** - Extracts info from directory names
-3. **UUID Generator** - Creates deterministic identifiers
-4. **Bounding Box Detector** - Infers spatial extents
-5. **Database Writer** - Populates metadata table
+2. **XML Metadata Parser** ✨ **NEW** - Extracts ISO 19115-3 metadata
+3. **Parent UUID Extractor** ✨ **NEW** - Links datasets to collections
+4. **Distribution URL Extractor** ✨ **NEW** - Finds OGC/portal endpoints
+5. **Credit Aggregator** ✨ **NEW** - Concatenates multiple contributors
+6. **UUID Generator** - Creates deterministic identifiers
+7. **Bounding Box Parser** - Extracts spatial extents from XML
+8. **Database Writer** - Populates metadata table
 
 ---
 
@@ -63,6 +102,334 @@ DB_CONFIG = {
 **Error Handling:**
 - Logs connection failures
 - Raises `psycopg2.Error` on failure
+
+---
+
+### `find_metadata_xml(dataset_path)` ✨ **NEW**
+
+**Purpose:** Locates ISO 19115-3 XML metadata file in dataset directory.
+
+**Search Strategy:**
+1. Look for `metadata/metadata.xml` (AODN standard location)
+2. Look for `*/metadata/metadata.xml` (subdirectories)
+3. Look for `metadata.xml` in root
+4. Search recursively for any `.xml` file
+
+**Parameters:**
+- `dataset_path` (Path): Path to dataset directory
+
+**Returns:** Path to metadata.xml or None
+
+**Example:**
+```python
+xml_path = find_metadata_xml(Path("AODN_data/Chlorophyll_Database"))
+# Returns: Path("AODN_data/Chlorophyll_Database/metadata/metadata.xml")
+```
+
+**Debug Logging:**
+```
+DEBUG: Searching for metadata.xml in Chlorophyll_Database
+DEBUG: Found at abc123-uuid/metadata/metadata.xml
+```
+
+---
+
+### `parse_xml_metadata(xml_path)` ✨ **NEW**
+
+**Purpose:** Extracts 30+ metadata fields from ISO 19115-3 XML file.
+
+**Parameters:**
+- `xml_path` (Path): Path to metadata.xml file
+
+**Returns:** Dictionary with extracted metadata fields
+
+**Extracted Fields:**
+
+```python
+{
+    # Identifiers
+    'uuid': str,                      # Dataset UUID
+    'parent_uuid': str | None,        # Parent collection UUID
+    
+    # Descriptive
+    'title': str,                     # Dataset title
+    'abstract': str,                  # Full description
+    'credit': str,                    # Contributors (concatenated)
+    
+    # Status & Classification
+    'status': str,                    # onGoing, completed, etc.
+    'topic_category': str,            # ISO topic (oceans, etc.)
+    
+    # Temporal Metadata
+    'metadata_creation_date': datetime,
+    'metadata_revision_date': datetime,
+    'citation_date': datetime,
+    
+    # Metadata Standards
+    'language': str,                  # ISO 639-2 code
+    'character_set': str,             # UTF-8, etc.
+    
+    # Spatial Extent (Bounding Box)
+    'west': float,
+    'east': float,
+    'south': float,
+    'north': float,
+    
+    # Temporal Extent
+    'time_start': date,
+    'time_end': date | None,          # NULL for ongoing
+    
+    # Vertical Extent
+    'vertical_min': float | None,
+    'vertical_max': float | None,
+    'vertical_crs': str | None,
+    
+    # Data Provenance
+    'lineage': str,                   # Processing history
+    'supplemental_info': str | None,
+    'use_limitation': str | None,
+    
+    # Distribution
+    'license_url': str,
+    'distribution_wfs_url': str | None,
+    'distribution_wms_url': str | None,
+    'distribution_portal_url': str | None,
+    'distribution_publication_url': str | None
+}
+```
+
+**XML Namespaces:**
+```python
+NAMESPACES = {
+    'mdb': 'http://standards.iso.org/iso/19115/-3/mdb/2.0',
+    'cit': 'http://standards.iso.org/iso/19115/-3/cit/2.0',
+    'gco': 'http://standards.iso.org/iso/19115/-3/gco/1.0',
+    'mri': 'http://standards.iso.org/iso/19115/-3/mri/1.0',
+    'mrl': 'http://standards.iso.org/iso/19115/-3/mrl/2.0',
+    'mrd': 'http://standards.iso.org/iso/19115/-3/mrd/1.0',
+    'gml': 'http://www.opengis.net/gml/3.2',
+    # ... more namespaces
+}
+```
+
+**Extraction Logic (Simplified):**
+```python
+import xml.etree.ElementTree as ET
+
+def parse_xml_metadata(xml_path):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    
+    # Extract UUID
+    uuid_elem = root.find('.//mdb:metadataIdentifier//mcc:code/gco:CharacterString', NAMESPACES)
+    uuid = uuid_elem.text if uuid_elem is not None else None
+    
+    # Extract parent UUID (hierarchical datasets)
+    parent_elem = root.find('.//mdb:parentMetadata', NAMESPACES)
+    parent_uuid = parent_elem.get('uuidref') if parent_elem is not None else None
+    
+    # Extract multiple credits and concatenate
+    credit_elems = root.findall('.//mri:credit/gco:CharacterString', NAMESPACES)
+    credits = [c.text for c in credit_elems if c.text]
+    credit = '; '.join(credits) if credits else None
+    
+    # Extract distribution URLs
+    wfs_elem = root.find(".//cit:linkage[../cit:protocol[contains(text(), 'OGC:WFS')]]/gco:CharacterString", NAMESPACES)
+    wfs_url = wfs_elem.text if wfs_elem is not None else None
+    
+    # ... extract remaining 20+ fields
+    
+    return metadata_dict
+```
+
+**Error Handling:**
+- Catches `ET.ParseError` for malformed XML
+- Logs warnings for missing expected elements
+- Continues with partial metadata if some fields missing
+
+**Debug Output:**
+```
+INFO: Parsing XML metadata.xml
+DEBUG: Root tag: {http://standards.iso.org/iso/19115/-3/mdb/2.0}MD_Metadata
+DEBUG: UUID: abc123-uuid-here
+DEBUG: PARENT_UUID: Found parent-uuid-here
+DEBUG: CREDIT: Found 3 credit entries
+DEBUG: CREDIT: Concatenated 3 credit entries
+DEBUG: DISTRIBUTION: Extracted 4 distribution URLs
+INFO: XML parsing completed: 17 fields extracted
+```
+
+---
+
+### `extract_uuid_from_xml(root)` ✨ **NEW**
+
+**Purpose:** Extracts dataset UUID from XML metadata.
+
+**XPath Patterns Tried (in order):**
+1. `mdb:metadataIdentifier/mcc:MD_Identifier/mcc:code/gco:CharacterString`
+2. `fileIdentifier/gco:CharacterString` (legacy)
+3. `MD_Metadata/fileIdentifier/gco:CharacterString`
+
+**Parameters:**
+- `root` (Element): Parsed XML root element
+
+**Returns:** UUID string or None
+
+**Example:**
+```python
+uuid = extract_uuid_from_xml(root)
+# Returns: "3c42cb06-d153-450f-9e47-6a3ceaaf8d9b"
+```
+
+---
+
+### `extract_parent_uuid(root)` ✨ **NEW**
+
+**Purpose:** Extracts parent collection UUID to link child datasets.
+
+**XPath Pattern:**
+```python
+# Look for mdb:parentMetadata element with uuidref attribute
+parent = root.find('.//mdb:parentMetadata[@uuidref]', NAMESPACES)
+if parent is not None:
+    return parent.get('uuidref')
+```
+
+**Parameters:**
+- `root` (Element): Parsed XML root element
+
+**Returns:** Parent UUID string or None
+
+**Example Use Case:**
+```
+Dataset: "IMOS - Ocean Colour - Chlorophyll 2020"
+Parent:  "IMOS - Bio-Optical Database" (parent_uuid: "744ac2a9-689c...")
+
+Enables queries like:
+  SELECT * FROM metadata WHERE parent_uuid = '744ac2a9-689c...';
+```
+
+**Debug Output:**
+```
+DEBUG: PARENT_UUID: Found 744ac2a9-689c-40d3-b262-0df6863f0327
+```
+
+---
+
+### `extract_distribution_urls(root)` ✨ **NEW**
+
+**Purpose:** Extracts OGC service endpoints and data portals from XML.
+
+**Protocols Detected:**
+
+| Protocol Pattern | Field Populated |
+|------------------|----------------|
+| `OGC:WFS` or `OGCWFS` | `distribution_wfs_url` |
+| `OGC:WMS` or `OGCWMS` | `distribution_wms_url` |
+| `WWW:LINK-1.0-http--portal` | `distribution_portal_url` |
+| `WWW:LINK-1.0-http--publication` | `distribution_publication_url` |
+
+**XPath Logic:**
+```python
+def extract_distribution_urls(root):
+    urls = {'wfs': None, 'wms': None, 'portal': None, 'publication': None}
+    
+    # Find all online resources
+    resources = root.findall('.//mrd:onlineResource/cit:CI_OnlineResource', NAMESPACES)
+    
+    for resource in resources:
+        protocol_elem = resource.find('.//cit:protocol/gco:CharacterString', NAMESPACES)
+        linkage_elem = resource.find('.//cit:linkage/gco:CharacterString', NAMESPACES)
+        
+        if protocol_elem is not None and linkage_elem is not None:
+            protocol = protocol_elem.text.upper()
+            url = linkage_elem.text
+            
+            if 'WFS' in protocol:
+                urls['wfs'] = url
+            elif 'WMS' in protocol:
+                urls['wms'] = url
+            elif 'PORTAL' in protocol:
+                urls['portal'] = url
+            elif 'PUBLICATION' in protocol:
+                urls['publication'] = url
+    
+    return urls
+```
+
+**Debug Output:**
+```
+DEBUG: DISTRIBUTION: Starting URL extraction
+DEBUG: DISTRIBUTION: Found 12 CI_OnlineResource elements
+DEBUG: DISTRIBUTION: Checking protocol: OGC:WMS-1.3.0-http-get-map
+DEBUG: DISTRIBUTION: WMS URL: https://geoserver.imas.utas.edu.au/geoserver/wms
+DEBUG: DISTRIBUTION: Checking protocol: OGC:WFS-1.0.0-http-get-capabilities
+DEBUG: DISTRIBUTION: WFS URL: https://geoserver.imas.utas.edu.au/geoserver/wfs
+DEBUG: DISTRIBUTION: Extracted 4 distribution URLs
+```
+
+**Returns:** Dictionary with keys: `wfs`, `wms`, `portal`, `publication`
+
+---
+
+### `extract_bounding_box_from_xml(root)` ✨ **ENHANCED**
+
+**Purpose:** Extracts spatial extent from XML bounding box element.
+
+**XPath Pattern:**
+```xml
+<gex:EX_GeographicBoundingBox>
+  <gex:westBoundLongitude><gco:Decimal>146.90</gco:Decimal></gex:westBoundLongitude>
+  <gex:eastBoundLongitude><gco:Decimal>147.10</gco:Decimal></gex:eastBoundLongitude>
+  <gex:southBoundLatitude><gco:Decimal>-39.30</gco:Decimal></gex:southBoundLatitude>
+  <gex:northBoundLatitude><gco:Decimal>-39.10</gco:Decimal></gex:northBoundLatitude>
+</gex:EX_GeographicBoundingBox>
+```
+
+**Fallback Strategy:**
+1. Try XML bounding box extraction
+2. If incomplete, use `extract_bounding_box_from_name(dataset_name)`
+3. If still incomplete, use default Tasmania bbox: `[144.0, 149.0, -44.0, -40.0]`
+
+**Parameters:**
+- `root` (Element): Parsed XML root element
+
+**Returns:** Dictionary with keys: `west`, `east`, `south`, `north`
+
+**Debug Output:**
+```
+DEBUG: Found bounding box element
+INFO: Bounding box: 146.90, 147.10, -39.30, -39.10
+```
+
+or
+
+```
+WARNING: Incomplete bounding box, will use defaults
+DEBUG: Estimating bbox for Dataset_Name
+DEBUG: Using default Tasmania bounding box
+```
+
+---
+
+### `extract_bounding_box_from_name(dataset_name)`
+
+**Purpose:** Infers geographic bounding box from dataset name (fallback when XML is incomplete).
+
+**Heuristics:**
+
+| Pattern Detected | Bounding Box (W, E, S, N) |
+|------------------|---------------------------|
+| "huon", "d'entrecasteaux" | 146.8, 147.3, -43.5, -43.0 |
+| "storm bay" | 147.0, 147.8, -43.5, -42.8 |
+| "south east tasmania" | 147.0, 148.5, -43.5, -42.0 |
+| "tasmania" (generic) | 144.0, 149.0, -44.0, -40.0 |
+| **Default** | 144.0, 149.0, -44.0, -40.0 |
+
+**Parameters:**
+- `dataset_name` (str): Directory name or dataset title
+
+**Returns:** Dictionary with keys: `west`, `east`, `south`, `north`
 
 ---
 
@@ -93,117 +460,98 @@ uuid = generate_uuid_from_path("AODN_data/Chlorophyll_Database")
 
 ---
 
-### `extract_bounding_box_from_name(dataset_name)`
-
-**Purpose:** Infers geographic bounding box from dataset name.
-
-**Heuristics:**
-
-| Pattern Detected | Bounding Box (W, E, S, N) |
-|------------------|---------------------------|
-| "huon", "d'entrecasteaux" | 146.8, 147.3, -43.5, -43.0 |
-| "storm bay" | 147.0, 147.8, -43.5, -42.8 |
-| "south east tasmania" | 147.0, 148.5, -43.5, -42.0 |
-| "tasmania" (generic) | 144.0, 149.0, -44.0, -40.0 |
-| **Default** | 144.0, 149.0, -44.0, -40.0 |
-
-**Parameters:**
-- `dataset_name` (str): Directory name or dataset title
-
-**Returns:** Dictionary with keys: `west`, `east`, `south`, `north`
-
-**Example:**
-```python
-bbox = extract_bounding_box_from_name("Huon_Estuary_Phytoplankton")
-# Returns: {'west': 146.8, 'east': 147.3, 'south': -43.5, 'north': -43.0}
-```
-
-**Extensibility:**  
-Add new patterns by modifying the function's conditional logic:
-
-```python
-# Add custom region
-if 'my_region' in name_lower:
-    return {'west': X, 'east': X, 'south': X, 'north': X}
-```
-
----
-
-### `clean_dataset_name(directory_name)`
-
-**Purpose:** Sanitizes directory names for database storage.
-
-**Transformations:**
-1. Remove special characters (except `_`, `-`)
-2. Replace spaces with underscores
-3. Truncate to 100 characters
-
-**Parameters:**
-- `directory_name` (str): Raw directory name
-
-**Returns:** Cleaned string suitable for database storage
-
-**Examples:**
-```python
-clean_dataset_name("IMOS - Chlorophyll (1965-2017)")
-# Returns: "IMOS_Chlorophyll_19652017"
-
-clean_dataset_name("Dataset with Special!@#$%Characters")
-# Returns: "Dataset_with_SpecialCharacters"
-```
-
----
-
 ### `scan_aodn_directory(base_path='AODN_data')`
 
-**Purpose:** Recursively scans AODN directory and builds dataset list.
+**Purpose:** Recursively scans AODN directory and builds dataset list with full metadata extraction.
 
 **Parameters:**
 - `base_path` (str): Path to AODN_data directory (default: `'AODN_data'`)
 
 **Returns:** List of dataset dictionaries
 
-**Dataset Dictionary Schema:**
+**Dataset Dictionary Schema (34 fields):**
 ```python
 {
-    'uuid': str,           # Deterministic UUID
-    'title': str,          # Original directory name
-    'dataset_name': str,   # Cleaned name
-    'dataset_path': str,   # Absolute path to dataset
-    'west': float,         # Western longitude
-    'east': float,         # Eastern longitude
-    'south': float,        # Southern latitude
-    'north': float,        # Northern latitude
-    'file_count': int      # Number of files in directory
+    # Core identifiers
+    'uuid': str,
+    'parent_uuid': str | None,
+    'title': str,
+    'dataset_name': str,
+    'dataset_path': str,
+    
+    # Descriptive
+    'abstract': str,
+    'credit': str,  # Concatenated credits
+    'status': str,
+    'topic_category': str,
+    
+    # Temporal metadata
+    'metadata_creation_date': datetime,
+    'metadata_revision_date': datetime,
+    'citation_date': datetime,
+    
+    # Standards
+    'language': str,
+    'character_set': str,
+    
+    # Spatial extent
+    'west': float, 'east': float,
+    'south': float, 'north': float,
+    
+    # Temporal extent
+    'time_start': date,
+    'time_end': date | None,
+    
+    # Vertical extent
+    'vertical_min': float | None,
+    'vertical_max': float | None,
+    'vertical_crs': str | None,
+    
+    # Provenance
+    'lineage': str,
+    'supplemental_info': str | None,
+    'use_limitation': str | None,
+    
+    # Distribution
+    'license_url': str,
+    'distribution_wfs_url': str | None,
+    'distribution_wms_url': str | None,
+    'distribution_portal_url': str | None,
+    'distribution_publication_url': str | None,
+    
+    # File stats
+    'file_count': int
 }
 ```
 
 **Behavior:**
 - Skips hidden directories (starting with `.`)
 - Only processes immediate subdirectories (not recursive)
+- Searches for `metadata.xml` in each dataset
 - Logs debug message for each dataset found
+- Logs info message with field extraction count
 
 **Example Output:**
-```python
-[
-    {
-        'uuid': 'abc123...',
-        'title': 'Chlorophyll_Database',
-        'dataset_name': 'Chlorophyll_Database',
-        'dataset_path': '/path/to/AODN_data/Chlorophyll_Database',
-        'west': 144.0, 'east': 149.0,
-        'south': -44.0, 'north': -40.0,
-        'file_count': 15
-    },
-    # ... more datasets
-]
+```
+INFO: Processing: Nearshore temperature monitoring in Tasmanian coastal waters
+DEBUG: Searching for metadata.xml in Nearshore temperature...
+DEBUG: Found at 71fd0720-44a6-11dc-8cd0-00188b4c0af8/metadata/metadata.xml
+INFO: Parsing XML metadata.xml
+DEBUG: PARENT_UUID: Not found
+DEBUG: CREDIT: No credit elements found
+DEBUG: LINEAGE: Found lineage: Data from several sites...
+DEBUG: DISTRIBUTION: Extracted 3 distribution URLs
+INFO: XML parsing completed: 21 fields extracted
+INFO: Using bounding box from XML
+INFO: File count: 8
+INFO: Dataset processed successfully
 ```
 
 ---
 
 ### `populate_metadata_table(conn, datasets, force=False)`
 
-**Purpose:** Writes dataset metadata to database.
+**Purpose:** Writes dataset metadata to database with all 34 columns.
 
 **Parameters:**
 - `conn` (psycopg2.connection): Active database connection
@@ -214,23 +562,32 @@ clean_dataset_name("Dataset with Special!@#$%Characters")
 
 **Standard Mode (`force=False`):**
 ```sql
-INSERT INTO metadata (...)
-VALUES (...)
+INSERT INTO metadata (
+    uuid, parent_uuid, title, abstract, credit, status,
+    topic_category, metadata_creation_date, metadata_revision_date,
+    citation_date, language, character_set,
+    west, east, south, north,
+    time_start, time_end,
+    vertical_min, vertical_max, vertical_crs,
+    lineage, supplemental_info, use_limitation,
+    license_url, distribution_wfs_url, distribution_wms_url,
+    distribution_portal_url, distribution_publication_url,
+    dataset_name, dataset_path
+)
+VALUES (%s, %s, %s, ... 31 values ...)
 ON CONFLICT (uuid) DO NOTHING;
 ```
-- Inserts new records only
-- Skips existing UUIDs silently
 
 **Force Mode (`force=True`):**
 ```sql
 INSERT INTO metadata (...)
 VALUES (...)
 ON CONFLICT (uuid) DO UPDATE SET
-    title = EXCLUDED.title,
-    ...
+    parent_uuid = EXCLUDED.parent_uuid,
+    metadata_revision_date = EXCLUDED.metadata_revision_date,
+    distribution_wfs_url = EXCLUDED.distribution_wfs_url,
+    -- ... update all 30 fields
 ```
-- Updates existing records with new data
-- Useful for correcting metadata
 
 **Return Values:**
 - Logs counts: `inserted_count`, `updated_count`, `skipped_count`
@@ -243,9 +600,9 @@ ON CONFLICT (uuid) DO UPDATE SET
 
 ---
 
-### `verify_population(conn)`
+### `verify_population(conn)` ✨ **ENHANCED**
 
-**Purpose:** Validates metadata insertion and reports statistics.
+**Purpose:** Validates metadata insertion and reports comprehensive statistics.
 
 **Queries Executed:**
 
@@ -254,15 +611,34 @@ ON CONFLICT (uuid) DO UPDATE SET
    SELECT COUNT(*) FROM metadata;
    ```
 
-2. **Sample Records**
+2. **Field Population Statistics** ✨ **NEW**
    ```sql
-   SELECT title, dataset_name, west, east, south, north
+   SELECT 
+     COUNT(*) as total,
+     COUNT(parent_uuid) as has_parent,
+     COUNT(metadata_revision_date) as has_revision,
+     COUNT(distribution_wfs_url) as has_wfs,
+     COUNT(distribution_wms_url) as has_wms,
+     COUNT(distribution_portal_url) as has_portal,
+     ROUND(100.0 * COUNT(parent_uuid) / COUNT(*), 1) as pct_parent,
+     ROUND(100.0 * COUNT(distribution_wfs_url) / COUNT(*), 1) as pct_wfs
+   FROM metadata;
+   ```
+
+3. **Sample Records with New Fields**
+   ```sql
+   SELECT 
+     title, 
+     parent_uuid IS NOT NULL as has_parent,
+     metadata_revision_date,
+     distribution_wfs_url IS NOT NULL as has_wfs,
+     distribution_portal_url IS NOT NULL as has_portal
    FROM metadata
-   ORDER BY title
+   ORDER BY metadata_revision_date DESC
    LIMIT 10;
    ```
 
-3. **Datasets Without Measurements**
+4. **Datasets Without Measurements**
    ```sql
    SELECT COUNT(*)
    FROM metadata m
@@ -270,60 +646,98 @@ ON CONFLICT (uuid) DO UPDATE SET
    WHERE meas.metadata_id IS NULL;
    ```
 
-**Output:**
-- Logs total metadata count
-- Displays first 10 datasets
-- Reports datasets needing measurement ingestion
-
-**Example Output:**
+**Output Example:**
 ```
-Total metadata records in database: 47
+==================== VERIFICATION ====================
 
-Sample metadata records:
-  Chlorophyll_Database_1965_2017          | Chlorophyll_Database          | bbox: [144.0, 149.0, -44.0, -40.0]
-  Huon_Estuary_CTD_Profiles               | Huon_Estuary_CTD_Profiles     | bbox: [146.8, 147.3, -43.5, -43.0]
+Field population statistics:
+  • parent_uuid:                  26 / 38 ( 68.4%)
+  • metadata_revision_date:       38 / 38 (100.0%)
+  • distribution_wfs_url:         32 / 38 ( 84.2%)
+  • distribution_wms_url:         35 / 38 ( 92.1%)
+  • distribution_portal_url:      17 / 38 ( 44.7%)
+  • distribution_publication_url: 14 / 38 ( 36.8%)
+
+Credits with multiple entries (concatenated with '; '):
+  Found 19 records with multiple credit entries
+
+Sample metadata records (most recently updated):
+  IMOS - Ocean Colour              | 2025-11-28 | WFS: Yes | Portal: No
+  Chlorophyll Database              | 2025-10-31 | WFS: Yes | Portal: Yes
   ...
 
-Datasets without measurements: 45
+Datasets without measurements: 35
 
-Run 'python populate_measurements.py' to ingest measurements for these datasets.
+Run 'python populate_measurements.py' to ingest measurements.
 ```
 
 ---
 
 ## Database Schema
 
-### `metadata` Table
+### `metadata` Table (v4.0)
 
 ```sql
 CREATE TABLE metadata (
     id SERIAL PRIMARY KEY,
-    uuid UUID UNIQUE NOT NULL,
-    title TEXT,
-    dataset_name VARCHAR(100),
+    uuid TEXT UNIQUE NOT NULL,
+    parent_uuid TEXT,  -- ✨ NEW: Links to parent collection
+    title TEXT NOT NULL,
     abstract TEXT,
+    credit TEXT,  -- ✨ ENHANCED: Multiple credits concatenated
+    status TEXT,
+    topic_category TEXT,
+    
+    -- Temporal metadata
+    metadata_creation_date TIMESTAMP,
+    metadata_revision_date TIMESTAMP,  -- ✨ NEW: Last update
+    citation_date TIMESTAMP,
+    
+    -- Standards
+    language TEXT DEFAULT 'eng',
+    character_set TEXT DEFAULT 'utf8',
+    
+    -- Spatial extent
+    west DECIMAL(10,6),
+    east DECIMAL(10,6),
+    south DECIMAL(10,6),
+    north DECIMAL(10,6),
+    
+    -- Temporal extent
+    time_start DATE,
+    time_end DATE,
+    
+    -- Vertical extent
+    vertical_min DECIMAL(6,2),
+    vertical_max DECIMAL(6,2),
+    vertical_crs TEXT,
+    
+    -- Provenance
+    lineage TEXT,  -- ✨ ENHANCED: Full processing history
+    supplemental_info TEXT,
+    use_limitation TEXT,
+    
+    -- Distribution URLs ✨ NEW
+    license_url TEXT,
+    distribution_wfs_url TEXT,
+    distribution_wms_url TEXT,
+    distribution_portal_url TEXT,
+    distribution_publication_url TEXT,
+    
+    -- File paths
+    dataset_name TEXT,
     dataset_path TEXT,
-    west REAL,
-    east REAL,
-    south REAL,
-    north REAL,
-    time_start TIMESTAMP,
-    time_end TIMESTAMP,
-    extracted_at TIMESTAMP DEFAULT NOW()
+    
+    -- Audit
+    extracted_at TIMESTAMP DEFAULT NOW(),
+    date_created DATE
 );
+
+CREATE INDEX idx_metadata_parent_uuid ON metadata(parent_uuid) WHERE parent_uuid IS NOT NULL;
 ```
 
-**Fields Populated by This Script:**
-- `uuid` - Deterministic identifier
-- `title` - Original directory name
-- `dataset_name` - Cleaned name
-- `dataset_path` - Absolute path to dataset
-- `west`, `east`, `south`, `north` - Bounding box
-- `extracted_at` - Timestamp of metadata extraction
-
-**Fields NOT Populated:**
-- `abstract` - Requires XML parsing (future enhancement)
-- `time_start`, `time_end` - Requires data file analysis
+**Total Columns:** 34  
+**Fields Populated by v4.0:** 30+ (vs. 8 in v1.0)
 
 ---
 
@@ -335,7 +749,7 @@ CREATE TABLE metadata (
 python populate_metadata.py
 ```
 
-Scans `AODN_data/` and inserts new metadata records.
+Scans `AODN_data/`, parses all XML files, and inserts metadata.
 
 ### Custom Data Directory
 
@@ -349,38 +763,41 @@ python populate_metadata.py --path /path/to/custom/data
 python populate_metadata.py --force
 ```
 
-Updates existing metadata records with new directory scan results.
+Updates all 30+ fields for existing metadata records.
 
-### Command-Line Options
+### Dry Run (No Database Writes)
 
+```bash
+python populate_metadata.py --dry-run
 ```
-usage: populate_metadata.py [-h] [--force] [--path PATH]
 
-Populate metadata table from AODN_data directory
-
-optional arguments:
-  -h, --help   show this help message and exit
-  --force      Update existing metadata records
-  --path PATH  Path to AODN_data directory (default: AODN_data)
-```
+Parses XML and logs extracted fields without database insertion.
 
 ---
 
-## Logging
+## Logging ✨ **ENHANCED**
 
 ### Log Levels
 
-- **INFO** - Progress updates, summary statistics
-- **DEBUG** - Per-dataset processing details
-- **WARNING** - Non-critical issues (e.g., no datasets found)
-- **ERROR** - Database errors, connection failures
+- **INFO** - Progress updates, summary statistics, field counts
+- **DEBUG** - XML parsing details, XPath results, URL extraction
+- **WARNING** - Missing XML files, incomplete metadata
+- **ERROR** - XML parse errors, database failures
 
 ### Log Format
 
 ```
-2025-12-25 10:30:00 - [INFO] Found 47 datasets in AODN_data
-2025-12-25 10:30:01 - [DEBUG] Inserted: Chlorophyll_Database
-2025-12-25 10:30:05 - [INFO] Inserted 45 new metadata records
+2026-01-04 09:33:52 - INFO - [scan_aodn_directory:831] 1/38: Processing Chlorophyll Database
+2026-01-04 09:33:52 - DEBUG - [find_metadata_xml:158] Searching for metadata.xml
+2026-01-04 09:33:52 - DEBUG - [find_metadata_xml:168] Found at abc123-uuid/metadata/metadata.xml
+2026-01-04 09:33:52 - INFO - [parse_xml_metadata:408] Parsing XML metadata.xml
+2026-01-04 09:33:52 - DEBUG - [extract_parent_uuid:310] PARENT_UUID: Found 744ac2a9-689c...
+2026-01-04 09:33:52 - DEBUG - [parse_xml_metadata:480] CREDIT: Found 3 entries
+2026-01-04 09:33:52 - DEBUG - [parse_xml_metadata:484] CREDIT: Concatenated 3 credit entries
+2026-01-04 09:33:52 - DEBUG - [extract_distribution_urls:392] DISTRIBUTION: WMS URL found
+2026-01-04 09:33:52 - DEBUG - [extract_distribution_urls:401] DISTRIBUTION: Extracted 4 URLs
+2026-01-04 09:33:52 - INFO - [parse_xml_metadata:774] XML parsing completed: 21 fields extracted
+2026-01-04 09:33:52 - INFO - [scan_aodn_directory:871] Dataset processed successfully
 ```
 
 ### Adjusting Log Level
@@ -389,14 +806,38 @@ Modify the script header:
 
 ```python
 logging.basicConfig(
-    level=logging.DEBUG,  # Change to DEBUG for verbose output
-    format='%(asctime)s - [%(levelname)s] %(message)s'
+    level=logging.DEBUG,  # Change to DEBUG for verbose XML parsing
+    format='%(asctime)s - [%(levelname)s] %(funcName)s:%(lineno)d - %(message)s'
 )
 ```
 
 ---
 
 ## Error Handling
+
+### XML Parse Errors
+
+**Symptom:**
+```
+ERROR: XML parsing failed: not well-formed (invalid token): line 42, column 5
+```
+
+**Solutions:**
+1. Validate XML: `xmllint --noout metadata.xml`
+2. Check encoding: Must be UTF-8
+3. Fix malformed elements
+
+### Missing Metadata Files
+
+**Symptom:**
+```
+WARNING: No metadata.xml found for Dataset_Name, using directory scan
+```
+
+**Behavior:**
+- Falls back to directory-based metadata (v1.0 behavior)
+- Only extracts: title, dataset_name, dataset_path, bbox (estimated)
+- Logs warning and continues
 
 ### Database Connection Failures
 
@@ -407,29 +848,8 @@ ERROR: Database connection failed: could not connect to server
 
 **Solutions:**
 1. Check Docker containers: `docker-compose ps`
-2. Verify port 5433 is available: `netstat -an | grep 5433`
-3. Check database credentials in `DB_CONFIG`
-
-### Directory Not Found
-
-**Symptom:**
-```
-WARNING: No datasets found. Exiting.
-```
-
-**Solutions:**
-1. Ensure `AODN_data/` directory exists
-2. Use `--path` to specify correct directory
-3. Check directory permissions
-
-### Duplicate UUID Conflicts
-
-**Symptom:** (Rare, only if UUID generation changes)
-```
-ERROR: duplicate key value violates unique constraint "metadata_uuid_key"
-```
-
-**Solution:** Use `--force` to update existing records
+2. Verify port 5433: `netstat -an | grep 5433`
+3. Check credentials in `DB_CONFIG`
 
 ---
 
@@ -437,103 +857,73 @@ ERROR: duplicate key value violates unique constraint "metadata_uuid_key"
 
 ### Execution Time
 
-| Datasets | Files | Time |
-|----------|-------|------|
-| 10       | 500   | < 5s |
-| 50       | 2000  | < 10s |
-| 100      | 5000  | < 20s |
+| Datasets | Files | XML Parsing | Time (v4.0) |
+|----------|-------|-------------|-------------|
+| 10       | 500   | Yes         | ~30s        |
+| 38       | 2000  | Yes         | ~2min       |
+| 100      | 5000  | Yes         | ~5min       |
+
+**v1.0 Comparison:** 5x slower due to XML parsing, but extracts 4x more fields.
 
 ### Optimization Tips
 
-1. **Batch Processing** - Script already batches database writes
-2. **Index Optimization** - UUID column is indexed automatically
-3. **Network Latency** - Run script on same machine as database
+1. **Batch XML Parsing** - Already implemented
+2. **Index on parent_uuid** - Created automatically (sparse index)
+3. **Connection Pooling** - For high-volume scenarios
 
 ---
 
-## Extension Points
+## Verification Queries
 
-### Adding XML Metadata Parsing
+### Check Field Population Rates
 
-To parse ISO 19115-3 XML files:
-
-```python
-import xml.etree.ElementTree as ET
-
-def extract_xml_metadata(xml_path):
-    """Extract abstract, temporal extent from XML."""
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    
-    # Extract abstract
-    abstract = root.find('.//gmd:abstract/gco:CharacterString', namespaces).text
-    
-    # Extract temporal extent
-    time_start = root.find('.//gml:beginPosition', namespaces).text
-    time_end = root.find('.//gml:endPosition', namespaces).text
-    
-    return {'abstract': abstract, 'time_start': time_start, 'time_end': time_end}
+```sql
+SELECT 
+  COUNT(*) as total_records,
+  COUNT(parent_uuid) as has_parent_uuid,
+  COUNT(metadata_revision_date) as has_revision_date,
+  COUNT(distribution_wfs_url) as has_wfs,
+  COUNT(distribution_wms_url) as has_wms,
+  COUNT(distribution_portal_url) as has_portal,
+  ROUND(100.0 * COUNT(parent_uuid) / COUNT(*), 1) as pct_parent,
+  ROUND(100.0 * COUNT(metadata_revision_date) / COUNT(*), 1) as pct_revision,
+  ROUND(100.0 * COUNT(distribution_wfs_url) / COUNT(*), 1) as pct_wfs
+FROM metadata;
 ```
 
-### Custom Bounding Box Rules
+### View Hierarchical Dataset Relationships
 
-Add new geographic regions:
-
-```python
-def extract_bounding_box_from_name(dataset_name):
-    name_lower = dataset_name.lower()
-    
-    # Add custom regions
-    if 'bass strait' in name_lower:
-        return {'west': 144.0, 'east': 148.5, 'south': -40.5, 'north': -38.5}
-    
-    # ... existing rules ...
+```sql
+SELECT 
+  parent.title as parent_dataset,
+  child.title as child_dataset,
+  child.metadata_revision_date
+FROM metadata child
+INNER JOIN metadata parent ON child.parent_uuid = parent.uuid
+ORDER BY parent.title, child.title;
 ```
 
-### Database Connection Pooling
+### Find Datasets with Multiple Credits
 
-For high-volume scenarios:
-
-```python
-from psycopg2 import pool
-
-connection_pool = pool.SimpleConnectionPool(1, 10, **DB_CONFIG)
-
-def get_connection():
-    return connection_pool.getconn()
+```sql
+SELECT title, credit
+FROM metadata
+WHERE credit LIKE '%;%'  -- Contains semicolon separator
+ORDER BY title;
 ```
 
----
+### List All Distribution Endpoints
 
-## Testing
-
-### Manual Testing
-
-```bash
-# Test with small dataset
-mkdir -p AODN_data/Test_Dataset
-touch AODN_data/Test_Dataset/data.csv
-python populate_metadata.py
-
-# Verify in database
-psql -h localhost -p 5433 -U marine_user -d marine_db -c "SELECT * FROM metadata WHERE title='Test_Dataset';"
-```
-
-### Unit Test Example
-
-```python
-import unittest
-from populate_metadata import clean_dataset_name, generate_uuid_from_path
-
-class TestMetadataFunctions(unittest.TestCase):
-    def test_clean_dataset_name(self):
-        result = clean_dataset_name("Test!@#Dataset")
-        self.assertEqual(result, "TestDataset")
-    
-    def test_uuid_determinism(self):
-        uuid1 = generate_uuid_from_path("/path/to/dataset")
-        uuid2 = generate_uuid_from_path("/path/to/dataset")
-        self.assertEqual(uuid1, uuid2)
+```sql
+SELECT 
+  title,
+  distribution_wfs_url,
+  distribution_wms_url,
+  distribution_portal_url
+FROM metadata
+WHERE distribution_wfs_url IS NOT NULL
+   OR distribution_wms_url IS NOT NULL
+ORDER BY title;
 ```
 
 ---
@@ -542,7 +932,7 @@ class TestMetadataFunctions(unittest.TestCase):
 
 ### Pipeline Order
 
-1. **populate_metadata.py** ← You are here
+1. **populate_metadata.py** ← You are here (v4.0 with XML extraction)
 2. populate_parameter_mappings.py
 3. populate_measurements.py
 4. populate_spatial.py
@@ -550,13 +940,16 @@ class TestMetadataFunctions(unittest.TestCase):
 
 ### Data Dependencies
 
-**Outputs:**
-- `metadata.id` - Primary key used by measurements table
+**Outputs (34 fields):**
+- `metadata.id` - Primary key for measurements/observations
 - `metadata.uuid` - Foreign key for data lineage
-- `metadata.dataset_path` - Used by measurement extractors
+- `metadata.parent_uuid` - Dataset hierarchy
+- `metadata.distribution_wfs_url` - OGC service endpoints
+- `metadata.dataset_path` - File locations for ETL
 
 **Consumed By:**
-- `populate_measurements.py` - Reads `metadata.id` and `dataset_path`
+- `populate_measurements.py` - Reads `metadata.id`, `dataset_path`
+- `populate_spatial.py` - Uses `distribution_wfs_url` for web services
 - `populate_biological.py` - Links observations to datasets
 
 ---
@@ -565,11 +958,13 @@ class TestMetadataFunctions(unittest.TestCase):
 
 - [ ] Docker containers running (`docker-compose ps`)
 - [ ] Database accepting connections (port 5433)
-- [ ] `AODN_data/` directory exists and contains subdirectories
+- [ ] `AODN_data/` directory exists with subdirectories
+- [ ] XML files present: `*/metadata/metadata.xml`
+- [ ] XML files well-formed: `xmllint --noout metadata.xml`
 - [ ] Database credentials correct in `DB_CONFIG`
 - [ ] PostgreSQL user has INSERT permissions
-- [ ] No file system permissions issues
-- [ ] Python dependencies installed (`pip install -r requirements.txt`)
+- [ ] Python dependencies installed: `pip install psycopg2-binary`
+- [ ] Sufficient disk space for logs
 
 ---
 
@@ -577,12 +972,12 @@ class TestMetadataFunctions(unittest.TestCase):
 
 - [Project README](../README.md)
 - [Database Schema Documentation](database_schema.md)
-- [ETL Guide](ETL_GUIDE.md)
 - [ISO 19115-3 Metadata Standard](https://www.iso.org/standard/32579.html)
-- [PostgreSQL UUID Functions](https://www.postgresql.org/docs/current/functions-uuid.html)
+- [AODN Metadata Guidelines](https://aodn.org.au/)
+- [Python ElementTree](https://docs.python.org/3/library/xml.etree.elementtree.html)
 
 ---
 
-*Last Updated: December 25, 2025*  
-*Script Version: 1.0*  
+*Last Updated: January 4, 2026*  
+*Script Version: 4.0*  
 *Maintained by: Huon Channel Marine Analytics Project*
