@@ -656,7 +656,7 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     
     # Build SQL with all possible fields
     fields = [
-        'aodn_uuid', 'title', 'dataset_name', 'dataset_path',  # CHANGED: uuid -> aodn_uuid
+        'uuid', 'title', 'dataset_name', 'dataset_path',  # CHANGED: aodn_uuid -> uuid
         'abstract', 'credit', 'supplemental_info', 'lineage',
         'use_limitation', 'license_url', 'topic_category', 'language',
         'character_set', 'status', 'metadata_creation_date',
@@ -669,7 +669,7 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     field_names = ', '.join(fields)
     
     if force:
-        # CHANGED: Conflict on dataset_path, not uuid
+        # CHANGED: Conflict on dataset_path, update uuid if changed
         update_set = ', '.join([f"{field} = EXCLUDED.{field}" for field in fields if field != 'dataset_path'])
         insert_sql = f"""
         INSERT INTO metadata ({field_names})
@@ -677,7 +677,6 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
         ON CONFLICT (dataset_path) DO UPDATE SET {update_set};
         """
     else:
-        # CHANGED: Conflict on dataset_path, not uuid
         insert_sql = f"""
         INSERT INTO metadata ({field_names})
         VALUES ({placeholders})
@@ -688,23 +687,24 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     
     for idx, dataset in enumerate(datasets, 1):
         try:
-            # CHANGED: Don't require UUID (it can be NULL), but require dataset_path
+            # Generate UUID if AODN UUID not available
+            if not dataset.get('uuid'):
+                dataset['uuid'] = str(uuid.uuid4())
+                logger.info(f"\n[{idx}/{len(datasets)}] Generated UUID (no AODN UUID): {dataset['uuid']}")
+            else:
+                logger.info(f"\n[{idx}/{len(datasets)}] Using AODN UUID: {dataset['uuid']}")
+            
             if not dataset.get('dataset_path'):
                 logger.error(f"\n[{idx}/{len(datasets)}] ✗ Skipping - no dataset_path")
                 failed += 1
                 continue
             
-            logger.info(f"\n[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
-            if dataset.get('uuid'):  # CHANGED: Log UUID if present
-                logger.info(f"  UUID: {dataset.get('uuid')}")
+            logger.info(f"[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
             
-            # Prepare values tuple - map 'uuid' key from parse to 'aodn_uuid' field
+            # Prepare values tuple
             values = []
             for field in fields[:-1]:
-                if field == 'aodn_uuid':
-                    values.append(dataset.get('uuid', None))  # Map uuid -> aodn_uuid
-                else:
-                    values.append(dataset.get(field, None))
+                values.append(dataset.get(field, None))
             values.append(datetime.now())  # extracted_at
             
             cursor.execute(insert_sql, tuple(values))
@@ -721,13 +721,13 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                 logger.info(f"  ○ Skipped (already exists)")
                 
         except psycopg2.IntegrityError as e:
-            conn.rollback()  # CRITICAL: Rollback failed transaction to continue
+            conn.rollback()
             failed += 1
             logger.error(f"  ✗ Integrity error: {e}")
             logger.error(f"  DETAIL: {e.pgerror}")
             
         except psycopg2.Error as e:
-            conn.rollback()  # CRITICAL: Rollback failed transaction to continue
+            conn.rollback()
             failed += 1
             logger.error(f"  ✗ Database error: {e}")
             
@@ -743,7 +743,6 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     logger.info(f"{'='*60}")
     
     cursor.close()
-
 
 
 def verify_population(conn):

@@ -153,9 +153,9 @@ CREATE INDEX IF NOT EXISTS idx_locations_lat_lon_partial
 -- CHANGED: Removed uuid field, made dataset_path UNIQUE NOT NULL
 -- =============================================================================
 
-CREATE TABLE IF NOT EXISTS metadata (
+CREATE TABLE metadata (
   id SERIAL PRIMARY KEY,
-  aodn_uuid TEXT UNIQUE,  -- AODN catalog UUID from directory structure (nullable for non-AODN datasets)
+  uuid TEXT UNIQUE NOT NULL,  -- AODN UUID when available, generated UUID as fallback
   parent_uuid TEXT,
   title TEXT NOT NULL,
   abstract TEXT,
@@ -185,9 +185,15 @@ CREATE TABLE IF NOT EXISTS metadata (
   distribution_portal_url TEXT,
   distribution_publication_url TEXT,
   dataset_name TEXT,
-  dataset_path TEXT UNIQUE NOT NULL,  -- Primary stable identifier for upserts
+  dataset_path TEXT UNIQUE,  -- For upsert conflict detection
   extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  date_created DATE
+  date_created DATE,
+  
+  -- PostGIS spatial extent (unlocks spatial queries)
+  extent_geom GEOMETRY(POLYGON, 4326),
+  
+  -- Materialized bounding box for non-spatial queries
+  bbox_envelope BOX2D GENERATED ALWAYS AS (BOX2D(extent_geom)) STORED
 );
 
 -- Metadata indexes (pure PostgreSQL)
