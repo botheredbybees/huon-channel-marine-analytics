@@ -12,13 +12,15 @@ Enhanced with:
 - AODN UUID extraction from XML metadataIdentifier (ISO 19115-3)
 - Fallback to fileIdentifier (ISO 19115-1) and directory structure
 - Namespace-agnostic XML parsing for ISO 19115-1 and ISO 19115-3
-- Extraction of 20+ metadata fields:
+- Extraction of 27+ metadata fields:
   * Descriptive: abstract, credit, supplemental_info, lineage
   * Constraints: use_limitation, license_url
   * Classification: topic_category, language, character_set, status
   * Dates: metadata_creation_date, metadata_revision_date, citation_date
   * Temporal: time_start, time_end
   * Spatial: west, east, south, north (bounding box)
+  * Vertical: vertical_min, vertical_max, vertical_crs
+  * Distribution: WFS, WMS, portal, and publication URLs
 - File-based debug logging to logs/ directory
 - Detailed progress tracking with console and file output separation
 - Better error handling and reporting
@@ -294,7 +296,10 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         'character_set': None, 'status': None, 'metadata_creation_date': None,
         'metadata_revision_date': None, 'citation_date': None,
         'west': None, 'east': None, 'south': None, 'north': None,
-        'time_start': None, 'time_end': None
+        'time_start': None, 'time_end': None,
+        'vertical_min': None, 'vertical_max': None, 'vertical_crs': None,
+        'distribution_wfs_url': None, 'distribution_wms_url': None,
+        'distribution_portal_url': None, 'distribution_publication_url': None
     }
     
     try:
@@ -524,6 +529,84 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         if metadata.get('time_start') or metadata.get('time_end'):
             logger.info(f"  ✓ Temporal extent: {metadata.get('time_start') or 'N/A'} to {metadata.get('time_end') or 'N/A'}")
         
+        # === VERTICAL EXTENT ===
+        
+        vertical_elem = find_element_by_tag_suffix(root, 'EX_VerticalExtent')
+        if vertical_elem is not None:
+            logger.debug("  Found vertical extent element")
+            
+            # Extract min and max values
+            for child in vertical_elem:
+                if child.tag.endswith('}minimumValue') or child.tag == 'minimumValue':
+                    vert_min = get_element_text(child)
+                    if vert_min:
+                        try:
+                            metadata['vertical_min'] = float(vert_min)
+                            logger.debug(f"    Vertical min: {vert_min}")
+                        except ValueError:
+                            logger.warning(f"    Could not convert vertical_min: {vert_min}")
+                
+                elif child.tag.endswith('}maximumValue') or child.tag == 'maximumValue':
+                    vert_max = get_element_text(child)
+                    if vert_max:
+                        try:
+                            metadata['vertical_max'] = float(vert_max)
+                            logger.debug(f"    Vertical max: {vert_max}")
+                        except ValueError:
+                            logger.warning(f"    Could not convert vertical_max: {vert_max}")
+                
+                # Extract vertical CRS
+                elif child.tag.endswith('}verticalCRS') or child.tag == 'verticalCRS':
+                    for crs_child in child.iter():
+                        if crs_child.tag.endswith('}code') or crs_child.tag == 'code':
+                            crs_text = get_element_text(crs_child)
+                            if crs_text:
+                                metadata['vertical_crs'] = crs_text
+                                logger.debug(f"    Vertical CRS: {crs_text}")
+                                break
+        
+        if metadata.get('vertical_min') is not None or metadata.get('vertical_max') is not None:
+            logger.info(f"  ✓ Vertical extent: {metadata.get('vertical_min') or 'N/A'} to {metadata.get('vertical_max') or 'N/A'} ({metadata.get('vertical_crs') or 'No CRS'})")
+        
+        # === DISTRIBUTION INFORMATION ===
+        
+        # Find all distribution elements
+        for elem in root.iter():
+            if elem.tag.endswith('}distributionInfo'):
+                # Look for online resources
+                for dist_child in elem.iter():
+                    if dist_child.tag.endswith('}linkage'):
+                        url_text = get_element_text(dist_child)
+                        if url_text:
+                            # Determine URL type based on content
+                            url_lower = url_text.lower()
+                            
+                            if 'wfs' in url_lower or 'ogc/wfs' in url_lower:
+                                if not metadata['distribution_wfs_url']:
+                                    metadata['distribution_wfs_url'] = url_text
+                                    logger.debug(f"    WFS URL: {url_text[:80]}...")
+                            
+                            elif 'wms' in url_lower or 'ogc/wms' in url_lower:
+                                if not metadata['distribution_wms_url']:
+                                    metadata['distribution_wms_url'] = url_text
+                                    logger.debug(f"    WMS URL: {url_text[:80]}...")
+                            
+                            elif 'portal.aodn.org.au' in url_lower or 'catalogue' in url_lower:
+                                if not metadata['distribution_portal_url']:
+                                    metadata['distribution_portal_url'] = url_text
+                                    logger.debug(f"    Portal URL: {url_text[:80]}...")
+                            
+                            elif 'doi' in url_lower or 'publication' in url_lower:
+                                if not metadata['distribution_publication_url']:
+                                    metadata['distribution_publication_url'] = url_text
+                                    logger.debug(f"    Publication URL: {url_text[:80]}...")
+        
+        dist_count = sum(1 for k in ['distribution_wfs_url', 'distribution_wms_url', 
+                                      'distribution_portal_url', 'distribution_publication_url'] 
+                         if metadata.get(k))
+        if dist_count > 0:
+            logger.info(f"  ✓ Distribution URLs found: {dist_count}")
+        
         # === SUMMARY ===
         
         fields_extracted = sum(1 for v in metadata.values() if v is not None)
@@ -662,7 +745,11 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
         'character_set', 'status', 'metadata_creation_date',
         'metadata_revision_date', 'citation_date',
         'west', 'east', 'south', 'north',
-        'time_start', 'time_end', 'extracted_at'
+        'time_start', 'time_end',
+        'vertical_min', 'vertical_max', 'vertical_crs',
+        'distribution_wfs_url', 'distribution_wms_url',
+        'distribution_portal_url', 'distribution_publication_url',
+        'extracted_at'
     ]
     
     placeholders = ', '.join(['%s'] * len(fields))
