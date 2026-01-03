@@ -25,6 +25,7 @@ Enhanced with:
 - Normalized date handling for year-only temporal extents
 - UUID validation with regex pattern matching
 - Attribute extraction for code list values (@codeListValue)
+- Enhanced debugging for problematic fields
 
 Usage:
     python populate_metadata.py
@@ -381,18 +382,24 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     logger.debug(f"    Supplemental: {supp_text[:80]}...")
                 break
         
-        # Lineage - AT METADATA LEVEL (mdb:resourceLineage)
+        # Lineage - AT METADATA LEVEL (mdb:resourceLineage) with enhanced debugging
+        logger.debug("  [LINEAGE] Starting lineage extraction...")
+        lineage_found = False
         for pattern in [
             ['resourceLineage', 'LI_Lineage', 'statement'],
             ['dataQualityInfo', 'DQ_DataQuality', 'lineage', 'LI_Lineage', 'statement'],
             ['dataQualityInfo', 'lineage', 'statement']
         ]:
+            logger.debug(f"  [LINEAGE] Trying pattern: {' -> '.join(pattern)}")
             lineage_text = extract_field_by_path(root, pattern)
             if lineage_text:
                 metadata['lineage'] = lineage_text
-                if verbose:
-                    logger.debug(f"    Lineage: {lineage_text[:80]}...")
+                logger.debug(f"  [LINEAGE] ✓ Found lineage: {lineage_text[:80]}...")
+                lineage_found = True
                 break
+        
+        if not lineage_found:
+            logger.debug(f"  [LINEAGE] ✗ No lineage found in any pattern")
         
         # === CONSTRAINTS ===
         
@@ -431,22 +438,31 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                 if verbose:
                     logger.debug(f"    Topic: {topic_text}")
         
-        # Language - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:language/lan:LanguageCode)
-        # Look for defaultLocale element first
+        # Language - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:language/lan:LanguageCode) with enhanced debugging
+        logger.debug("  [LANGUAGE] Starting language extraction...")
         locale_elem = find_element_by_tag_suffix(root, 'defaultLocale')
         if locale_elem is not None:
+            logger.debug(f"  [LANGUAGE] Found defaultLocale element")
             # Navigate to LanguageCode and extract codeListValue attribute
+            lang_found = False
             for elem in locale_elem.iter():
+                logger.debug(f"  [LANGUAGE] Checking element: {elem.tag}")
                 if elem.tag.endswith('}LanguageCode'):
+                    logger.debug(f"  [LANGUAGE] Found LanguageCode element, attributes: {elem.attrib}")
                     lang_code = get_attribute_value(elem, 'codeListValue')
                     if lang_code:
                         metadata['language'] = lang_code
-                        if verbose:
-                            logger.debug(f"    Language: {lang_code}")
+                        logger.debug(f"  [LANGUAGE] ✓ Extracted language: {lang_code}")
+                        lang_found = True
                         break
+            if not lang_found:
+                logger.debug(f"  [LANGUAGE] ✗ No LanguageCode with codeListValue found in defaultLocale")
+        else:
+            logger.debug(f"  [LANGUAGE] ✗ No defaultLocale element found")
         
         # Fallback: try identification info level
         if not metadata['language']:
+            logger.debug(f"  [LANGUAGE] Trying fallback patterns...")
             for pattern in [
                 ['identificationInfo', 'MD_DataIdentification', 'language'],
                 ['identificationInfo', 'language']
@@ -454,45 +470,62 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                 lang_text = extract_field_by_path(root, pattern)
                 if lang_text:
                     metadata['language'] = lang_text
-                    if verbose:
-                        logger.debug(f"    Language (fallback): {lang_text}")
+                    logger.debug(f"  [LANGUAGE] ✓ Found via fallback: {lang_text}")
                     break
         
-        # Character Set - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:characterEncoding)
+        # Character Set - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:characterEncoding) with enhanced debugging
+        logger.debug("  [CHARSET] Starting character set extraction...")
         if locale_elem is not None:
+            charset_found = False
             for elem in locale_elem.iter():
+                logger.debug(f"  [CHARSET] Checking element: {elem.tag}")
                 if elem.tag.endswith('}MD_CharacterSetCode'):
+                    logger.debug(f"  [CHARSET] Found MD_CharacterSetCode element, attributes: {elem.attrib}")
                     charset_code = get_attribute_value(elem, 'codeListValue')
                     if charset_code:
                         metadata['character_set'] = charset_code
-                        if verbose:
-                            logger.debug(f"    Charset: {charset_code}")
+                        logger.debug(f"  [CHARSET] ✓ Extracted charset: {charset_code}")
+                        charset_found = True
                         break
+            if not charset_found:
+                logger.debug(f"  [CHARSET] ✗ No MD_CharacterSetCode with codeListValue found in defaultLocale")
+        else:
+            logger.debug(f"  [CHARSET] Skipping (no defaultLocale element)")
         
         # Fallback for character set
         if not metadata['character_set']:
+            logger.debug(f"  [CHARSET] Trying fallback - searching entire document...")
             charset_elem = find_element_by_tag_suffix(root, 'MD_CharacterSetCode')
             if charset_elem is not None:
+                logger.debug(f"  [CHARSET] Found MD_CharacterSetCode in document, attributes: {charset_elem.attrib}")
                 charset_code = get_attribute_value(charset_elem, 'codeListValue')
                 if not charset_code:
                     charset_code = get_element_text(charset_elem)
                 if charset_code:
                     metadata['character_set'] = charset_code
-                    if verbose:
-                        logger.debug(f"    Charset (fallback): {charset_code}")
+                    logger.debug(f"  [CHARSET] ✓ Found via fallback: {charset_code}")
+            else:
+                logger.debug(f"  [CHARSET] ✗ No MD_CharacterSetCode found anywhere")
         
-        # Status - Extract from MD_ProgressCode element's codeListValue attribute
+        # Status - Extract from MD_ProgressCode element's codeListValue attribute with enhanced debugging
+        logger.debug("  [STATUS] Starting status extraction...")
         status_elem = find_element_by_tag_suffix(root, 'MD_ProgressCode')
         if status_elem is not None:
+            logger.debug(f"  [STATUS] Found MD_ProgressCode element, attributes: {status_elem.attrib}")
             # Try to get codeListValue attribute first
             status_code = get_attribute_value(status_elem, 'codeListValue')
-            if not status_code:
+            if status_code:
+                logger.debug(f"  [STATUS] ✓ Extracted from codeListValue: {status_code}")
+            else:
                 # Fallback to element text
+                logger.debug(f"  [STATUS] No codeListValue, trying element text...")
                 status_code = get_element_text(status_elem)
+                if status_code:
+                    logger.debug(f"  [STATUS] ✓ Extracted from element text: {status_code}")
             if status_code:
                 metadata['status'] = status_code
-                if verbose:
-                    logger.debug(f"    Status: {status_code}")
+        else:
+            logger.debug(f"  [STATUS] ✗ No MD_ProgressCode element found")
         
         # === DATES ===
         
@@ -579,6 +612,12 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         
         fields_extracted = sum(1 for v in metadata.values() if v is not None)
         logger.info(f"  ✓ XML parsing completed: {fields_extracted} fields extracted")
+        
+        # Log which problematic fields were extracted
+        logger.debug(f"  [SUMMARY] language: {metadata.get('language')}")
+        logger.debug(f"  [SUMMARY] character_set: {metadata.get('character_set')}")
+        logger.debug(f"  [SUMMARY] status: {metadata.get('status')}")
+        logger.debug(f"  [SUMMARY] lineage: {metadata.get('lineage')[:50] + '...' if metadata.get('lineage') else None}")
         
         if not metadata.get('uuid'):
             logger.warning(f"  ⚠ No UUID - record cannot be inserted (missing PRIMARY KEY)")
@@ -707,7 +746,7 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     
     # Build SQL with all possible fields
     fields = [
-        'uuid', 'title', 'dataset_name', 'dataset_path',  # CHANGED: aodn_uuid -> uuid
+        'uuid', 'title', 'dataset_name', 'dataset_path',
         'abstract', 'credit', 'supplemental_info', 'lineage',
         'use_limitation', 'license_url', 'topic_category', 'language',
         'character_set', 'status', 'metadata_creation_date',
@@ -720,7 +759,6 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
     field_names = ', '.join(fields)
     
     if force:
-        # CHANGED: Conflict on dataset_path, update uuid if changed
         update_set = ', '.join([f"{field} = EXCLUDED.{field}" for field in fields if field != 'dataset_path'])
         insert_sql = f"""
         INSERT INTO metadata ({field_names})
@@ -751,6 +789,12 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                 continue
             
             logger.info(f"[{idx}/{len(datasets)}] Inserting: {dataset.get('title', 'Unknown')[:60]}...")
+            
+            # Log the values being inserted for problematic fields
+            logger.debug(f"  [DB INSERT] language: {dataset.get('language')}")
+            logger.debug(f"  [DB INSERT] character_set: {dataset.get('character_set')}")
+            logger.debug(f"  [DB INSERT] status: {dataset.get('status')}")
+            logger.debug(f"  [DB INSERT] lineage: {dataset.get('lineage')[:50] + '...' if dataset.get('lineage') else None}")
             
             # Prepare values tuple
             values = []
@@ -810,7 +854,7 @@ def verify_population(conn):
     # Check field population stats
     fields_to_check = [
         'abstract', 'credit', 'lineage', 'topic_category',
-        'language', 'status', 'time_start', 'time_end'
+        'language', 'character_set', 'status', 'time_start', 'time_end'
     ]
     
     logger.info(f"\nField population statistics:")
