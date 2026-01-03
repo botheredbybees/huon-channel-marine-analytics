@@ -2,8 +2,8 @@
 -- Huon Channel Marine Analytics - Database Initialization Script (PostGIS-Free)
 -- =============================================================================
 -- Purpose: Creates PostgreSQL database schema for AODN marine data
--- Version: 3.2 (Pure PostgreSQL - no PostGIS, removed uuid field)
--- Last Updated: January 1, 2026
+-- Version: 3.3 (Pure PostgreSQL - no PostGIS, uuid field with AODN/generated values)
+-- Last Updated: January 4, 2026
 --
 -- IMPORTANT NOTES:
 -- 1. Removed ALL PostGIS dependencies (GEOMETRY, ST_* functions, BOX2D, GIST on geometry)
@@ -11,8 +11,8 @@
 -- 3. Compatible with timescale/timescaledb:latest-pg18 (Community license)
 -- 4. All spatial queries work with DECIMAL bbox columns
 -- 5. TimescaleDB hypertable enabled for measurements table
--- 6. Removed confusing 'uuid' field - now using aodn_uuid for AODN catalog IDs
--- 7. dataset_path is now the primary stable identifier for upserts
+-- 6. uuid field contains AODN UUID when available, generated UUID as fallback
+-- 7. dataset_path is UNIQUE for stable upsert operations
 -- =============================================================================
 
 -- Enable extensions (NO PostGIS)
@@ -150,7 +150,8 @@ CREATE INDEX IF NOT EXISTS idx_locations_lat_lon_partial
 
 -- =============================================================================
 -- METADATA TABLES (normalized structure for 38+ IMOS datasets)
--- CHANGED: Removed uuid field, made dataset_path UNIQUE NOT NULL
+-- uuid field: Contains AODN UUID when available, generated UUID as fallback
+-- dataset_path: UNIQUE constraint for stable upsert operations
 -- =============================================================================
 
 CREATE TABLE metadata (
@@ -185,24 +186,28 @@ CREATE TABLE metadata (
   distribution_portal_url TEXT,
   distribution_publication_url TEXT,
   dataset_name TEXT,
-  dataset_path TEXT UNIQUE,  -- For upsert conflict detection
+  dataset_path TEXT UNIQUE NOT NULL,  -- For upsert conflict detection
   extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  date_created DATE,
-  
-  -- PostGIS spatial extent (unlocks spatial queries)
-  extent_geom GEOMETRY(POLYGON, 4326),
-  
-  -- Materialized bounding box for non-spatial queries
-  bbox_envelope BOX2D GENERATED ALWAYS AS (BOX2D(extent_geom)) STORED
+  date_created DATE
 );
 
 -- Metadata indexes (pure PostgreSQL)
-CREATE INDEX IF NOT EXISTS idx_metadata_aodn_uuid ON metadata(aodn_uuid)
-  WHERE aodn_uuid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_metadata_uuid ON metadata(uuid);
 CREATE INDEX IF NOT EXISTS idx_metadata_bbox ON metadata(west, east, south, north);
 CREATE INDEX IF NOT EXISTS idx_metadata_time ON metadata(time_start, time_end);
 CREATE INDEX IF NOT EXISTS idx_metadata_dataset_name ON metadata(dataset_name);
 CREATE INDEX IF NOT EXISTS idx_metadata_dataset_path ON metadata(dataset_path);
+
+-- Add unique constraint on dataset_path (idempotent)
+DO $$ 
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint 
+    WHERE conname = 'metadata_dataset_path_unique'
+  ) THEN
+    ALTER TABLE metadata ADD CONSTRAINT metadata_dataset_path_unique UNIQUE (dataset_path);
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS public.spatial_ref_system (
   id SERIAL PRIMARY KEY,
@@ -263,6 +268,7 @@ CREATE TABLE IF NOT EXISTS measurements (
   time TIMESTAMPTZ NOT NULL,
   data_id BIGSERIAL,
   metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
+  uuid TEXT REFERENCES metadata(uuid) ON DELETE CASCADE,
   parameter_code TEXT NOT NULL,
   namespace TEXT NOT NULL DEFAULT 'custom',
   value DOUBLE PRECISION NOT NULL,
@@ -276,6 +282,7 @@ CREATE TABLE IF NOT EXISTS measurements (
 
 COMMENT ON TABLE measurements IS 'Timeseries measurements (quality-controlled only, QC columns removed Dec 2025)';
 COMMENT ON COLUMN measurements.quality_flag IS 'IMOS QC flag: 1=good, 2=probably good (only values 1-2 stored)';
+COMMENT ON COLUMN measurements.uuid IS 'Links to metadata.uuid (contains AODN UUID or generated UUID)';
 
 -- Create hypertable ONLY if not already created
 DO $$
@@ -290,7 +297,6 @@ END $$;
 
 -- Primary key (safe idempotent version)
 CREATE UNIQUE INDEX IF NOT EXISTS measurements_pkey ON measurements (time, data_id);
-
 
 -- Enable compression
 ALTER TABLE IF EXISTS measurements SET (timescaledb.compress = true, timescaledb.compress_segmentby = 'parameter_code, namespace');
@@ -308,6 +314,7 @@ CREATE INDEX IF NOT EXISTS idx_measurements_location_time ON measurements (locat
   WHERE location_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_measurements_namespace ON measurements (namespace);
 CREATE INDEX IF NOT EXISTS idx_measurements_metadata_id ON measurements (metadata_id);
+CREATE INDEX IF NOT EXISTS idx_measurements_uuid ON measurements (uuid);
 CREATE INDEX IF NOT EXISTS idx_measurements_time_brin ON measurements USING BRIN (time);
 CREATE INDEX IF NOT EXISTS idx_measurements_param_gin ON measurements USING GIN (to_tsvector('english', parameter_code));
 CREATE INDEX IF NOT EXISTS idx_measurements_good_data ON measurements (time DESC, parameter_code)
@@ -349,7 +356,6 @@ SELECT add_continuous_aggregate_policy('measurements_1d',
   end_offset => INTERVAL '1 day',
   schedule_interval => INTERVAL '1 day');
 
-
 -- =============================================================================
 -- VIEWS FOR GRAFANA & ANALYSIS (Pure PostgreSQL - no PostGIS)
 -- =============================================================================
@@ -361,11 +367,12 @@ SELECT
   m.uncertainty, m.depth_m, m.location_id, m.quality_flag,
   md.title AS dataset_title,
   md.dataset_name,
+  md.uuid,
   p.parameter_label,
   p.unit_name,
   md.west, md.east, md.south, md.north
 FROM measurements m
-LEFT JOIN metadata md ON m.metadata_id = md.id
+LEFT JOIN metadata md ON m.uuid = md.uuid
 LEFT JOIN parameters p ON md.id = p.metadata_id AND m.parameter_code = p.parameter_code;
 
 DROP VIEW IF EXISTS datasets_by_parameter CASCADE;
@@ -444,7 +451,6 @@ SELECT
 FROM measurements
 GROUP BY parameter_code;
 
-
 -- =============================================================================
 -- SPATIAL & BIOLOGICAL FEATURES (Pure PostgreSQL - lat/lon)
 -- =============================================================================
@@ -511,20 +517,19 @@ EXCEPTION
   WHEN undefined_table THEN NULL; 
 END $$;
 
-
 GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO marine_user;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO marine_user;
 
 -- =============================================================================
--- DATABASE STATISTICS (Post-Cleanup, January 1, 2026)
+-- DATABASE STATISTICS (Post-Update, January 4, 2026)
 -- =============================================================================
--- Schema Version: 3.2 (Pure PostgreSQL, no PostGIS, removed uuid field)
+-- Schema Version: 3.3 (Pure PostgreSQL, no PostGIS)
+-- uuid field: Contains AODN UUID when available, generated UUID as fallback
 -- Total measurements capacity: 12M+ (quality-controlled)
 -- Unique parameters: 125+
 -- Datasets: 38+
 -- Compatible with: timescale/timescaledb:latest-pg18 (Community license)
--- CHANGED: Removed uuid field, aodn_uuid is now sole AODN identifier
--- dataset_path is primary stable identifier for upserts
+-- dataset_path: UNIQUE constraint for stable upsert operations
 -- =============================================================================
 
 VACUUM ANALYZE;
