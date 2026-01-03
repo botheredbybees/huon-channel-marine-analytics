@@ -12,13 +12,15 @@ Enhanced with:
 - AODN UUID extraction from XML metadataIdentifier (ISO 19115-3)
 - Fallback to fileIdentifier (ISO 19115-1) and directory structure
 - Namespace-agnostic XML parsing for ISO 19115-1 and ISO 19115-3
-- Extraction of 20+ metadata fields:
-  * Descriptive: abstract, credit, supplemental_info, lineage
+- Extraction of 30+ metadata fields including:
+  * Descriptive: abstract, credit (multiple), supplemental_info, lineage
   * Constraints: use_limitation, license_url
   * Classification: topic_category, language, character_set, status
   * Dates: metadata_creation_date, metadata_revision_date, citation_date
   * Temporal: time_start, time_end
   * Spatial: west, east, south, north (bounding box)
+  * Distribution: wfs_url, wms_url, portal_url, publication_url
+  * Relationships: parent_uuid
 - File-based debug logging to logs/ directory
 - Detailed progress tracking with console and file output separation
 - Better error handling and reporting
@@ -178,6 +180,15 @@ def find_element_by_tag_suffix(root, tag_suffix: str):
     return None
 
 
+def find_all_elements_by_tag_suffix(root, tag_suffix: str):
+    """Find all elements whose tag ends with the given suffix (namespace-agnostic)."""
+    found = []
+    for elem in root.iter():
+        if elem.tag.endswith('}' + tag_suffix) or elem.tag == tag_suffix:
+            found.append(elem)
+    return found
+
+
 def get_element_text(element) -> Optional[str]:
     """Extract text from element, checking both direct text and gco:CharacterString/gco:Decimal children."""
     if element is None:
@@ -197,7 +208,7 @@ def get_element_text(element) -> Optional[str]:
 
 
 def get_attribute_value(element, attribute_name: str) -> Optional[str]:
-    """Extract attribute value from element (e.g., codeListValue)."""
+    """Extract attribute value from element (e.g., codeListValue, uuidref)."""
     if element is None:
         return None
     
@@ -276,6 +287,33 @@ def extract_uuid_from_xml(xml_path: Path) -> Optional[str]:
         return None
 
 
+def extract_parent_uuid(root) -> Optional[str]:
+    """
+    Extract parent metadata UUID from mdb:parentMetadata element.
+    
+    Args:
+        root: XML root element
+        
+    Returns:
+        Parent UUID string or None if not found
+    """
+    uuid_pattern = re.compile(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+        re.IGNORECASE
+    )
+    
+    parent_elem = find_element_by_tag_suffix(root, 'parentMetadata')
+    if parent_elem is not None:
+        # Try uuidref attribute
+        parent_uuid = get_attribute_value(parent_elem, 'uuidref')
+        if parent_uuid and uuid_pattern.match(parent_uuid):
+            logger.debug(f"  [PARENT_UUID] ✓ Found: {parent_uuid}")
+            return parent_uuid
+    
+    logger.debug(f"  [PARENT_UUID] ✗ Not found")
+    return None
+
+
 def extract_field_by_path(root, path_components: List[str]) -> Optional[str]:
     """
     Extract field by navigating through path components (namespace-agnostic).
@@ -302,19 +340,84 @@ def extract_field_by_path(root, path_components: List[str]) -> Optional[str]:
     return get_element_text(current)
 
 
+def extract_distribution_urls(root) -> Dict[str, Optional[str]]:
+    """
+    Extract distribution URLs from distributionInfo/transferOptions/onLine elements.
+    
+    Looks for:
+    - WFS: protocol contains "OGC:WFS"
+    - WMS: protocol contains "OGC:WMS"
+    - Portal: protocol contains "WWW:LINK-1.0-http--portal"
+    - Publication: protocol contains "WWW:LINK-1.0-http--publication"
+    
+    Args:
+        root: XML root element
+        
+    Returns:
+        Dictionary with distribution URLs
+    """
+    urls = {
+        'distribution_wfs_url': None,
+        'distribution_wms_url': None,
+        'distribution_portal_url': None,
+        'distribution_publication_url': None
+    }
+    
+    logger.debug("  [DISTRIBUTION] Starting URL extraction...")
+    
+    # Find all CI_OnlineResource elements
+    online_resources = find_all_elements_by_tag_suffix(root, 'CI_OnlineResource')
+    logger.debug(f"  [DISTRIBUTION] Found {len(online_resources)} CI_OnlineResource elements")
+    
+    for resource in online_resources:
+        protocol = None
+        linkage = None
+        
+        # Extract protocol and linkage
+        for child in resource.iter():
+            if child.tag.endswith('}protocol'):
+                protocol = get_element_text(child)
+            elif child.tag.endswith('}linkage'):
+                linkage = get_element_text(child)
+        
+        if protocol and linkage:
+            logger.debug(f"  [DISTRIBUTION] Checking protocol: {protocol[:50]}...")
+            
+            # Match protocol to URL type
+            if 'OGC:WFS' in protocol and not urls['distribution_wfs_url']:
+                urls['distribution_wfs_url'] = linkage
+                logger.debug(f"  [DISTRIBUTION] ✓ WFS URL: {linkage}")
+            elif 'OGC:WMS' in protocol and not urls['distribution_wms_url']:
+                urls['distribution_wms_url'] = linkage
+                logger.debug(f"  [DISTRIBUTION] ✓ WMS URL: {linkage}")
+            elif 'WWW:LINK-1.0-http--portal' in protocol and not urls['distribution_portal_url']:
+                urls['distribution_portal_url'] = linkage
+                logger.debug(f"  [DISTRIBUTION] ✓ Portal URL: {linkage}")
+            elif 'WWW:LINK-1.0-http--publication' in protocol and not urls['distribution_publication_url']:
+                urls['distribution_publication_url'] = linkage
+                logger.debug(f"  [DISTRIBUTION] ✓ Publication URL: {linkage}")
+    
+    found_count = sum(1 for v in urls.values() if v is not None)
+    logger.debug(f"  [DISTRIBUTION] Extracted {found_count}/4 distribution URLs")
+    
+    return urls
+
+
 def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
     """Parse ISO 19115 XML metadata file with namespace-agnostic element matching."""
     logger.info(f"Parsing XML: {xml_path.name}")
     logger.debug(f"  Full path: {xml_path}")
     
     metadata = {
-        'uuid': None, 'title': None, 'abstract': None, 'credit': None,
+        'uuid': None, 'parent_uuid': None, 'title': None, 'abstract': None, 'credit': None,
         'supplemental_info': None, 'lineage': None, 'use_limitation': None,
         'license_url': None, 'topic_category': None, 'language': None,
         'character_set': None, 'status': None, 'metadata_creation_date': None,
         'metadata_revision_date': None, 'citation_date': None,
         'west': None, 'east': None, 'south': None, 'north': None,
-        'time_start': None, 'time_end': None
+        'time_start': None, 'time_end': None,
+        'distribution_wfs_url': None, 'distribution_wms_url': None,
+        'distribution_portal_url': None, 'distribution_publication_url': None
     }
     
     try:
@@ -333,6 +436,12 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         else:
             metadata['uuid'] = None
             logger.warning("  ⚠ No UUID found - uuid will be NULL")
+        
+        # Extract parent UUID
+        parent_uuid = extract_parent_uuid(root)
+        if parent_uuid:
+            metadata['parent_uuid'] = parent_uuid
+            logger.info(f"  ✓ Parent UUID: {metadata['parent_uuid']}")
         
         # Title - navigate through identificationInfo -> citation -> title
         for base_patterns in [
@@ -359,17 +468,22 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     logger.debug(f"    Abstract: {abstract_text[:80]}...")
                 break
         
-        # Credit
-        for pattern in [
-            ['identificationInfo', 'MD_DataIdentification', 'credit'],
-            ['identificationInfo', 'credit']
-        ]:
-            credit_text = extract_field_by_path(root, pattern)
-            if credit_text:
-                metadata['credit'] = credit_text
-                if verbose:
-                    logger.debug(f"    Credit: {credit_text[:80]}...")
-                break
+        # Credit - ENHANCED: Extract all credit elements and concatenate
+        logger.debug("  [CREDIT] Starting credit extraction...")
+        credit_elements = find_all_elements_by_tag_suffix(root, 'credit')
+        if credit_elements:
+            credits = []
+            for elem in credit_elements:
+                credit_text = get_element_text(elem)
+                if credit_text:
+                    credits.append(credit_text)
+                    logger.debug(f"  [CREDIT] Found: {credit_text[:50]}...")
+            
+            if credits:
+                metadata['credit'] = "; ".join(credits)
+                logger.debug(f"  [CREDIT] ✓ Concatenated {len(credits)} credit entries")
+        else:
+            logger.debug(f"  [CREDIT] ✗ No credit elements found")
         
         # Supplemental Information
         for pattern in [
@@ -383,7 +497,7 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     logger.debug(f"    Supplemental: {supp_text[:80]}...")
                 break
         
-        # Lineage - AT METADATA LEVEL (mdb:resourceLineage) with enhanced debugging
+        # Lineage - AT METADATA LEVEL (mdb:resourceLineage)
         logger.debug("  [LINEAGE] Starting lineage extraction...")
         lineage_found = False
         for pattern in [
@@ -406,6 +520,7 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         
         # Use limitation
         for pattern in [
+            ['identificationInfo', 'MD_DataIdentification', 'resourceConstraints', 'MD_Constraints', 'useLimitation'],
             ['identificationInfo', 'MD_DataIdentification', 'resourceConstraints', 'MD_LegalConstraints', 'useLimitation'],
             ['identificationInfo', 'resourceConstraints', 'useLimitation']
         ]:
@@ -416,17 +531,45 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     logger.debug(f"    Use limitation: {use_lim_text[:80]}...")
                 break
         
-        # License URL (from otherConstraints)
-        for pattern in [
-            ['identificationInfo', 'MD_DataIdentification', 'resourceConstraints', 'MD_LegalConstraints', 'otherConstraints'],
-            ['identificationInfo', 'resourceConstraints', 'otherConstraints']
-        ]:
-            license_text = extract_field_by_path(root, pattern)
-            if license_text and 'http' in license_text:
-                metadata['license_url'] = license_text
-                if verbose:
-                    logger.debug(f"    License URL: {license_text}")
+        # License URL - ENHANCED: Look in onlineResource within MD_LegalConstraints
+        logger.debug("  [LICENSE] Starting license URL extraction...")
+        license_found = False
+        
+        # Find all MD_LegalConstraints elements
+        legal_constraints = find_all_elements_by_tag_suffix(root, 'MD_LegalConstraints')
+        for constraint in legal_constraints:
+            # Look for reference/onlineResource with "License" in description
+            for child in constraint.iter():
+                if child.tag.endswith('}onlineResource') or child.tag.endswith('}CI_OnlineResource'):
+                    linkage = None
+                    description = None
+                    
+                    for online_child in child.iter():
+                        if online_child.tag.endswith('}linkage'):
+                            linkage = get_element_text(online_child)
+                        elif online_child.tag.endswith('}description'):
+                            description = get_element_text(online_child)
+                    
+                    if linkage and description and 'license' in description.lower():
+                        metadata['license_url'] = linkage
+                        logger.debug(f"  [LICENSE] ✓ Found via onlineResource: {linkage}")
+                        license_found = True
+                        break
+            
+            if license_found:
                 break
+        
+        # Fallback: try otherConstraints
+        if not license_found:
+            for pattern in [
+                ['identificationInfo', 'MD_DataIdentification', 'resourceConstraints', 'MD_LegalConstraints', 'otherConstraints'],
+                ['identificationInfo', 'resourceConstraints', 'otherConstraints']
+            ]:
+                license_text = extract_field_by_path(root, pattern)
+                if license_text and 'http' in license_text:
+                    metadata['license_url'] = license_text
+                    logger.debug(f"  [LICENSE] ✓ Found via otherConstraints: {license_text}")
+                    break
         
         # === CLASSIFICATION ===
         
@@ -439,15 +582,13 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                 if verbose:
                     logger.debug(f"    Topic: {topic_text}")
         
-        # Language - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:language/lan:LanguageCode) with enhanced debugging
+        # Language - AT METADATA LEVEL (mdb:defaultLocale)
         logger.debug("  [LANGUAGE] Starting language extraction...")
         locale_elem = find_element_by_tag_suffix(root, 'defaultLocale')
         if locale_elem is not None:
             logger.debug(f"  [LANGUAGE] Found defaultLocale element")
-            # Navigate to LanguageCode and extract codeListValue attribute
             lang_found = False
             for elem in locale_elem.iter():
-                logger.debug(f"  [LANGUAGE] Checking element: {elem.tag}")
                 if elem.tag.endswith('}LanguageCode'):
                     logger.debug(f"  [LANGUAGE] Found LanguageCode element, attributes: {elem.attrib}")
                     lang_code = get_attribute_value(elem, 'codeListValue')
@@ -457,7 +598,7 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                         lang_found = True
                         break
             if not lang_found:
-                logger.debug(f"  [LANGUAGE] ✗ No LanguageCode with codeListValue found in defaultLocale")
+                logger.debug(f"  [LANGUAGE] ✗ No LanguageCode with codeListValue found")
         else:
             logger.debug(f"  [LANGUAGE] ✗ No defaultLocale element found")
         
@@ -474,14 +615,13 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     logger.debug(f"  [LANGUAGE] ✓ Found via fallback: {lang_text}")
                     break
         
-        # Character Set - AT METADATA LEVEL (mdb:defaultLocale/lan:PT_Locale/lan:characterEncoding) with enhanced debugging
+        # Character Set - AT METADATA LEVEL
         logger.debug("  [CHARSET] Starting character set extraction...")
         if locale_elem is not None:
             charset_found = False
             for elem in locale_elem.iter():
-                logger.debug(f"  [CHARSET] Checking element: {elem.tag}")
                 if elem.tag.endswith('}MD_CharacterSetCode'):
-                    logger.debug(f"  [CHARSET] Found MD_CharacterSetCode element, attributes: {elem.attrib}")
+                    logger.debug(f"  [CHARSET] Found MD_CharacterSetCode, attributes: {elem.attrib}")
                     charset_code = get_attribute_value(elem, 'codeListValue')
                     if charset_code:
                         metadata['character_set'] = charset_code
@@ -489,37 +629,31 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                         charset_found = True
                         break
             if not charset_found:
-                logger.debug(f"  [CHARSET] ✗ No MD_CharacterSetCode with codeListValue found in defaultLocale")
+                logger.debug(f"  [CHARSET] ✗ No MD_CharacterSetCode with codeListValue found")
         else:
             logger.debug(f"  [CHARSET] Skipping (no defaultLocale element)")
         
         # Fallback for character set
         if not metadata['character_set']:
-            logger.debug(f"  [CHARSET] Trying fallback - searching entire document...")
+            logger.debug(f"  [CHARSET] Trying fallback...")
             charset_elem = find_element_by_tag_suffix(root, 'MD_CharacterSetCode')
             if charset_elem is not None:
-                logger.debug(f"  [CHARSET] Found MD_CharacterSetCode in document, attributes: {charset_elem.attrib}")
                 charset_code = get_attribute_value(charset_elem, 'codeListValue')
                 if not charset_code:
                     charset_code = get_element_text(charset_elem)
                 if charset_code:
                     metadata['character_set'] = charset_code
                     logger.debug(f"  [CHARSET] ✓ Found via fallback: {charset_code}")
-            else:
-                logger.debug(f"  [CHARSET] ✗ No MD_CharacterSetCode found anywhere")
         
-        # Status - Extract from MD_ProgressCode element's codeListValue attribute with enhanced debugging
+        # Status
         logger.debug("  [STATUS] Starting status extraction...")
         status_elem = find_element_by_tag_suffix(root, 'MD_ProgressCode')
         if status_elem is not None:
-            logger.debug(f"  [STATUS] Found MD_ProgressCode element, attributes: {status_elem.attrib}")
-            # Try to get codeListValue attribute first
+            logger.debug(f"  [STATUS] Found MD_ProgressCode, attributes: {status_elem.attrib}")
             status_code = get_attribute_value(status_elem, 'codeListValue')
             if status_code:
                 logger.debug(f"  [STATUS] ✓ Extracted from codeListValue: {status_code}")
             else:
-                # Fallback to element text
-                logger.debug(f"  [STATUS] No codeListValue, trying element text...")
                 status_code = get_element_text(status_elem)
                 if status_code:
                     logger.debug(f"  [STATUS] ✓ Extracted from element text: {status_code}")
@@ -530,17 +664,44 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         
         # === DATES ===
         
-        # Metadata creation date
-        for pattern in [
-            ['dateStamp'],
-            ['dateInfo', 'CI_Date', 'date']
-        ]:
-            date_text = extract_field_by_path(root, pattern)
-            if date_text:
-                metadata['metadata_creation_date'] = normalize_date(date_text)
-                if verbose:
-                    logger.debug(f"    Creation date: {metadata['metadata_creation_date']}")
-                break
+        # Metadata dates - ENHANCED: Extract both creation and revision dates
+        logger.debug("  [DATES] Starting metadata date extraction...")
+        date_info_elements = find_all_elements_by_tag_suffix(root, 'dateInfo')
+        
+        for date_info in date_info_elements:
+            date_value = None
+            date_type = None
+            
+            # Extract date and dateType
+            for child in date_info.iter():
+                if child.tag.endswith('}date'):
+                    # Check if this is a DateTime element
+                    for date_child in child:
+                        if date_child.tag.endswith('}DateTime') or date_child.tag.endswith('}Date'):
+                            date_value = get_element_text(date_child)
+                            break
+                    if not date_value:
+                        date_value = get_element_text(child)
+                elif child.tag.endswith('}CI_DateTypeCode'):
+                    date_type = get_attribute_value(child, 'codeListValue')
+                    if not date_type:
+                        date_type = get_element_text(child)
+            
+            if date_value and date_type:
+                logger.debug(f"  [DATES] Found date: {date_value}, type: {date_type}")
+                if date_type == 'creation' and not metadata['metadata_creation_date']:
+                    metadata['metadata_creation_date'] = normalize_date(date_value)
+                    logger.debug(f"  [DATES] ✓ Creation date: {metadata['metadata_creation_date']}")
+                elif date_type == 'revision' and not metadata['metadata_revision_date']:
+                    metadata['metadata_revision_date'] = normalize_date(date_value)
+                    logger.debug(f"  [DATES] ✓ Revision date: {metadata['metadata_revision_date']}")
+        
+        # Fallback for metadata creation date
+        if not metadata['metadata_creation_date']:
+            date_stamp = extract_field_by_path(root, ['dateStamp'])
+            if date_stamp:
+                metadata['metadata_creation_date'] = normalize_date(date_stamp)
+                logger.debug(f"  [DATES] ✓ Creation date (from dateStamp): {metadata['metadata_creation_date']}")
         
         # Citation date
         for pattern in [
@@ -560,7 +721,6 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         if bbox_elem is not None:
             logger.debug("  Found bounding box element")
             
-            # Extract coordinates using namespace-agnostic search
             for coord_elem in bbox_elem:
                 tag = coord_elem.tag
                 value_text = get_element_text(coord_elem)
@@ -569,23 +729,19 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
                     try:
                         if tag.endswith('}westBoundLongitude') or tag == 'westBoundLongitude':
                             metadata['west'] = float(value_text)
-                            logger.debug(f"    westBoundLongitude: {value_text}")
                         elif tag.endswith('}eastBoundLongitude') or tag == 'eastBoundLongitude':
                             metadata['east'] = float(value_text)
-                            logger.debug(f"    eastBoundLongitude: {value_text}")
                         elif tag.endswith('}southBoundLatitude') or tag == 'southBoundLatitude':
                             metadata['south'] = float(value_text)
-                            logger.debug(f"    southBoundLatitude: {value_text}")
                         elif tag.endswith('}northBoundLatitude') or tag == 'northBoundLatitude':
                             metadata['north'] = float(value_text)
-                            logger.debug(f"    northBoundLatitude: {value_text}")
                     except ValueError as e:
                         logger.error(f"    Error converting coordinate {tag}: {e}")
             
             if all(metadata.get(c) is not None for c in ['west', 'east', 'south', 'north']):  
                 logger.info(f"  ✓ Bounding box: [{metadata['west']:.2f}, {metadata['east']:.2f}, {metadata['south']:.2f}, {metadata['north']:.2f}]")
             else:
-                logger.warning(f"  ⚠ Incomplete bounding box: W={metadata.get('west')}, E={metadata.get('east')}, S={metadata.get('south')}, N={metadata.get('north')}")
+                logger.warning(f"  ⚠ Incomplete bounding box")
         
         # === TEMPORAL EXTENT ===
         
@@ -593,10 +749,8 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         if temporal_elem is not None:
             logger.debug("  Found temporal extent element")
             
-            # Find TimePeriod element
             for elem in temporal_elem.iter():
                 if elem.tag.endswith('}TimePeriod'):
-                    # Extract begin and end positions
                     for child in elem:
                         text = get_element_text(child)
                         if text:
@@ -609,16 +763,15 @@ def parse_xml_metadata(xml_path: Path, verbose: bool = False) -> Dict:
         if metadata.get('time_start') or metadata.get('time_end'):
             logger.info(f"  ✓ Temporal extent: {metadata.get('time_start') or 'N/A'} to {metadata.get('time_end') or 'N/A'}")
         
+        # === DISTRIBUTION URLs ===
+        
+        distribution_urls = extract_distribution_urls(root)
+        metadata.update(distribution_urls)
+        
         # === SUMMARY ===
         
         fields_extracted = sum(1 for v in metadata.values() if v is not None)
         logger.info(f"  ✓ XML parsing completed: {fields_extracted} fields extracted")
-        
-        # Log which problematic fields were extracted
-        logger.debug(f"  [SUMMARY] language: {metadata.get('language')}")
-        logger.debug(f"  [SUMMARY] character_set: {metadata.get('character_set')}")
-        logger.debug(f"  [SUMMARY] status: {metadata.get('status')}")
-        logger.debug(f"  [SUMMARY] lineage: {metadata.get('lineage')[:50] + '...' if metadata.get('lineage') else None}")
         
         if not metadata.get('uuid'):
             logger.warning(f"  ⚠ No UUID - record cannot be inserted (missing PRIMARY KEY)")
@@ -678,23 +831,19 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
         logger.info(f"\n[{idx}/{len(subdirs)}] Processing: {dataset_dir.name}")
         
         try:
-            # Try to find and parse metadata.xml
             xml_path = find_metadata_xml(dataset_dir)
             
             if xml_path:
                 xml_metadata = parse_xml_metadata(xml_path, verbose=verbose)
                 
-                # Check if we got a UUID
                 if not xml_metadata.get('uuid'):
-                    logger.error(f"  ✗ Skipping dataset - no UUID found in XML or directory structure")
+                    logger.error(f"  ✗ Skipping dataset - no UUID found")
                     skipped_no_uuid += 1
                     continue
                 
-                # Use title from XML or fallback to directory name
                 title = xml_metadata.get('title') or dataset_dir.name
                 xml_metadata['title'] = title
                 
-                # Use bounding box from XML if complete, otherwise estimate
                 if all(xml_metadata.get(c) for c in ['west', 'east', 'south', 'north']):
                     logger.info(f"  Using bounding box from XML")
                 else:
@@ -702,13 +851,11 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
                     logger.info(f"  Using estimated bounding box")
                     xml_metadata.update(bbox)
                 
-                # Create dataset info with base fields
                 dataset_info = {
                     'dataset_name': clean_dataset_name(dataset_dir.name),
                     'dataset_path': str(dataset_dir),
                 }
                 
-                # Merge all metadata fields
                 dataset_info.update(xml_metadata)
             else:
                 logger.error(f"  ✗ Skipping dataset - no metadata.xml found")
@@ -719,12 +866,11 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
             logger.info(f"  File count: {file_count}")
             dataset_info['file_count'] = file_count
             
-            # Only add datasets with UUID and title
             if dataset_info.get('uuid') and dataset_info.get('title'):
                 datasets.append(dataset_info)
                 logger.info(f"  ✓ Dataset processed successfully")
             else:
-                logger.error(f"  ✗ Skipping dataset - missing required fields (UUID: {dataset_info.get('uuid')}, Title: {dataset_info.get('title')})")
+                logger.error(f"  ✗ Skipping dataset - missing required fields")
                 skipped_no_uuid += 1
         
         except Exception as e:
@@ -741,34 +887,36 @@ def scan_aodn_directory(base_path: str = 'AODN_data', verbose: bool = False) -> 
 
 
 def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
-    """Populate metadata table with column-specific updates to avoid FK violations."""
+    """Populate metadata table with all extracted fields."""
     logger.info(f"\nPopulating metadata (mode: {'UPDATE' if force else 'INSERT ONLY'})")
     cursor = conn.cursor()
     
-    # Fields for INSERT
+    # ALL fields including new distribution URLs and parent_uuid
     insert_fields = [
-        'uuid', 'title', 'dataset_name', 'dataset_path',
+        'uuid', 'parent_uuid', 'title', 'dataset_name', 'dataset_path',
         'abstract', 'credit', 'supplemental_info', 'lineage',
         'use_limitation', 'license_url', 'topic_category', 'language',
         'character_set', 'status', 'metadata_creation_date',
         'metadata_revision_date', 'citation_date',
         'west', 'east', 'south', 'north',
-        'time_start', 'time_end', 'extracted_at'
+        'time_start', 'time_end',
+        'distribution_wfs_url', 'distribution_wms_url',
+        'distribution_portal_url', 'distribution_publication_url',
+        'extracted_at'
     ]
     
     placeholders = ', '.join(['%s'] * len(insert_fields))
     field_names = ', '.join(insert_fields)
     
-    # INSERT statement for new records
     insert_sql = f"""
     INSERT INTO metadata ({field_names})
     VALUES ({placeholders})
     ON CONFLICT (dataset_path) DO NOTHING;
     """
     
-    # UPDATE statement for existing records - updates specific columns only
     update_sql = """
     UPDATE metadata SET
+        parent_uuid = %s,
         title = %s,
         dataset_name = %s,
         abstract = %s,
@@ -790,45 +938,40 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
         north = %s,
         time_start = %s,
         time_end = %s,
+        distribution_wfs_url = %s,
+        distribution_wms_url = %s,
+        distribution_portal_url = %s,
+        distribution_publication_url = %s,
         extracted_at = %s
     WHERE dataset_path = %s;
     """
     
-    # Check if record exists
     check_sql = "SELECT uuid FROM metadata WHERE dataset_path = %s;"
     
     inserted, updated, skipped, failed = 0, 0, 0, 0
     
     for idx, dataset in enumerate(datasets, 1):
         try:
-            # Generate UUID if AODN UUID not available
             if not dataset.get('uuid'):
                 dataset['uuid'] = str(uuid.uuid4())
-                logger.info(f"\n[{idx}/{len(datasets)}] Generated UUID (no AODN UUID): {dataset['uuid']}")
+                logger.info(f"\n[{idx}/{len(datasets)}] Generated UUID: {dataset['uuid']}")
             else:
                 logger.info(f"\n[{idx}/{len(datasets)}] Using AODN UUID: {dataset['uuid']}")
             
             if not dataset.get('dataset_path'):
-                logger.error(f"\n[{idx}/{len(datasets)}] ✗ Skipping - no dataset_path")
+                logger.error(f"  ✗ Skipping - no dataset_path")
                 failed += 1
                 continue
             
-            logger.info(f"[{idx}/{len(datasets)}] Processing: {dataset.get('title', 'Unknown')[:60]}...")
-            
-            # Log the values being inserted/updated for problematic fields
-            logger.debug(f"  [DB INSERT] language: {dataset.get('language')}")
-            logger.debug(f"  [DB INSERT] character_set: {dataset.get('character_set')}")
-            logger.debug(f"  [DB INSERT] status: {dataset.get('status')}")
-            logger.debug(f"  [DB INSERT] lineage: {dataset.get('lineage')[:50] + '...' if dataset.get('lineage') else None}")
+            logger.info(f"Processing: {dataset.get('title', 'Unknown')[:60]}...")
             
             if force:
-                # Check if record exists
                 cursor.execute(check_sql, (dataset.get('dataset_path'),))
                 exists = cursor.fetchone() is not None
                 
                 if exists:
-                    # Update existing record with specific columns
                     update_values = [
+                        dataset.get('parent_uuid'),
                         dataset.get('title'),
                         dataset.get('dataset_name'),
                         dataset.get('abstract'),
@@ -850,25 +993,27 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
                         dataset.get('north'),
                         dataset.get('time_start'),
                         dataset.get('time_end'),
+                        dataset.get('distribution_wfs_url'),
+                        dataset.get('distribution_wms_url'),
+                        dataset.get('distribution_portal_url'),
+                        dataset.get('distribution_publication_url'),
                         datetime.now(),
-                        dataset.get('dataset_path')  # WHERE clause
+                        dataset.get('dataset_path')
                     ]
                     
                     cursor.execute(update_sql, tuple(update_values))
                     updated += 1
-                    logger.info(f"  ✓ Updated existing record (preserving UUID and FK references)")
+                    logger.info(f"  ✓ Updated existing record")
                 else:
-                    # Insert new record
                     insert_values = [dataset.get(field, None) for field in insert_fields[:-1]]
-                    insert_values.append(datetime.now())  # extracted_at
+                    insert_values.append(datetime.now())
                     
                     cursor.execute(insert_sql, tuple(insert_values))
                     inserted += 1
                     logger.info(f"  ✓ Inserted new record")
             else:
-                # Insert only mode
                 insert_values = [dataset.get(field, None) for field in insert_fields[:-1]]
-                insert_values.append(datetime.now())  # extracted_at
+                insert_values.append(datetime.now())
                 
                 cursor.execute(insert_sql, tuple(insert_values))
                 
@@ -883,7 +1028,6 @@ def populate_metadata_table(conn, datasets: List[Dict], force: bool = False):
             conn.rollback()
             failed += 1
             logger.error(f"  ✗ Integrity error: {e}")
-            logger.error(f"  DETAIL: {e.pgerror}")
             
         except psycopg2.Error as e:
             conn.rollback()
@@ -915,10 +1059,12 @@ def verify_population(conn):
     total = cursor.fetchone()[0]
     logger.info(f"Total metadata records: {total}")
     
-    # Check field population stats
     fields_to_check = [
-        'abstract', 'credit', 'lineage', 'topic_category',
-        'language', 'character_set', 'status', 'time_start', 'time_end'
+        'parent_uuid', 'abstract', 'credit', 'lineage', 'topic_category',
+        'language', 'character_set', 'status', 'metadata_revision_date',
+        'time_start', 'time_end',
+        'distribution_wfs_url', 'distribution_wms_url',
+        'distribution_portal_url', 'distribution_publication_url'
     ]
     
     logger.info(f"\nField population statistics:")
@@ -926,12 +1072,14 @@ def verify_population(conn):
         cursor.execute(f"SELECT COUNT(*) FROM metadata WHERE {field} IS NOT NULL;")
         count = cursor.fetchone()[0]
         percentage = (count / total * 100) if total > 0 else 0
-        logger.info(f"  {field:25} : {count:3}/{total} ({percentage:5.1f}%)")
+        logger.info(f"  {field:30} : {count:3}/{total} ({percentage:5.1f}%)")
     
     cursor.execute("""
-        SELECT title, dataset_name, west, east, south, north, 
+        SELECT title, 
+               CASE WHEN parent_uuid IS NOT NULL THEN '✓' ELSE '✗' END as has_parent,
                CASE WHEN abstract IS NOT NULL THEN '✓' ELSE '✗' END as has_abstract,
-               CASE WHEN time_start IS NOT NULL THEN '✓' ELSE '✗' END as has_temporal
+               CASE WHEN distribution_wfs_url IS NOT NULL THEN '✓' ELSE '✗' END as has_wfs,
+               CASE WHEN distribution_portal_url IS NOT NULL THEN '✓' ELSE '✗' END as has_portal
         FROM metadata 
         ORDER BY title 
         LIMIT 5;
@@ -939,7 +1087,7 @@ def verify_population(conn):
     
     logger.info(f"\nSample records:")
     for row in cursor.fetchall():
-        logger.info(f"  {row[0][:30]:30} | [{row[2]:.1f}, {row[3]:.1f}, {row[4]:.1f}, {row[5]:.1f}] | Abstract:{row[6]} Temporal:{row[7]}")
+        logger.info(f"  {row[0][:40]:40} | Parent:{row[1]} Abstract:{row[2]} WFS:{row[3]} Portal:{row[4]}")
     
     cursor.close()
 
@@ -954,12 +1102,11 @@ def main():
     
     args = parser.parse_args()
     
-    # Initialize logger
     global logger
     logger = setup_logging(debug=args.debug)
     
     logger.info("="*60)
-    logger.info("METADATA POPULATION SCRIPT (XML UUID Extraction)")
+    logger.info("METADATA POPULATION SCRIPT - ENHANCED")
     logger.info("="*60)
     
     try:
