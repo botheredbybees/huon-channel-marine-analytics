@@ -7,6 +7,10 @@ Analyzes the relationship between:
 2. parameter_mappings table (standardized mappings)
 3. measurements table (actual data)
 
+Key Fix: Joins measurements -> parameter_mappings -> parameters
+to properly count measurements that use different naming conventions
+(e.g., both "temperature" and "TEMP" map to standard code "TEMP")
+
 Outputs to logs/ directory:
 - parameter_coverage.csv: Full analysis with mapping suggestions
 - unmeasured_parameters.csv: Parameters without measurements
@@ -134,19 +138,28 @@ def get_parameter_mappings(cursor):
         results.append(dict(zip(columns, row)))
     return results
 
-def get_measurement_counts(cursor):
+def get_measurement_counts_by_standard_code(cursor):
     """
-    Get count of measurements per parameter_code.
-    FIXED: measurements table uses parameter_code (TEXT), not parameter_id.
+    Get count of measurements grouped by standard_code.
+    
+    This joins measurements -> parameter_mappings to normalize
+    different naming conventions (e.g., "temperature" and "TEMP" both -> "TEMP")
+    
+    Returns dict of {standard_code: {count, first, last, raw_codes}}
     """
     cursor.execute("""
         SELECT 
-            parameter_code,
+            pm.standard_code,
             COUNT(*) as measurement_count,
-            MIN(time) as first_measurement,
-            MAX(time) as last_measurement
-        FROM measurements
-        GROUP BY parameter_code
+            MIN(m.time) as first_measurement,
+            MAX(m.time) as last_measurement,
+            array_agg(DISTINCT m.parameter_code) as raw_codes
+        FROM measurements m
+        LEFT JOIN parameter_mappings pm 
+            ON UPPER(m.parameter_code) = UPPER(pm.raw_parameter_name)
+        WHERE pm.standard_code IS NOT NULL
+        GROUP BY pm.standard_code
+        ORDER BY measurement_count DESC
     """)
     
     result = {}
@@ -154,8 +167,31 @@ def get_measurement_counts(cursor):
         result[row[0]] = {
             'count': row[1],
             'first': row[2],
-            'last': row[3]
+            'last': row[3],
+            'raw_codes': row[4] if row[4] else []
         }
+    return result
+
+def get_unmapped_measurements(cursor):
+    """
+    Get measurements that don't have a mapping in parameter_mappings.
+    These need to be added to parameter_mappings.
+    """
+    cursor.execute("""
+        SELECT 
+            m.parameter_code,
+            COUNT(*) as count
+        FROM measurements m
+        LEFT JOIN parameter_mappings pm 
+            ON UPPER(m.parameter_code) = UPPER(pm.raw_parameter_name)
+        WHERE pm.id IS NULL
+        GROUP BY m.parameter_code
+        ORDER BY count DESC
+    """)
+    
+    result = {}
+    for row in cursor.fetchall():
+        result[row[0]] = row[1]
     return result
 
 def analyze_parameter_coverage():
@@ -163,7 +199,7 @@ def analyze_parameter_coverage():
     Main analysis function.
     """
     print("="*80)
-    print("PARAMETER COVERAGE ANALYSIS")
+    print("PARAMETER COVERAGE ANALYSIS (v2.0 - Fixed)")
     print("="*80)
     
     conn = get_db_connection()
@@ -173,11 +209,16 @@ def analyze_parameter_coverage():
     print("\n📊 Fetching data...")
     parameters = get_parameters_with_metadata(cursor)
     mappings = get_parameter_mappings(cursor)
-    measurement_counts = get_measurement_counts(cursor)
+    measurement_counts = get_measurement_counts_by_standard_code(cursor)
+    unmapped_measurements = get_unmapped_measurements(cursor)
     
-    print(f"   Parameters: {len(parameters)}")
+    print(f"   Parameters (from metadata): {len(parameters)}")
     print(f"   Parameter Mappings: {len(mappings)}")
-    print(f"   Unique parameter codes with measurements: {len(measurement_counts)}")
+    print(f"   Standard codes with measurements: {len(measurement_counts)}")
+    
+    if unmapped_measurements:
+        print(f"   ⚠️  Unmapped measurement codes: {len(unmapped_measurements)}")
+        print(f"      (These need to be added to parameter_mappings table)")
     
     # Analyze each parameter
     print("\n🔍 Analyzing parameters...")
@@ -200,10 +241,6 @@ def analyze_parameter_coverage():
         param_id = param['id']
         param_code = param['parameter_code']
         
-        # Check if has measurements - using parameter_code now
-        has_measurements = param_code in measurement_counts
-        meas_info = measurement_counts.get(param_code, {})
-        
         # Find potential mappings
         potential_mappings = find_potential_mappings(
             param['parameter_code'],
@@ -213,6 +250,11 @@ def analyze_parameter_coverage():
         
         # Get best match
         best_mapping = potential_mappings[0] if potential_mappings else None
+        standard_code = best_mapping[2] if best_mapping else None
+        
+        # Check if this standard code has measurements
+        has_measurements = standard_code in measurement_counts if standard_code else False
+        meas_info = measurement_counts.get(standard_code, {}) if standard_code else {}
         
         # Build coverage record
         record = {
@@ -223,13 +265,14 @@ def analyze_parameter_coverage():
             'aodn_uri': param['aodn_parameter_uri'] or '',
             'dataset_name': param['dataset_name'],
             'dataset_uuid': param['uuid'],
+            'suggested_mapping': best_mapping[2] if best_mapping else '',
+            'mapping_confidence': best_mapping[3] if best_mapping else '',
+            'mapping_id': best_mapping[0] if best_mapping else '',
             'has_measurements': 'YES' if has_measurements else 'NO',
             'measurement_count': meas_info.get('count', 0),
             'first_measurement': str(meas_info.get('first', '')),
             'last_measurement': str(meas_info.get('last', '')),
-            'suggested_mapping': best_mapping[2] if best_mapping else '',
-            'mapping_confidence': best_mapping[3] if best_mapping else '',
-            'mapping_id': best_mapping[0] if best_mapping else ''
+            'raw_measurement_codes': ','.join(meas_info.get('raw_codes', []))
         }
         
         coverage_data.append(record)
@@ -294,6 +337,10 @@ def analyze_parameter_coverage():
         writer.writerow(['With AODN URI', stats['with_aodn_uri']])
         writer.writerow(['With Mapping Suggestion', stats['with_mapping_suggestion']])
         writer.writerow([])
+        writer.writerow(['Standard Codes with Measurements', ''])
+        for std_code, info in sorted(measurement_counts.items(), key=lambda x: x[1]['count'], reverse=True):
+            writer.writerow([std_code, info['count'], f"Raw codes: {','.join(info['raw_codes'])}"])
+        writer.writerow([])
         writer.writerow(['Top Parameters by Occurrence', ''])
         for param_code, count in sorted(stats['by_parameter_code'].items(), 
                                        key=lambda x: x[1], reverse=True)[:20]:
@@ -303,6 +350,13 @@ def analyze_parameter_coverage():
         for dataset, count in sorted(stats['by_dataset'].items(), 
                                     key=lambda x: x[1], reverse=True):
             writer.writerow([dataset[:60], count])
+        
+        if unmapped_measurements:
+            writer.writerow([])
+            writer.writerow(['Unmapped Measurement Codes (Need to add to parameter_mappings)', ''])
+            for code, count in sorted(unmapped_measurements.items(), key=lambda x: x[1], reverse=True):
+                writer.writerow([code, count])
+    
     print(f"   ✅ {stats_file}")
     
     # Print summary to console
@@ -315,10 +369,19 @@ def analyze_parameter_coverage():
     print(f"With AODN parameter URI:       {stats['with_aodn_uri']}")
     print(f"With mapping suggestions:      {stats['with_mapping_suggestion']}")
     
-    print("\n🔝 Top 10 Most Common Parameters:")
-    for param_code, count in sorted(stats['by_parameter_code'].items(), 
-                                   key=lambda x: x[1], reverse=True)[:10]:
-        print(f"   {param_code[:50]:50} - {count} datasets")
+    print("\n🔝 Standard Codes with Most Measurements:")
+    for std_code, info in sorted(measurement_counts.items(), key=lambda x: x[1]['count'], reverse=True)[:10]:
+        raw_codes_str = ', '.join(info['raw_codes'][:3])
+        if len(info['raw_codes']) > 3:
+            raw_codes_str += f", ... (+{len(info['raw_codes'])-3} more)"
+        print(f"   {std_code:20} - {info['count']:>10,} measurements ({raw_codes_str})")
+    
+    if unmapped_measurements:
+        print("\n⚠️  Unmapped Measurement Codes (need to add to parameter_mappings):")
+        for code, count in sorted(unmapped_measurements.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"   {code:30} - {count:>10,} measurements")
+        if len(unmapped_measurements) > 10:
+            print(f"   ... and {len(unmapped_measurements)-10} more")
     
     print("\n⚠️  Unmeasured Parameters by Dataset:")
     unmeasured_by_dataset = defaultdict(list)
