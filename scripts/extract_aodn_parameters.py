@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """
-Extract parameters from ISO19115-3 metadata XML files and add to parameters table and JSON config.
-This script parses AODN metadata files to discover water quality parameters.
+Extract parameters from ISO19115-3 metadata XML files and populate parameters table.
+This script scans AODN_data directory automatically and links parameters to datasets.
+
+Updated to:
+- Auto-scan AODN_data directory (same logic as populate_metadata.py)
+- Extract parameter definitions from ISO19115-3 XML metadata
+- Link parameters to specific datasets via metadata_id
+- Handle AODN parameter URIs and units properly
 """
 
 import xml.etree.ElementTree as ET
-import json
 import psycopg2
-from psycopg2.extras import execute_values
-import sys
 from pathlib import Path
+import argparse
+import logging
+from datetime import datetime
+
+# Database configuration
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 5433,
+    'database': 'marine_db',
+    'user': 'marine_user',
+    'password': 'marine_pass123'
+}
 
 # XML Namespaces used in ISO19115-3 metadata
 NAMESPACES = {
@@ -22,215 +37,292 @@ NAMESPACES = {
     'gml': 'http://www.opengis.net/gml/3.2',
 }
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def extract_params_from_xml(xml_file_path):
+
+def get_db_connection():
+    """Create database connection."""
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def find_metadata_xml(dataset_dir: Path):
+    """Search for metadata.xml file in dataset directory (same as populate_metadata.py)."""
+    # Try common locations
+    for path in [dataset_dir / 'metadata.xml', dataset_dir / 'METADATA' / 'metadata.xml']:
+        if path.exists():
+            return path
+    
+    # Search recursively
+    for xml_file in dataset_dir.rglob('metadata.xml'):
+        return xml_file
+    
+    return None
+
+
+def find_element_by_tag_suffix(root, tag_suffix: str):
+    """Find first element whose tag ends with the given suffix (namespace-agnostic)."""
+    for elem in root.iter():
+        if elem.tag.endswith('}' + tag_suffix) or elem.tag == tag_suffix:
+            return elem
+    return None
+
+
+def get_element_text(element):
+    """Extract text from element, checking both direct text and gco:CharacterString children."""
+    if element is None:
+        return None
+    
+    # Try direct text first
+    if element.text and element.text.strip():
+        return element.text.strip()
+    
+    # Try gco:CharacterString or gco:Decimal children
+    for child in element:
+        if child.tag.endswith('}CharacterString') or child.tag.endswith('}Decimal'):
+            if child.text and child.text.strip():
+                return child.text.strip()
+    
+    return None
+
+
+def extract_params_from_xml(xml_file_path: Path):
     """
     Extract parameter information from ISO19115-3 metadata XML.
     
     Returns: List of dicts containing parameter info
     """
-    tree = ET.parse(xml_file_path)
-    root = tree.getroot()
-    
-    parameters = []
-    
-    # Find all MDSampleDimension elements which contain parameter definitions
-    for sample_dim in root.findall('.//mrc:MDSampleDimension', NAMESPACES):
-        param_info = {}
+    try:
+        tree = ET.parse(xml_file_path)
+        root = tree.getroot()
         
-        # Get parameter name - can be in mcc:code/gcx:Anchor or mcc:code/gco:CharacterString
-        name_elem = sample_dim.find('.//mcc:code/gcx:Anchor', NAMESPACES)
-        if name_elem is not None:
-            param_info['name'] = name_elem.text
-            param_info['uri'] = name_elem.get('{http://www.w3.org/1999/xlink}href', '')
-        else:
-            name_elem = sample_dim.find('.//mcc:code/gco:CharacterString', NAMESPACES)
+        parameters = []
+        
+        # Find all MDSampleDimension elements which contain parameter definitions
+        for sample_dim in root.findall('.//mrc:MDSampleDimension', NAMESPACES):
+            param_info = {}
+            
+            # Get parameter code - can be in mcc:code/gcx:Anchor or mcc:code/gco:CharacterString
+            name_elem = sample_dim.find('.//mcc:code/gcx:Anchor', NAMESPACES)
             if name_elem is not None:
-                param_info['name'] = name_elem.text
-                param_info['uri'] = ''
-        
-        # Get unit information from gml:BaseUnit
-        unit_name_elem = sample_dim.find('.//gml:name', NAMESPACES)
-        if unit_name_elem is not None:
-            param_info['unit'] = unit_name_elem.text
-        
-        unit_id_elem = sample_dim.find('.//gml:identifier', NAMESPACES)
-        if unit_id_elem is not None:
-            param_info['unit_uri'] = unit_id_elem.text
+                param_info['parameter_code'] = name_elem.text
+                param_info['aodn_parameter_uri'] = name_elem.get('{http://www.w3.org/1999/xlink}href', '')
+            else:
+                name_elem = sample_dim.find('.//mcc:code/gco:CharacterString', NAMESPACES)
+                if name_elem is not None:
+                    param_info['parameter_code'] = name_elem.text
+                    param_info['aodn_parameter_uri'] = ''
             
-        # Get description if available
-        desc_elem = sample_dim.find('.//mrc:description/gco:CharacterString', NAMESPACES)
-        if desc_elem is not None and desc_elem.text not in ['missing', None]:
-            param_info['description'] = desc_elem.text
+            # Get parameter label/description
+            desc_elem = sample_dim.find('.//mrc:description/gco:CharacterString', NAMESPACES)
+            if desc_elem is not None and desc_elem.text and desc_elem.text.strip() not in ['missing', 'null', '']:
+                param_info['parameter_label'] = desc_elem.text.strip()
+            elif 'parameter_code' in param_info:
+                # Use code as label if no description
+                param_info['parameter_label'] = param_info['parameter_code'].replace('_', ' ').title()
+            
+            # Get unit information from gml:BaseUnit
+            unit_name_elem = sample_dim.find('.//gml:name', NAMESPACES)
+            if unit_name_elem is not None:
+                param_info['unit_name'] = unit_name_elem.text
+            
+            unit_id_elem = sample_dim.find('.//gml:identifier', NAMESPACES)
+            if unit_id_elem is not None:
+                param_info['unit_uri'] = unit_id_elem.text
+            
+            # Only add if we have at least a parameter code
+            if 'parameter_code' in param_info and param_info['parameter_code']:
+                parameters.append(param_info)
         
-        # Only add if we have at least a name
-        if 'name' in param_info and param_info['name']:
-            parameters.append(param_info)
-    
-    return parameters
+        return parameters
+        
+    except Exception as e:
+        logger.error(f"  ❌ Error parsing XML: {e}")
+        return []
 
 
-def standardize_parameter_name(name):
-    """Convert parameter name to standardized format for database."""
-    # Remove special characters and normalize
-    name = name.strip()
-    # Keep the full descriptive name
-    return name
-
-
-def get_db_connection():
-    """Create database connection."""
-    return psycopg2.connect(
-        host="localhost",
-        port=5433,
-        dbname="marine_db",
-        user="marine_user",
-        password="marine_pass123"
+def get_metadata_id(cursor, dataset_path: str):
+    """Get metadata_id for a dataset path."""
+    cursor.execute(
+        "SELECT id FROM metadata WHERE dataset_path = %s",
+        (dataset_path,)
     )
+    result = cursor.fetchone()
+    return result[0] if result else None
 
 
-def add_parameters_to_db(parameters):
+def insert_parameter(cursor, metadata_id: int, param_info: dict):
     """
-    Add extracted parameters to the database parameters table.
-    Handles duplicates gracefully.
+    Insert a parameter into the database.
+    Returns True if inserted, False if skipped (duplicate).
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    added = 0
-    skipped = 0
-    
-    for param in parameters:
-        try:
-            # Check if parameter already exists
-            cursor.execute(
-                "SELECT id FROM parameters WHERE name = %s",
-                (param['name'],)
-            )
-            existing = cursor.fetchone()
-            
-            if existing:
-                print(f"  ⏭️  Skipped (exists): {param['name']}")
-                skipped += 1
-                continue
-            
-            # Insert new parameter
-            cursor.execute("""
-                INSERT INTO parameters (name, unit, description)
-                VALUES (%s, %s, %s)
-                RETURNING id
-            """, (
-                param['name'],
-                param.get('unit', ''),
-                param.get('description', '')
-            ))
-            
-            param_id = cursor.fetchone()[0]
-            print(f"  ✅ Added: {param['name']} (ID: {param_id})")
-            added += 1
-            
-        except Exception as e:
-            print(f"  ❌ Error adding {param.get('name', 'unknown')}: {e}")
-            conn.rollback()
-            continue
-    
-    conn.commit()
-    cursor.close()
-    conn.close()
-    
-    return added, skipped
+    try:
+        # Check if parameter already exists for this dataset
+        cursor.execute("""
+            SELECT id FROM parameters 
+            WHERE metadata_id = %s AND parameter_code = %s
+        """, (metadata_id, param_info['parameter_code']))
+        
+        if cursor.fetchone():
+            return False  # Already exists
+        
+        # Insert new parameter
+        cursor.execute("""
+            INSERT INTO parameters (
+                metadata_id,
+                parameter_code,
+                parameter_label,
+                aodn_parameter_uri,
+                unit_name,
+                unit_uri,
+                content_type
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            metadata_id,
+            param_info['parameter_code'],
+            param_info.get('parameter_label', ''),
+            param_info.get('aodn_parameter_uri', ''),
+            param_info.get('unit_name', ''),
+            param_info.get('unit_uri', ''),
+            'physicalMeasurement'
+        ))
+        
+        return True  # Successfully inserted
+        
+    except Exception as e:
+        logger.error(f"    ❌ Error inserting parameter: {e}")
+        return False
 
 
-def update_json_config(parameters, json_path):
+def scan_aodn_directory(base_path: str = 'AODN_data'):
     """
-    Update the parameter mappings JSON configuration file.
-    Adds new mappings for discovered parameters.
+    Scan AODN_data directory for datasets with metadata.xml files.
+    Same logic as populate_metadata.py.
     """
-    # Load existing config
-    with open(json_path, 'r') as f:
-        config = json.load(f)
+    base_path = Path(base_path)
     
-    added = 0
+    if not base_path.exists():
+        logger.error(f"❌ Directory not found: {base_path}")
+        return []
     
-    for param in parameters:
-        param_name = param['name']
-        
-        # Check if already in config
-        existing = False
-        for dataset in config.get('datasets', []):
-            if param_name in dataset.get('column_mappings', {}):
-                existing = True
-                break
-        
-        if existing:
-            continue
-        
-        # Create a suggested mapping entry (you'll need to customize this)
-        # For now, we'll add it as a comment/template
-        suggested_mapping = {
-            "aodn_parameter": param_name,
-            "unit": param.get('unit', ''),
-            "uri": param.get('uri', ''),
-            "description": param.get('description', ''),
-            "suggested_column_names": []  # User will need to fill this
-        }
-        
-        print(f"  📝 New parameter for JSON: {param_name}")
-        added += 1
+    subdirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    logger.info(f"Found {len(subdirs)} potential datasets")
     
-    # Note: Actual JSON update would require more context about structure
-    # This is a placeholder for manual review
+    datasets_with_xml = []
     
-    return added
+    for dataset_dir in subdirs:
+        xml_path = find_metadata_xml(dataset_dir)
+        if xml_path:
+            datasets_with_xml.append({
+                'path': str(dataset_dir),
+                'xml_path': xml_path,
+                'name': dataset_dir.name
+            })
+    
+    return datasets_with_xml
 
 
 def main():
     """Main execution function."""
-    print("=" * 80)
-    print("ISO19115-3 METADATA PARAMETER EXTRACTOR")
-    print("=" * 80)
+    parser = argparse.ArgumentParser(
+        description='Extract parameters from AODN metadata and populate database'
+    )
+    parser.add_argument(
+        '--path',
+        default='AODN_data',
+        help='Path to AODN data directory (default: AODN_data)'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Show what would be done without making changes'
+    )
     
-    # Parse command line arguments or use defaults
-    xml_files = sys.argv[1:] if len(sys.argv) > 1 else ['metadata.xml']
+    args = parser.parse_args()
     
-    all_parameters = []
+    logger.info("=" * 80)
+    logger.info("AODN PARAMETER EXTRACTOR")
+    logger.info("=" * 80)
     
-    for xml_file in xml_files:
-        print(f"\n📄 Processing: {xml_file}")
-        
-        try:
-            params = extract_params_from_xml(xml_file)
-            print(f"   Found {len(params)} parameters")
-            all_parameters.extend(params)
-            
-            for p in params[:3]:  # Show first 3 as examples
-                print(f"     • {p['name'][:60]}...")
-            if len(params) > 3:
-                print(f"     ... and {len(params) - 3} more")
-                
-        except Exception as e:
-            print(f"   ❌ Error parsing {xml_file}: {e}")
-            continue
+    # Scan for datasets
+    logger.info(f"\n📂 Scanning: {args.path}")
+    datasets = scan_aodn_directory(args.path)
     
-    if not all_parameters:
-        print("\n⚠️  No parameters found in XML files")
+    if not datasets:
+        logger.warning("⚠️  No datasets with metadata.xml found")
         return
     
-    print(f"\n📊 Total parameters extracted: {len(all_parameters)}")
-    print(f"   Unique parameters: {len(set(p['name'] for p in all_parameters))}")
+    logger.info(f"Found {len(datasets)} datasets with metadata.xml")
     
-    # Add to database
-    print("\n💾 Adding parameters to database...")
-    added, skipped = add_parameters_to_db(all_parameters)
-    print(f"   Added: {added}, Skipped: {skipped}")
+    # Process each dataset
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # Update JSON (placeholder)
-    print("\n📝 Checking JSON configuration...")
-    # json_path = 'config_parameter_mapping.json'
-    # update_json_config(all_parameters, json_path)
-    print("   Note: Review parameters and update JSON mappings manually")
+    total_params = 0
+    total_inserted = 0
+    total_skipped = 0
+    datasets_processed = 0
     
-    print("\n✅ Done!")
+    for idx, dataset in enumerate(datasets, 1):
+        logger.info(f"\n[{idx}/{len(datasets)}] {dataset['name']}")
+        
+        # Get metadata_id for this dataset
+        metadata_id = get_metadata_id(cursor, dataset['path'])
+        if not metadata_id:
+            logger.warning(f"  ⚠️  Dataset not in metadata table: {dataset['path']}")
+            logger.info("     Run populate_metadata.py first!")
+            continue
+        
+        # Extract parameters from XML
+        logger.info(f"  🔍 Extracting from: {dataset['xml_path'].name}")
+        params = extract_params_from_xml(dataset['xml_path'])
+        
+        if not params:
+            logger.info("     No parameters found in XML")
+            continue
+        
+        logger.info(f"     Found {len(params)} parameters")
+        total_params += len(params)
+        
+        # Insert parameters
+        if not args.dry_run:
+            for param in params:
+                if insert_parameter(cursor, metadata_id, param):
+                    logger.info(f"     ✅ {param['parameter_code']:20} - {param.get('parameter_label', 'N/A')[:40]}")
+                    total_inserted += 1
+                else:
+                    logger.info(f"     ⏭️  {param['parameter_code']:20} - already exists")
+                    total_skipped += 1
+            conn.commit()
+        else:
+            for param in params:
+                logger.info(f"     [DRY RUN] Would insert: {param['parameter_code']}")
+        
+        datasets_processed += 1
+    
+    cursor.close()
+    conn.close()
+    
+    # Summary
+    logger.info("\n" + "=" * 80)
+    logger.info("✅ COMPLETE")
+    logger.info("=" * 80)
+    logger.info(f"Datasets processed:    {datasets_processed}")
+    logger.info(f"Total parameters found: {total_params}")
+    
+    if not args.dry_run:
+        logger.info(f"Parameters inserted:    {total_inserted}")
+        logger.info(f"Parameters skipped:     {total_skipped} (already existed)")
+    else:
+        logger.info("\n📝 DRY RUN - No changes made to database")
+        logger.info("Run without --dry-run to insert parameters")
+    
+    logger.info("=" * 80)
 
 
 if __name__ == '__main__':
