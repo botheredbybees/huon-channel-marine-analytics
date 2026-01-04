@@ -10,6 +10,7 @@ Updated to:
 - Handle AODN parameter URIs and units properly
 - Use robust namespace-agnostic XML parsing
 - Output detailed debug information to JSON file
+- Fix namespace handling for concatenated namespace+tag format
 """
 
 import xml.etree.ElementTree as ET
@@ -83,11 +84,35 @@ def get_element_info(elem):
     }
 
 
+def tag_matches(element_tag: str, target_suffix: str) -> bool:
+    """
+    Check if an element tag matches the target suffix.
+    Handles multiple namespace formats:
+    - {http://namespace}TagName
+    - http://namespaceTagName (concatenated without separator)
+    - TagName (no namespace)
+    """
+    # Direct match
+    if element_tag == target_suffix:
+        return True
+    
+    # Standard namespace format: {namespace}TagName
+    if element_tag.endswith('}' + target_suffix):
+        return True
+    
+    # Concatenated format without separator: just check if it ends with the target
+    # But be careful - only match if there's a namespace-like prefix
+    if element_tag.endswith(target_suffix) and ('http://' in element_tag or 'https://' in element_tag):
+        return True
+    
+    return False
+
+
 def find_elements_by_tag_suffix(root, tag_suffix: str):
     """Find all elements whose tag ends with the given suffix (namespace-agnostic)."""
     results = []
     for elem in root.iter():
-        if elem.tag.endswith('}' + tag_suffix) or elem.tag == tag_suffix:
+        if tag_matches(elem.tag, tag_suffix):
             results.append(elem)
     return results
 
@@ -95,7 +120,7 @@ def find_elements_by_tag_suffix(root, tag_suffix: str):
 def find_element_by_tag_suffix(elem, tag_suffix: str):
     """Find first child element whose tag ends with the given suffix (namespace-agnostic)."""
     for child in elem.iter():
-        if child.tag.endswith('}' + tag_suffix) or child.tag == tag_suffix:
+        if tag_matches(child.tag, tag_suffix):
             return child
     return None
 
@@ -111,7 +136,7 @@ def get_element_text(element):
     
     # Try gco:CharacterString or gco:Decimal children
     for child in element:
-        if child.tag.endswith('}CharacterString') or child.tag.endswith('}Decimal'):
+        if tag_matches(child.tag, 'CharacterString') or tag_matches(child.tag, 'Decimal'):
             if child.text and child.text.strip():
                 return child.text.strip()
     
@@ -234,9 +259,9 @@ def extract_params_from_xml(xml_file_path: Path, dataset_name: str):
                 sample_dim_debug['processing']['BaseUnit_info'] = get_element_info(base_unit)
                 # Get unit name from gml:name
                 for child in base_unit:
-                    if child.tag.endswith('}name') and child.text:
+                    if tag_matches(child.tag, 'name') and child.text:
                         param_info['unit_name'] = child.text.strip()
-                    elif child.tag.endswith('}identifier') and child.text:
+                    elif tag_matches(child.tag, 'identifier') and child.text:
                         param_info['unit_uri'] = child.text.strip()
             
             sample_dim_debug['processing']['extracted_param'] = param_info.copy()
