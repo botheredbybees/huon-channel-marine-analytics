@@ -7,7 +7,7 @@ Analyzes the relationship between:
 2. parameter_mappings table (standardized mappings)
 3. measurements table (actual data)
 
-Outputs:
+Outputs to logs/ directory:
 - parameter_coverage.csv: Full analysis with mapping suggestions
 - unmeasured_parameters.csv: Parameters without measurements
 - parameter_statistics.csv: Summary statistics
@@ -38,6 +38,8 @@ def normalize_parameter_name(name: str) -> str:
     Normalize parameter name for fuzzy matching.
     Converts to uppercase, removes special chars, standardizes spacing.
     """
+    if not name:
+        return ''
     # Convert to uppercase
     normalized = name.upper()
     # Remove special characters except spaces
@@ -69,10 +71,10 @@ def find_potential_mappings(param_code: str, param_label: str, mappings: list) -
             matches.append((mapping['id'], mapping['raw_parameter_name'], 
                           mapping['standard_code'], 'EXACT_LABEL'))
         # Partial match (contains)
-        elif mapping_norm in param_norm or param_norm in mapping_norm:
+        elif mapping_norm and param_norm and (mapping_norm in param_norm or param_norm in mapping_norm):
             matches.append((mapping['id'], mapping['raw_parameter_name'], 
                           mapping['standard_code'], 'PARTIAL_CODE'))
-        elif mapping_norm in label_norm or label_norm in mapping_norm:
+        elif mapping_norm and label_norm and (mapping_norm in label_norm or label_norm in mapping_norm):
             matches.append((mapping['id'], mapping['raw_parameter_name'], 
                           mapping['standard_code'], 'PARTIAL_LABEL'))
     
@@ -134,16 +136,17 @@ def get_parameter_mappings(cursor):
 
 def get_measurement_counts(cursor):
     """
-    Get count of measurements per parameter.
+    Get count of measurements per parameter_code.
+    FIXED: measurements table uses parameter_code (TEXT), not parameter_id.
     """
     cursor.execute("""
         SELECT 
-            parameter_id,
+            parameter_code,
             COUNT(*) as measurement_count,
-            MIN(timestamp) as first_measurement,
-            MAX(timestamp) as last_measurement
+            MIN(time) as first_measurement,
+            MAX(time) as last_measurement
         FROM measurements
-        GROUP BY parameter_id
+        GROUP BY parameter_code
     """)
     
     result = {}
@@ -174,7 +177,7 @@ def analyze_parameter_coverage():
     
     print(f"   Parameters: {len(parameters)}")
     print(f"   Parameter Mappings: {len(mappings)}")
-    print(f"   Parameters with measurements: {len(measurement_counts)}")
+    print(f"   Unique parameter codes with measurements: {len(measurement_counts)}")
     
     # Analyze each parameter
     print("\n🔍 Analyzing parameters...")
@@ -195,15 +198,16 @@ def analyze_parameter_coverage():
     
     for param in parameters:
         param_id = param['id']
+        param_code = param['parameter_code']
         
-        # Check if has measurements
-        has_measurements = param_id in measurement_counts
-        meas_info = measurement_counts.get(param_id, {})
+        # Check if has measurements - using parameter_code now
+        has_measurements = param_code in measurement_counts
+        meas_info = measurement_counts.get(param_code, {})
         
         # Find potential mappings
         potential_mappings = find_potential_mappings(
             param['parameter_code'],
-            param['parameter_label'],
+            param['parameter_label'] or '',
             mappings
         )
         
@@ -214,15 +218,15 @@ def analyze_parameter_coverage():
         record = {
             'parameter_id': param_id,
             'parameter_code': param['parameter_code'],
-            'parameter_label': param['parameter_label'],
+            'parameter_label': param['parameter_label'] or '',
             'unit_name': param['unit_name'] or '',
             'aodn_uri': param['aodn_parameter_uri'] or '',
             'dataset_name': param['dataset_name'],
             'dataset_uuid': param['uuid'],
             'has_measurements': 'YES' if has_measurements else 'NO',
             'measurement_count': meas_info.get('count', 0),
-            'first_measurement': meas_info.get('first', ''),
-            'last_measurement': meas_info.get('last', ''),
+            'first_measurement': str(meas_info.get('first', '')),
+            'last_measurement': str(meas_info.get('last', '')),
             'suggested_mapping': best_mapping[2] if best_mapping else '',
             'mapping_confidence': best_mapping[3] if best_mapping else '',
             'mapping_id': best_mapping[0] if best_mapping else ''
@@ -252,10 +256,10 @@ def analyze_parameter_coverage():
     cursor.close()
     conn.close()
     
-    # Output results
+    # Output results to logs/ directory
     print("\n💾 Writing reports...")
     
-    output_dir = Path('reports')
+    output_dir = Path('logs')
     output_dir.mkdir(exist_ok=True)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -330,6 +334,11 @@ def analyze_parameter_coverage():
     
     print("\n" + "="*80)
     print("✅ COMPLETE")
+    print("="*80)
+    print("\nOutput files in logs/ directory:")
+    print(f"  - parameter_coverage_{timestamp}.csv")
+    print(f"  - unmeasured_parameters_{timestamp}.csv")
+    print(f"  - parameter_statistics_{timestamp}.csv")
     print("="*80)
 
 if __name__ == '__main__':
