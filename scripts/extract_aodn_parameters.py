@@ -11,6 +11,7 @@ Updated to:
 - Use robust namespace-agnostic XML parsing
 - Output detailed debug information to JSON file
 - Fix namespace handling for concatenated namespace+tag format
+- FIXED: Search for MD_SampleDimension (with underscore) not MDSampleDimension
 """
 
 import xml.etree.ElementTree as ET
@@ -94,7 +95,7 @@ def tag_matches(element_tag: str, target_suffix: str) -> bool:
     
     The key insight is that XML parsers may concatenate namespace+tag without any
     separator character, resulting in strings like:
-    'http://standards.iso.org/iso/19115/-3/mrc/2.0MDSampleDimension'
+    'http://standards.iso.org/iso/19115/-3/mrc/2.0MD_SampleDimension'
     
     We need to check if the tag simply ENDS WITH the target suffix, regardless of
     what comes before it.
@@ -108,7 +109,7 @@ def tag_matches(element_tag: str, target_suffix: str) -> bool:
         return True
     
     # Concatenated format: just check if it ends with the target suffix
-    # This handles: 'http://...MDSampleDimension' ending with 'MDSampleDimension'
+    # This handles: 'http://...MD_SampleDimension' ending with 'MD_SampleDimension'
     if element_tag.endswith(target_suffix):
         return True
     
@@ -153,7 +154,10 @@ def get_element_text(element):
 def extract_params_from_xml(xml_file_path: Path, dataset_name: str):
     """
     Extract parameter information from ISO19115-3 metadata XML.
-    Uses namespace-agnostic approach to find MDSampleDimension elements.
+    Uses namespace-agnostic approach to find MD_SampleDimension elements.
+    
+    CRITICAL FIX: The element is named 'MD_SampleDimension' (with underscore),
+    not 'MDSampleDimension'. This was causing all extractions to fail.
     
     Returns: List of dicts containing parameter info
     """
@@ -164,7 +168,7 @@ def extract_params_from_xml(xml_file_path: Path, dataset_name: str):
         'namespaces': {},
         'all_tags': [],
         'contentInfo_elements': [],
-        'MDSampleDimension_elements': [],
+        'MD_SampleDimension_elements': [],
         'parameters_found': [],
         'error': None
     }
@@ -190,15 +194,16 @@ def extract_params_from_xml(xml_file_path: Path, dataset_name: str):
         for ci in content_info_elements:
             dataset_debug['contentInfo_elements'].append(get_element_info(ci))
         
-        # Find MDCoverageDescription elements
-        coverage_desc_elements = find_elements_by_tag_suffix(root, 'MDCoverageDescription')
-        dataset_debug['MDCoverageDescription_count'] = len(coverage_desc_elements)
+        # Find MD_CoverageDescription elements (note the underscore!)
+        coverage_desc_elements = find_elements_by_tag_suffix(root, 'MD_CoverageDescription')
+        dataset_debug['MD_CoverageDescription_count'] = len(coverage_desc_elements)
         
-        # Find all MDSampleDimension elements using namespace-agnostic search
-        sample_dims = find_elements_by_tag_suffix(root, 'MDSampleDimension')
-        dataset_debug['MDSampleDimension_count'] = len(sample_dims)
+        # CRITICAL FIX: Search for MD_SampleDimension (with underscore), not MDSampleDimension
+        # The actual XML element is: <mrc:MD_SampleDimension>
+        sample_dims = find_elements_by_tag_suffix(root, 'MD_SampleDimension')
+        dataset_debug['MD_SampleDimension_count'] = len(sample_dims)
         
-        logger.debug(f"  Found {len(sample_dims)} MDSampleDimension elements")
+        logger.debug(f"  Found {len(sample_dims)} MD_SampleDimension elements")
         
         parameters = []
         
@@ -211,34 +216,36 @@ def extract_params_from_xml(xml_file_path: Path, dataset_name: str):
             
             param_info = {}
             
-            # Find the name element (contains code)
-            name_elem = find_element_by_tag_suffix(sample_dim, 'MDIdentifier')
-            sample_dim_debug['processing']['found_MDIdentifier'] = name_elem is not None
+            # Find the name element (contains MD_Identifier with code)
+            name_elem = find_element_by_tag_suffix(sample_dim, 'MD_Identifier')
+            sample_dim_debug['processing']['found_MD_Identifier'] = name_elem is not None
             
             if name_elem:
-                sample_dim_debug['processing']['MDIdentifier_info'] = get_element_info(name_elem)
+                sample_dim_debug['processing']['MD_Identifier_info'] = get_element_info(name_elem)
                 
-                # Try to get code from Anchor element first
-                anchor = find_element_by_tag_suffix(name_elem, 'Anchor')
-                sample_dim_debug['processing']['found_Anchor'] = anchor is not None
+                # Look for the code element which contains the Anchor
+                code_elem = find_element_by_tag_suffix(name_elem, 'code')
+                sample_dim_debug['processing']['found_code'] = code_elem is not None
                 
-                if anchor is not None:
-                    sample_dim_debug['processing']['Anchor_info'] = get_element_info(anchor)
-                    if anchor.text:
-                        param_info['parameter_code'] = anchor.text.strip()
-                        # Get xlink:href for AODN parameter URI
-                        href = anchor.get('{http://www.w3.org/1999/xlink}href', '')
-                        if not href:
-                            # Try without namespace
-                            href = anchor.get('href', '')
-                        param_info['aodn_parameter_uri'] = href
-                else:
-                    # Try CharacterString
-                    code_elem = find_element_by_tag_suffix(name_elem, 'code')
-                    sample_dim_debug['processing']['found_code'] = code_elem is not None
+                if code_elem:
+                    sample_dim_debug['processing']['code_info'] = get_element_info(code_elem)
                     
-                    if code_elem:
-                        sample_dim_debug['processing']['code_info'] = get_element_info(code_elem)
+                    # Try to get code from Anchor element first
+                    anchor = find_element_by_tag_suffix(code_elem, 'Anchor')
+                    sample_dim_debug['processing']['found_Anchor'] = anchor is not None
+                    
+                    if anchor is not None:
+                        sample_dim_debug['processing']['Anchor_info'] = get_element_info(anchor)
+                        if anchor.text:
+                            param_info['parameter_code'] = anchor.text.strip()
+                            # Get xlink:href for AODN parameter URI
+                            href = anchor.get('{http://www.w3.org/1999/xlink}href', '')
+                            if not href:
+                                # Try without namespace
+                                href = anchor.get('href', '')
+                            param_info['aodn_parameter_uri'] = href
+                    else:
+                        # Try CharacterString fallback
                         code_text = get_element_text(code_elem)
                         if code_text:
                             param_info['parameter_code'] = code_text
@@ -272,7 +279,7 @@ def extract_params_from_xml(xml_file_path: Path, dataset_name: str):
                         param_info['unit_uri'] = child.text.strip()
             
             sample_dim_debug['processing']['extracted_param'] = param_info.copy()
-            dataset_debug['MDSampleDimension_elements'].append(sample_dim_debug)
+            dataset_debug['MD_SampleDimension_elements'].append(sample_dim_debug)
             
             # Only add if we have at least a parameter code
             if 'parameter_code' in param_info and param_info['parameter_code']:
