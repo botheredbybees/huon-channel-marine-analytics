@@ -9,6 +9,7 @@ Updated to:
 - Link parameters to specific datasets via metadata_id
 - Handle AODN parameter URIs and units properly
 - Use robust namespace-agnostic XML parsing
+- Output detailed debug information to JSON file
 """
 
 import xml.etree.ElementTree as ET
@@ -16,6 +17,7 @@ import psycopg2
 from pathlib import Path
 import argparse
 import logging
+import json
 from datetime import datetime
 
 # Database configuration
@@ -45,6 +47,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global debug data collector
+debug_data = {
+    'timestamp': datetime.now().isoformat(),
+    'datasets': []
+}
+
 
 def get_db_connection():
     """Create database connection."""
@@ -63,6 +71,16 @@ def find_metadata_xml(dataset_dir: Path):
         return xml_file
     
     return None
+
+
+def get_element_info(elem):
+    """Get detailed info about an element for debugging."""
+    return {
+        'tag': elem.tag,
+        'attrib': dict(elem.attrib),
+        'text': elem.text.strip() if elem.text else None,
+        'children': [child.tag for child in elem]
+    }
 
 
 def find_elements_by_tag_suffix(root, tag_suffix: str):
@@ -100,44 +118,95 @@ def get_element_text(element):
     return None
 
 
-def extract_params_from_xml(xml_file_path: Path):
+def extract_params_from_xml(xml_file_path: Path, dataset_name: str):
     """
     Extract parameter information from ISO19115-3 metadata XML.
     Uses namespace-agnostic approach to find MDSampleDimension elements.
     
     Returns: List of dicts containing parameter info
     """
+    dataset_debug = {
+        'name': dataset_name,
+        'xml_path': str(xml_file_path),
+        'root_tag': None,
+        'namespaces': {},
+        'all_tags': [],
+        'contentInfo_elements': [],
+        'MDSampleDimension_elements': [],
+        'parameters_found': [],
+        'error': None
+    }
+    
     try:
         tree = ET.parse(xml_file_path)
         root = tree.getroot()
         
-        parameters = []
+        # Collect debug info about the XML structure
+        dataset_debug['root_tag'] = root.tag
+        dataset_debug['namespaces'] = dict(root.attrib) if hasattr(root, 'attrib') else {}
+        
+        # Collect all unique tags in the document
+        all_tags = set()
+        for elem in root.iter():
+            all_tags.add(elem.tag)
+        dataset_debug['all_tags'] = sorted(list(all_tags))
+        
+        # Find contentInfo elements
+        content_info_elements = find_elements_by_tag_suffix(root, 'contentInfo')
+        dataset_debug['contentInfo_count'] = len(content_info_elements)
+        
+        for ci in content_info_elements:
+            dataset_debug['contentInfo_elements'].append(get_element_info(ci))
+        
+        # Find MDCoverageDescription elements
+        coverage_desc_elements = find_elements_by_tag_suffix(root, 'MDCoverageDescription')
+        dataset_debug['MDCoverageDescription_count'] = len(coverage_desc_elements)
         
         # Find all MDSampleDimension elements using namespace-agnostic search
         sample_dims = find_elements_by_tag_suffix(root, 'MDSampleDimension')
+        dataset_debug['MDSampleDimension_count'] = len(sample_dims)
         
         logger.debug(f"  Found {len(sample_dims)} MDSampleDimension elements")
         
-        for sample_dim in sample_dims:
+        parameters = []
+        
+        for idx, sample_dim in enumerate(sample_dims):
+            sample_dim_debug = {
+                'index': idx,
+                'element_info': get_element_info(sample_dim),
+                'processing': {}
+            }
+            
             param_info = {}
             
             # Find the name element (contains code)
             name_elem = find_element_by_tag_suffix(sample_dim, 'MDIdentifier')
+            sample_dim_debug['processing']['found_MDIdentifier'] = name_elem is not None
+            
             if name_elem:
+                sample_dim_debug['processing']['MDIdentifier_info'] = get_element_info(name_elem)
+                
                 # Try to get code from Anchor element first
                 anchor = find_element_by_tag_suffix(name_elem, 'Anchor')
-                if anchor is not None and anchor.text:
-                    param_info['parameter_code'] = anchor.text.strip()
-                    # Get xlink:href for AODN parameter URI
-                    href = anchor.get('{http://www.w3.org/1999/xlink}href', '')
-                    if not href:
-                        # Try without namespace
-                        href = anchor.get('href', '')
-                    param_info['aodn_parameter_uri'] = href
+                sample_dim_debug['processing']['found_Anchor'] = anchor is not None
+                
+                if anchor is not None:
+                    sample_dim_debug['processing']['Anchor_info'] = get_element_info(anchor)
+                    if anchor.text:
+                        param_info['parameter_code'] = anchor.text.strip()
+                        # Get xlink:href for AODN parameter URI
+                        href = anchor.get('{http://www.w3.org/1999/xlink}href', '')
+                        if not href:
+                            # Try without namespace
+                            href = anchor.get('href', '')
+                        param_info['aodn_parameter_uri'] = href
                 else:
                     # Try CharacterString
                     code_elem = find_element_by_tag_suffix(name_elem, 'code')
+                    sample_dim_debug['processing']['found_code'] = code_elem is not None
+                    
                     if code_elem:
+                        sample_dim_debug['processing']['code_info'] = get_element_info(code_elem)
                         code_text = get_element_text(code_elem)
                         if code_text:
                             param_info['parameter_code'] = code_text
@@ -145,7 +214,10 @@ def extract_params_from_xml(xml_file_path: Path):
             
             # Get description if available
             desc_elem = find_element_by_tag_suffix(sample_dim, 'description')
+            sample_dim_debug['processing']['found_description'] = desc_elem is not None
+            
             if desc_elem:
+                sample_dim_debug['processing']['description_info'] = get_element_info(desc_elem)
                 desc_text = get_element_text(desc_elem)
                 if desc_text and desc_text not in ['missing', 'null', 'inapplicable', '']:
                     param_info['parameter_label'] = desc_text
@@ -156,7 +228,10 @@ def extract_params_from_xml(xml_file_path: Path):
             
             # Get unit information from BaseUnit
             base_unit = find_element_by_tag_suffix(sample_dim, 'BaseUnit')
+            sample_dim_debug['processing']['found_BaseUnit'] = base_unit is not None
+            
             if base_unit:
+                sample_dim_debug['processing']['BaseUnit_info'] = get_element_info(base_unit)
                 # Get unit name from gml:name
                 for child in base_unit:
                     if child.tag.endswith('}name') and child.text:
@@ -164,15 +239,24 @@ def extract_params_from_xml(xml_file_path: Path):
                     elif child.tag.endswith('}identifier') and child.text:
                         param_info['unit_uri'] = child.text.strip()
             
+            sample_dim_debug['processing']['extracted_param'] = param_info.copy()
+            dataset_debug['MDSampleDimension_elements'].append(sample_dim_debug)
+            
             # Only add if we have at least a parameter code
             if 'parameter_code' in param_info and param_info['parameter_code']:
                 parameters.append(param_info)
+                dataset_debug['parameters_found'].append(param_info)
         
+        debug_data['datasets'].append(dataset_debug)
         return parameters
         
     except Exception as e:
-        logger.error(f"  ❌ Error parsing XML: {e}")
+        error_msg = f"Error parsing XML: {e}"
+        logger.error(f"  ❌ {error_msg}")
         import traceback
+        dataset_debug['error'] = error_msg
+        dataset_debug['traceback'] = traceback.format_exc()
+        debug_data['datasets'].append(dataset_debug)
         logger.debug(traceback.format_exc())
         return []
 
@@ -259,6 +343,14 @@ def scan_aodn_directory(base_path: str = 'AODN_data'):
     return datasets_with_xml
 
 
+def write_debug_json(output_path: Path):
+    """Write debug data to JSON file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(debug_data, f, indent=2)
+    logger.info(f"\n📝 Debug information written to: {output_path}")
+
+
 def main():
     """Main execution function."""
     parser = argparse.ArgumentParser(
@@ -277,7 +369,7 @@ def main():
     parser.add_argument(
         '--debug',
         action='store_true',
-        help='Enable debug logging'
+        help='Enable debug logging and write debug JSON'
     )
     
     args = parser.parse_args()
@@ -320,7 +412,7 @@ def main():
         
         # Extract parameters from XML
         logger.info(f"  🔍 Extracting from: {dataset['xml_path'].name}")
-        params = extract_params_from_xml(dataset['xml_path'])
+        params = extract_params_from_xml(dataset['xml_path'], dataset['name'])
         
         if not params:
             logger.info("     No parameters found in XML")
@@ -347,6 +439,12 @@ def main():
     
     cursor.close()
     conn.close()
+    
+    # Write debug JSON if requested
+    if args.debug:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        debug_json_path = Path('logs') / f'parameter_extraction_debug_{timestamp}.json'
+        write_debug_json(debug_json_path)
     
     # Summary
     logger.info("\n" + "=" * 80)
