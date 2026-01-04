@@ -3,10 +3,11 @@
 Populate the parameters table from existing measurements and parameter_mappings.
 This script addresses the issue where you have 7M measurements but 0 parameter records.
 
-FIXED: Removed uuid field which doesn't exist in parameters table schema
+FIXED: Added uuid field generation - the database schema has uuid NOT NULL constraint
 """
 
 import psycopg2
+import uuid as uuid_lib
 from psycopg2.extras import execute_values
 from datetime import datetime
 
@@ -196,18 +197,22 @@ def populate_parameters():
         unit = infer_unit(code, mapping.get('unit'))
         description = mapping.get('description', f'{name} measurements')
         
+        # Generate UUID for this parameter
+        param_uuid = str(uuid_lib.uuid4())
+        
         # Insert - NOTE: metadata_id is NULL for global parameters
         try:
             cursor.execute("""
                 INSERT INTO parameters (
+                    uuid,
                     parameter_code, 
                     parameter_label, 
                     unit_name,
                     standard_name,
                     content_type
-                ) VALUES (%s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
-            """, (code, name, unit, description, 'physicalMeasurement'))
+            """, (param_uuid, code, name, unit, description, 'physicalMeasurement'))
             
             param_id = cursor.fetchone()[0]
             print(f"   ✅ {code:20} - {name:30} [{unit:15}] ({count:>8,} measurements)")
