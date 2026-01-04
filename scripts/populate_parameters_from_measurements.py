@@ -2,14 +2,18 @@
 """
 Populate the parameters table from existing measurements and parameter_mappings.
 This script addresses the issue where you have 7M measurements but 0 parameter records.
+
+FIXED: 
+- Changed 'code' to 'parameter_code' to match schema
+- Updated database connection to match docker-compose.yml
+- All field names now match init.sql schema
 """
 
 import psycopg2
-from psycopg2.extras import execute_values
 from datetime import datetime
 
 def get_db_connection():
-    """Create database connection."""
+    """Create database connection - matches docker-compose.yml."""
     return psycopg2.connect(
         host="localhost",
         port=5433,
@@ -20,9 +24,7 @@ def get_db_connection():
 
 
 def get_parameters_from_measurements():
-    """
-    Extract unique parameter codes from measurements table with statistics.
-    """
+    """Extract unique parameter codes from measurements table with statistics."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -49,9 +51,7 @@ def get_parameters_from_measurements():
 
 
 def get_parameter_mappings():
-    """
-    Get parameter mappings to enrich parameter definitions.
-    """
+    """Get parameter mappings to enrich parameter definitions."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -86,9 +86,7 @@ def get_parameter_mappings():
 
 
 def standardize_parameter_name(code):
-    """
-    Convert parameter code to human-readable name.
-    """
+    """Convert parameter code to human-readable name."""
     name_map = {
         'TEMP': 'Temperature',
         'PSAL': 'Salinity',
@@ -117,9 +115,7 @@ def standardize_parameter_name(code):
 
 
 def infer_unit(code, mapping_unit=None):
-    """
-    Infer unit for parameter if not in mappings.
-    """
+    """Infer unit for parameter if not in mappings."""
     if mapping_unit:
         return mapping_unit
     
@@ -151,9 +147,7 @@ def infer_unit(code, mapping_unit=None):
 
 
 def populate_parameters():
-    """
-    Main function to populate parameters table.
-    """
+    """Main function to populate parameters table."""
     print("=" * 80)
     print("POPULATING PARAMETERS TABLE")
     print("=" * 80)
@@ -176,8 +170,11 @@ def populate_parameters():
     skipped = 0
     
     for code, count, mean, stddev, earliest, latest in param_stats:
-        # Check if already exists
-        cursor.execute("SELECT id FROM parameters WHERE code = %s", (code,))
+        # Check if already exists - FIXED: using parameter_code not code
+        cursor.execute(
+            "SELECT id FROM parameters WHERE parameter_code = %s AND metadata_id IS NULL",
+            (code,)
+        )
         if cursor.fetchone():
             print(f"   ⏭️  {code:20} - already exists")
             skipped += 1
@@ -189,13 +186,22 @@ def populate_parameters():
         unit = infer_unit(code, mapping.get('unit'))
         description = mapping.get('description', f'{name} measurements')
         
-        # Insert
+        # Insert - FIXED: using correct field names from schema
         try:
             cursor.execute("""
-                INSERT INTO parameters (code, name, unit, description)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO parameters (
+                    parameter_code, parameter_label, unit_name, 
+                    standard_name, content_type
+                )
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
-            """, (code, name, unit, description))
+            """, (
+                code,           # parameter_code
+                name,           # parameter_label
+                unit,           # unit_name
+                description,    # standard_name (closest match for description)
+                'physicalMeasurement'  # content_type (default)
+            ))
             
             param_id = cursor.fetchone()[0]
             print(f"   ✅ {code:20} - {name:30} [{unit:15}] ({count:>8,} measurements)")
@@ -220,9 +226,7 @@ def populate_parameters():
 
 
 def verify_population():
-    """
-    Verify that parameters were populated correctly.
-    """
+    """Verify that parameters were populated correctly."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -243,17 +247,19 @@ def verify_population():
     
     # Show sample
     cursor.execute("""
-        SELECT p.code, p.name, p.unit, COUNT(m.id) as measurement_count
+        SELECT p.parameter_code, p.parameter_label, p.unit_name, COUNT(m.data_id) as measurement_count
         FROM parameters p
-        LEFT JOIN measurements m ON m.parameter_code = p.code
-        GROUP BY p.code, p.name, p.unit
+        LEFT JOIN measurements m ON m.parameter_code = p.parameter_code
+        WHERE p.metadata_id IS NULL
+        GROUP BY p.parameter_code, p.parameter_label, p.unit_name
         ORDER BY measurement_count DESC
         LIMIT 10
     """)
     
     print("\n   Top 10 parameters by measurement count:")
     for code, name, unit, count in cursor.fetchall():
-        print(f"     • {code:15} {name:30} - {count:>10,} measurements")
+        count_str = f"{count:,}" if count else "0"
+        print(f"     • {code:15} {name:30} - {count_str:>10} measurements")
     
     cursor.close()
     conn.close()
