@@ -4,6 +4,7 @@ Populate the parameters table from existing measurements and parameter_mappings.
 This script addresses the issue where you have 7M measurements but 0 parameter records.
 
 FIXED: Added uuid field generation - the database schema has uuid NOT NULL constraint
+FIXED: Proper NULL handling in UNIQUE constraint check for metadata_id
 """
 
 import psycopg2
@@ -179,8 +180,8 @@ def populate_parameters():
     skipped = 0
     
     for code, count, mean, stddev, earliest, latest in param_stats:
+        # FIXED: Use IS NULL instead of = NULL for proper NULL comparison
         # Check if already exists (parameter_code is part of UNIQUE constraint with metadata_id)
-        # Since we're not linking to specific metadata, just check by code
         cursor.execute("""
             SELECT id FROM parameters 
             WHERE parameter_code = %s AND metadata_id IS NULL
@@ -200,7 +201,7 @@ def populate_parameters():
         # Generate UUID for this parameter
         param_uuid = str(uuid_lib.uuid4())
         
-        # Insert - NOTE: metadata_id is NULL for global parameters
+        # Insert - NOTE: metadata_id is explicitly NULL for global parameters
         try:
             cursor.execute("""
                 INSERT INTO parameters (
@@ -209,8 +210,9 @@ def populate_parameters():
                     parameter_label, 
                     unit_name,
                     standard_name,
-                    content_type
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    content_type,
+                    metadata_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, NULL)
                 RETURNING id
             """, (param_uuid, code, name, unit, description, 'physicalMeasurement'))
             
