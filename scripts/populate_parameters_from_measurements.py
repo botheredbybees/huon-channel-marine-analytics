@@ -12,10 +12,10 @@ def get_db_connection():
     """Create database connection."""
     return psycopg2.connect(
         host="localhost",
-        port=5432,
-        database="marine_data",
-        user="postgres",
-        password="postgres"
+        port=5433,
+        dbname="marine_db",
+        user="marine_user",
+        password="marine_pass123"
     )
 
 
