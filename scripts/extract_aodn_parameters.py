@@ -8,6 +8,7 @@ Updated to:
 - Extract parameter definitions from ISO19115-3 XML metadata
 - Link parameters to specific datasets via metadata_id
 - Handle AODN parameter URIs and units properly
+- Use robust namespace-agnostic XML parsing
 """
 
 import xml.etree.ElementTree as ET
@@ -64,11 +65,20 @@ def find_metadata_xml(dataset_dir: Path):
     return None
 
 
-def find_element_by_tag_suffix(root, tag_suffix: str):
-    """Find first element whose tag ends with the given suffix (namespace-agnostic)."""
+def find_elements_by_tag_suffix(root, tag_suffix: str):
+    """Find all elements whose tag ends with the given suffix (namespace-agnostic)."""
+    results = []
     for elem in root.iter():
         if elem.tag.endswith('}' + tag_suffix) or elem.tag == tag_suffix:
-            return elem
+            results.append(elem)
+    return results
+
+
+def find_element_by_tag_suffix(elem, tag_suffix: str):
+    """Find first child element whose tag ends with the given suffix (namespace-agnostic)."""
+    for child in elem.iter():
+        if child.tag.endswith('}' + tag_suffix) or child.tag == tag_suffix:
+            return child
     return None
 
 
@@ -93,6 +103,7 @@ def get_element_text(element):
 def extract_params_from_xml(xml_file_path: Path):
     """
     Extract parameter information from ISO19115-3 metadata XML.
+    Uses namespace-agnostic approach to find MDSampleDimension elements.
     
     Returns: List of dicts containing parameter info
     """
@@ -102,37 +113,56 @@ def extract_params_from_xml(xml_file_path: Path):
         
         parameters = []
         
-        # Find all MDSampleDimension elements which contain parameter definitions
-        for sample_dim in root.findall('.//mrc:MDSampleDimension', NAMESPACES):
+        # Find all MDSampleDimension elements using namespace-agnostic search
+        sample_dims = find_elements_by_tag_suffix(root, 'MDSampleDimension')
+        
+        logger.debug(f"  Found {len(sample_dims)} MDSampleDimension elements")
+        
+        for sample_dim in sample_dims:
             param_info = {}
             
-            # Get parameter code - can be in mcc:code/gcx:Anchor or mcc:code/gco:CharacterString
-            name_elem = sample_dim.find('.//mcc:code/gcx:Anchor', NAMESPACES)
-            if name_elem is not None:
-                param_info['parameter_code'] = name_elem.text
-                param_info['aodn_parameter_uri'] = name_elem.get('{http://www.w3.org/1999/xlink}href', '')
-            else:
-                name_elem = sample_dim.find('.//mcc:code/gco:CharacterString', NAMESPACES)
-                if name_elem is not None:
-                    param_info['parameter_code'] = name_elem.text
-                    param_info['aodn_parameter_uri'] = ''
+            # Find the name element (contains code)
+            name_elem = find_element_by_tag_suffix(sample_dim, 'MDIdentifier')
+            if name_elem:
+                # Try to get code from Anchor element first
+                anchor = find_element_by_tag_suffix(name_elem, 'Anchor')
+                if anchor is not None and anchor.text:
+                    param_info['parameter_code'] = anchor.text.strip()
+                    # Get xlink:href for AODN parameter URI
+                    href = anchor.get('{http://www.w3.org/1999/xlink}href', '')
+                    if not href:
+                        # Try without namespace
+                        href = anchor.get('href', '')
+                    param_info['aodn_parameter_uri'] = href
+                else:
+                    # Try CharacterString
+                    code_elem = find_element_by_tag_suffix(name_elem, 'code')
+                    if code_elem:
+                        code_text = get_element_text(code_elem)
+                        if code_text:
+                            param_info['parameter_code'] = code_text
+                            param_info['aodn_parameter_uri'] = ''
             
-            # Get parameter label/description
-            desc_elem = sample_dim.find('.//mrc:description/gco:CharacterString', NAMESPACES)
-            if desc_elem is not None and desc_elem.text and desc_elem.text.strip() not in ['missing', 'null', '']:
-                param_info['parameter_label'] = desc_elem.text.strip()
-            elif 'parameter_code' in param_info:
-                # Use code as label if no description
-                param_info['parameter_label'] = param_info['parameter_code'].replace('_', ' ').title()
+            # Get description if available
+            desc_elem = find_element_by_tag_suffix(sample_dim, 'description')
+            if desc_elem:
+                desc_text = get_element_text(desc_elem)
+                if desc_text and desc_text not in ['missing', 'null', 'inapplicable', '']:
+                    param_info['parameter_label'] = desc_text
             
-            # Get unit information from gml:BaseUnit
-            unit_name_elem = sample_dim.find('.//gml:name', NAMESPACES)
-            if unit_name_elem is not None:
-                param_info['unit_name'] = unit_name_elem.text
+            # If no label, use parameter code as label
+            if 'parameter_code' in param_info and 'parameter_label' not in param_info:
+                param_info['parameter_label'] = param_info['parameter_code']
             
-            unit_id_elem = sample_dim.find('.//gml:identifier', NAMESPACES)
-            if unit_id_elem is not None:
-                param_info['unit_uri'] = unit_id_elem.text
+            # Get unit information from BaseUnit
+            base_unit = find_element_by_tag_suffix(sample_dim, 'BaseUnit')
+            if base_unit:
+                # Get unit name from gml:name
+                for child in base_unit:
+                    if child.tag.endswith('}name') and child.text:
+                        param_info['unit_name'] = child.text.strip()
+                    elif child.tag.endswith('}identifier') and child.text:
+                        param_info['unit_uri'] = child.text.strip()
             
             # Only add if we have at least a parameter code
             if 'parameter_code' in param_info and param_info['parameter_code']:
@@ -142,6 +172,8 @@ def extract_params_from_xml(xml_file_path: Path):
         
     except Exception as e:
         logger.error(f"  ❌ Error parsing XML: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return []
 
 
@@ -242,8 +274,16 @@ def main():
         action='store_true',
         help='Show what would be done without making changes'
     )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug logging'
+    )
     
     args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     logger.info("=" * 80)
     logger.info("AODN PARAMETER EXTRACTOR")
@@ -293,15 +333,15 @@ def main():
         if not args.dry_run:
             for param in params:
                 if insert_parameter(cursor, metadata_id, param):
-                    logger.info(f"     ✅ {param['parameter_code']:20} - {param.get('parameter_label', 'N/A')[:40]}")
+                    logger.info(f"     ✅ {param['parameter_code'][:50]:50} - {param.get('unit_name', 'N/A')}")
                     total_inserted += 1
                 else:
-                    logger.info(f"     ⏭️  {param['parameter_code']:20} - already exists")
+                    logger.info(f"     ⏭️  {param['parameter_code'][:50]:50} - already exists")
                     total_skipped += 1
             conn.commit()
         else:
             for param in params:
-                logger.info(f"     [DRY RUN] Would insert: {param['parameter_code']}")
+                logger.info(f"     [DRY RUN] Would insert: {param['parameter_code'][:50]} ({param.get('unit_name', 'N/A')})")
         
         datasets_processed += 1
     
