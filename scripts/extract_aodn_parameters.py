@@ -88,21 +88,28 @@ def tag_matches(element_tag: str, target_suffix: str) -> bool:
     """
     Check if an element tag matches the target suffix.
     Handles multiple namespace formats:
-    - {http://namespace}TagName
-    - http://namespaceTagName (concatenated without separator)
+    - {http://namespace}TagName (standard ElementTree format with braces)
+    - http://namespaceTagName (concatenated without any separator)
     - TagName (no namespace)
+    
+    The key insight is that XML parsers may concatenate namespace+tag without any
+    separator character, resulting in strings like:
+    'http://standards.iso.org/iso/19115/-3/mrc/2.0MDSampleDimension'
+    
+    We need to check if the tag simply ENDS WITH the target suffix, regardless of
+    what comes before it.
     """
-    # Direct match
+    # Direct match (no namespace)
     if element_tag == target_suffix:
         return True
     
-    # Standard namespace format: {namespace}TagName
+    # Standard ElementTree namespace format: {namespace}TagName
     if element_tag.endswith('}' + target_suffix):
         return True
     
-    # Concatenated format without separator: just check if it ends with the target
-    # But be careful - only match if there's a namespace-like prefix
-    if element_tag.endswith(target_suffix) and ('http://' in element_tag or 'https://' in element_tag):
+    # Concatenated format: just check if it ends with the target suffix
+    # This handles: 'http://...MDSampleDimension' ending with 'MDSampleDimension'
+    if element_tag.endswith(target_suffix):
         return True
     
     return False
