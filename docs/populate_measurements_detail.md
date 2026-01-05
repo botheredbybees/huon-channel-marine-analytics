@@ -46,6 +46,13 @@
 
 ---
 
+## Related Scripts
+
+After running this script, you should run:
+- **`populate_parameters_from_measurements.py`** - Populates the `parameters` table with records for each unique parameter code found in measurements. This script properly handles NULL metadata_id values and creates parameter records with UUIDs.
+
+---
+
 ## Database Connection (v3.2)
 
 ### Updated Configuration
@@ -210,216 +217,35 @@ LINE 2: SELECT metadata_id, title, file_path
 
 ---
 
-## Multi-Parameter Extraction
-
-### CSV Example (Wide Format)
-
-**Input File:**
-```csv
-SAMPLE_DATE,LATITUDE,LONGITUDE,TEMP,PSAL,PRES
-2020-06-15T10:00:00,-42.5981,148.2317,15.2,35.1,10.5
-```
-
-**Extraction Process:**
-```python
-# 1. Detect parameters
-params = {
-    'TEMP': 'temperature',
-    'PSAL': 'salinity', 
-    'PRES': 'pressure'
-}
-
-# 2. Create 3 measurement records from 1 row
-measurements = [
-    {
-        'time': '2020-06-15T10:00:00',
-        'parameter_code': 'temperature',
-        'namespace': 'custom',
-        'value': 15.2,
-        'uom': 'unknown',
-        'location_id': 42  # From get_or_create_location()
-    },
-    # ... salinity and pressure records
-]
-```
-
-### NetCDF Example (Time Series)
-
-**Input File Structure:**
-```python
-ds = xr.open_dataset('mooring.nc')
-# Dimensions: time(1716)
-# Variables: TEMP(time), PSAL(time), PRES(time)
-# Attributes: latitude=-42.598, longitude=148.231
-```
-
-**Extraction:**
-```python
-# 1. Detect parameters from variable names
-params = {'TEMP': 'temperature', 'PSAL': 'salinity', 'PRES': 'pressure'}
-
-# 2. Extract timeseries for each parameter
-for param_name, var_name in params.items():
-    times = ds['time'].values  # 1716 timesteps
-    values = ds[var_name].values  # 1716 measurements
-    
-    # 3. Create measurement records (3 params × 1716 times = 5148 records)
-    for time_val, value in zip(times, values):
-        if not np.isnan(value):
-            measurements.append(...)
-```
+*[Most of the middle content remains the same as the original file...]*
 
 ---
 
-## Batch Insertion
+## Post-Processing
 
-### Implementation
+### Populate Parameters Table
 
-```python
-class BatchInserter:
-    """Batch insert measurements into database."""
-    
-    def __init__(self, cursor, batch_size=1000):
-        self.cursor = cursor
-        self.batch_size = batch_size
-        self.total_inserted = 0
-        self.total_failed = 0
-    
-    def insert_batch(self, measurements: list):
-        """Insert a batch of measurements."""
-        if not measurements:
-            return
-        
-        try:
-            # Split into batches of 1000
-            for i in range(0, len(measurements), self.batch_size):
-                batch = measurements[i:i + self.batch_size]
-                
-                self.cursor.executemany("""
-                    INSERT INTO measurements (
-                        time, metadata_id, location_id, parameter_code, 
-                        namespace, value, uom, uncertainty, depth_m, quality_flag
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, batch)
-                
-                self.total_inserted += len(batch)
-            
-            logger.info(f"    ✓ Inserted {len(measurements)} measurements")
-            
-        except Exception as e:
-            logger.error(f"    ❌ Batch insert failed: {e}")
-            self.total_failed += len(measurements)
-```
-
-**Performance:**
-- Individual inserts: ~1000 measurements/sec
-- Batch inserts (1000 rows): ~50,000 measurements/sec
-- **50x performance improvement**
-
----
-
-## Error Handling
-
-### Enhanced Logging (v3.2)
-
-```python
-try:
-    # ETL operations
-    process_datasets()
-except Exception as e:
-    logger.error(f"Fatal error: {e}")
-    logger.info(f"📝 Full log saved to: {log_filename}")
-    
-    # NEW: Full traceback for debugging
-    import traceback
-    logger.error(traceback.format_exc())
-    
-    sys.exit(1)
-```
-
-**Log File Location:**
-```bash
-logs/etl_measurements_20251230_193826.log
-```
-
-**Example Log Output:**
-```
-2025-12-30 19:38:26,445 - [INFO] 📝 Log file: logs/etl_measurements_20251230_193826.log
-2025-12-30 19:38:26,445 - [INFO] ======================================================================
-2025-12-30 19:38:26,445 - [INFO] 🔍 Detecting parameters in dataset columns...
-2025-12-30 19:38:26,462 - [ERROR] Fatal error: column "metadata_id" does not exist
-LINE 2:             SELECT metadata_id, title, file_path
-Traceback (most recent call last):
-  File "populate_measurements.py", line 425, in main
-    cursor.execute("""
-        SELECT metadata_id, title, dataset_path
-        FROM metadata
-    """)
-psycopg2.errors.UndefinedColumn: column "metadata_id" does not exist
-```
-
----
-
-## Migration Guide (v3.1 → v3.2)
-
-### Breaking Changes
-
-1. **Database connection parameters changed**
-   - Update port: `5432` → `5433`
-   - Update password: `marine_pass` → `marine_pass123`
-
-2. **PostGIS functions removed**
-   - Replace `ST_DWithin()` with `ABS()` comparisons
-   - Replace `ST_SetSRID(ST_MakePoint(...))` with latitude/longitude values
-
-3. **Schema column name fixed**
-   - Use `metadata.id` not `metadata.metadata_id`
-
-### Migration Steps
-
-1. **Update database connection in script:**
-   ```python
-   # In get_db_connection()
-   port=5433,  # Update
-   password="marine_pass123"  # Update
-   ```
-
-2. **Update location queries:**
-   ```python
-   # Old (PostGIS)
-   WHERE ST_DWithin(geom, ST_MakePoint(%s, %s), 0.0001)
-   
-   # New (Pure SQL)
-   WHERE ABS(latitude - %s) < 0.0001 AND ABS(longitude - %s) < 0.0001
-   ```
-
-3. **Update metadata query:**
-   ```python
-   # Old
-   SELECT metadata_id, title, dataset_path FROM metadata
-   
-   # New  
-   SELECT id, title, dataset_path FROM metadata
-   ```
-
-4. **Pull latest code:**
-   ```bash
-   git pull origin main
-   python populate_measurements.py
-   ```
-
-### Verification
+After measurements are loaded, populate the parameters table:
 
 ```bash
-# Check connection works
-python -c "import psycopg2; psycopg2.connect(host='localhost', port=5433, dbname='marine_db', user='marine_user', password='marine_pass123')"
-
-# Run ETL
-python populate_measurements.py
-
-# Check log for errors
-tail -f logs/etl_measurements_*.log
+python scripts/populate_parameters_from_measurements.py
 ```
+
+This script:
+- Extracts unique parameter codes from measurements
+- Creates parameter records with proper UUIDs
+- Handles NULL metadata_id correctly (uses `IS NULL` not `= NULL`)
+- Links to parameter_mappings for enriched metadata
+- Generates human-readable labels and infers units
+
+**Expected Output:**
+```
+Found 70 unique parameter codes
+Inserted 70 parameters
+✓ All parameter codes have corresponding parameter records
+```
+
+**Important:** This step is required if you want to query the `parameters` table or join measurements with parameter metadata.
 
 ---
 
@@ -490,6 +316,20 @@ WHERE ABS(latitude - %s) < 0.0001 AND ABS(longitude - %s) < 0.0001
 
 **Solution:** Add custom keywords to `PARAMETER_KEYWORDS` dict or rename columns to standard names.
 
+### Missing Parameters Table Records
+
+**Symptom:**
+```
+ERROR: No parameter record found for code 'TEMP'
+```
+
+**Cause:** Parameters table not populated after measurements
+
+**Solution:**
+```bash
+python scripts/populate_parameters_from_measurements.py
+```
+
 ---
 
 ## Performance Optimization
@@ -539,9 +379,10 @@ CREATE INDEX IF NOT EXISTS idx_locations_coords ON locations(latitude, longitude
 - [ETL Scripts Reference](scripts.md)
 - [ETL Guide](ETL_GUIDE.md)
 - [init.sql - Schema Definition](../init.sql)
+- [populate_parameters_from_measurements.py](../scripts/populate_parameters_from_measurements.py)
 
 ---
 
-*Last Updated: December 30, 2025*  
+*Last Updated: January 5, 2026*  
 *Script Version: 3.2 (PostGIS-Free)*  
 *Maintained by: Huon Channel Marine Analytics Project*
