@@ -95,7 +95,6 @@ def extract_centroid(geometry):
 
 def main():
     conn = get_db_connection()
-    
     try:
         cur = conn.cursor()
         
@@ -108,11 +107,11 @@ def main():
             LEFT JOIN spatial_features sf ON m.id = sf.metadata_id
             GROUP BY m.id
             HAVING COUNT(mes.data_id) = 0
-              AND COUNT(sf.id) = 0
-              AND m.dataset_path IS NOT NULL
+               AND COUNT(sf.id) = 0
+               AND m.dataset_path IS NOT NULL
         """)
-        datasets = cur.fetchall()
         
+        datasets = cur.fetchall()
         print(f"Found {len(datasets)} candidate datasets.")
         
         for ds in datasets:
@@ -132,8 +131,8 @@ def main():
                 continue
             
             print(f"Processing '{title}' ({len(shp_files)} shapefiles)...")
-            
             inserted_count = 0
+            
             for shp in shp_files:
                 geojson = convert_shp_to_geojson(shp)
                 if not geojson or 'features' not in geojson:
@@ -151,17 +150,19 @@ def main():
                         continue
                     
                     props = json.dumps(feature.get('properties', {}))
-                    features_to_insert.append((meta_id, meta_uuid, lat, lon, props))
+                    # FIXED: Removed meta_uuid from tuple
+                    features_to_insert.append((meta_id, lat, lon, props))
                 
                 if features_to_insert:
                     from psycopg2.extras import execute_values
                     
+                    # FIXED: Removed uuid from column list
                     sql = """
-                        INSERT INTO spatial_features (metadata_id, uuid, latitude, longitude, properties)
+                        INSERT INTO spatial_features (metadata_id, latitude, longitude, properties)
                         VALUES %s
                     """
-                    
-                    template = "(%s, %s, %s, %s, %s)"
+                    # FIXED: Removed one %s from template
+                    template = "(%s, %s, %s, %s)"
                     
                     try:
                         execute_values(cur, sql, features_to_insert, template=template)
@@ -179,7 +180,7 @@ def main():
                                     inserted_count += 1
                             except Exception as single_e:
                                 print(f"  Failed Row Error: {single_e}")
-                                print(f"  Bad Data: lat={item[2]}, lon={item[3]}")
+                                print(f"  Bad Data: lat={item[1]}, lon={item[2]}")  # FIXED: Adjusted index
                                 conn.rollback()
             
             if inserted_count > 0:
