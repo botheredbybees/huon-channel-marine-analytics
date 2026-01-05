@@ -11,8 +11,9 @@ Complete guide to downloading AODN/IMOS datasets and ingesting them into your ma
 3. [Downloading Data from AODN](#downloading-data-from-aodn)
 4. [Metadata Extraction](#metadata-extraction)
 5. [Data Ingestion Pipeline](#data-ingestion-pipeline)
-6. [Verification](#verification)
-7. [Troubleshooting](#troubleshooting)
+6. [Parameter Coverage Analysis](#parameter-coverage-analysis)
+7. [Verification](#verification)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -24,15 +25,18 @@ Complete guide to downloading AODN/IMOS datasets and ingesting them into your ma
 AODN Portal              AODN_data/           Database
     │                        │                     │
     ├─ Download    →       ├─ Dataset1/          ├─ metadata
-    ├─ Extract               │  ├─ *.csv            ├─ measurements
-    ├─ Store                 │  ├─ *.nc             ├─ spatial_features
-    └─ Metadata.xml          │  └─ metadata.xml    └─ species_observations
-                             │
-                             ├─ Dataset2/
+    ├─ Extract               │  ├─ *.csv            ├─ parameters
+    ├─ Store                 │  ├─ *.nc             ├─ parameter_mappings
+    └─ Metadata.xml          │  └─ metadata.xml    ├─ measurements
+                             │                      ├─ spatial_features
+                             ├─ Dataset2/          └─ species_observations
                              └─ ...
                                  │
                           ETL Scripts
-                          ├─ populate_measurements_v2.py
+                          ├─ populate_metadata.py
+                          ├─ populate_parameter_mappings.py
+                          ├─ populate_parameters_from_measurements.py
+                          ├─ populate_measurements.py
                           ├─ populate_spatial.py
                           └─ populate_biological.py
 ```
@@ -41,10 +45,11 @@ AODN Portal              AODN_data/           Database
 
 | Type | File Format | ETL Script | Table Destination |
 |------|-------------|------------|-------------------|
-| **Time-series** | CSV, NetCDF | `populate_measurements_v2.py` | `measurements` |
+| **Time-series** | CSV, NetCDF | `populate_measurements.py` | `measurements` |
 | **Spatial** | Shapefiles, GPX | `populate_spatial.py` | `spatial_features` |
 | **Biological** | CSV (species counts) | `populate_biological.py` | `species_observations` |
-| **Metadata** | XML (ISO 19115) | Manual or script | `metadata` |
+| **Metadata** | XML (ISO 19115) | `populate_metadata.py` | `metadata` |
+| **Parameters** | Inferred from data | `populate_parameters_from_measurements.py` | `parameters` |
 
 ---
 
@@ -84,8 +89,9 @@ docker exec marine_timescaledb psql -U marine_user -d marine_db -c "\dt"
 
 You should see tables including:
 - `metadata`
+- `parameters`
+- `parameter_mappings`
 - `measurements`
-- `parameter_mappings` (new!)
 - `spatial_features`
 - `species_observations`
 - `taxonomy`
@@ -169,52 +175,6 @@ with open(output_dir / file_name, 'wb') as f:
 print(f"Downloaded: {file_name}")
 ```
 
-#### Bulk Download Script
-
-For multiple datasets, create `download_aodn.py`:
-
-```python
-import requests
-import json
-from pathlib import Path
-
-# Load dataset URLs from JSON
-with open('aodn_datasets.json', 'r') as f:
-    datasets = json.load(f)
-
-for dataset in datasets:
-    name = dataset['name']
-    url = dataset['url']
-    
-    output_dir = Path(f"AODN_data/{name}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"Downloading {name}...")
-    response = requests.get(url, stream=True)
-    
-    file_path = output_dir / url.split('/')[-1]
-    with open(file_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-    
-    print(f"  → Saved to {file_path}")
-```
-
-Create `aodn_datasets.json`:
-
-```json
-[
-  {
-    "name": "IMOS_Wave_Buoys_Storm_Bay",
-    "url": "https://thredds.aodn.org.au/thredds/fileServer/.../STORM-BAY_...nc"
-  },
-  {
-    "name": "Chlorophyll_SE_Tasmania",
-    "url": "https://portal.aodn.org.au/.../chlorophyll.csv"
-  }
-]
-```
-
 ---
 
 ## Metadata Extraction
@@ -232,34 +192,24 @@ Every AODN dataset comes with an XML metadata file containing:
 
 ### Automated Metadata Ingestion
 
-**TODO: Create `populate_metadata.py`** (not yet implemented)
-
-For now, manually insert metadata:
-
-```sql
-INSERT INTO metadata (
-    uuid, title, abstract, west, east, south, north,
-    time_start, time_end, dataset_name, dataset_path
-) VALUES (
-    'your-uuid-here',
-    'Dataset Title',
-    'Description from XML',
-    147.0,  -- West longitude
-    148.0,  -- East
-    -43.5,  -- South latitude
-    -42.5,  -- North
-    '2010-01-01',
-    '2023-12-31',
-    'Dataset Folder Name',
-    'AODN_data/Dataset_Folder_Name'
-);
-```
-
-**Extract UUID from XML**:
+Use `populate_metadata.py` to automatically extract metadata from XML files:
 
 ```bash
-xmlstarlet sel -t -v "//gmd:fileIdentifier/gco:CharacterString" -n metadata.xml
+python populate_metadata.py
 ```
+
+This script extracts 30+ metadata fields including:
+- Dataset UUID and parent relationships
+- Spatial/temporal extents
+- Distribution URLs (WFS, WMS, Portal)
+- Data lineage and credits
+- License information
+
+For each dataset folder, the script:
+1. Locates `metadata.xml` file
+2. Parses ISO 19115-3 XML structure
+3. Extracts comprehensive metadata
+4. Inserts into `metadata` table
 
 ---
 
@@ -269,11 +219,14 @@ xmlstarlet sel -t -v "//gmd:fileIdentifier/gco:CharacterString" -n metadata.xml
 
 ```
 1. Run diagnostic         → Identify file formats and issues
-2. Populate metadata      → Add dataset records (manual for now)
-3. Ingest measurements    → Time-series CSV/NetCDF data
-4. Ingest spatial         → Shapefiles for seagrass, kelp
-5. Ingest biological      → Species observation CSVs
-6. Verify                 → Check counts and data quality
+2. Populate metadata      → Extract from XML files
+3. Populate parameter mappings → Load standardized mappings
+4. Populate parameters    → Create parameter records from measurements
+5. Ingest measurements    → Time-series CSV/NetCDF data
+6. Ingest spatial         → Shapefiles for seagrass, kelp
+7. Ingest biological      → Species observation CSVs
+8. Analyze coverage       → Check parameter coverage statistics
+9. Verify                 → Check counts and data quality
 ```
 
 ---
@@ -303,52 +256,97 @@ Common issues:
 
 ### Step 2: Populate Metadata Table
 
-**Option A: Manual SQL Insert**
-
-For each dataset folder:
-
-```sql
-INSERT INTO metadata (uuid, title, dataset_name, dataset_path, west, east, south, north)
-VALUES (
-    'f0904e61-2e15-4346-bb0e-638366b7e626',
-    'Aerial surveys of giant kelp',
-    'Aerial_surveys_giant_kelp_2019',
-    'AODN_data/Aerial surveys of giant kelp (Macrocystis pyrifera) from Musselroe Bay to Southeast Cape, Tasmania, 2019',
-    144.0, 148.0, -44.0, -40.0
-);
-```
-
-**Option B: Bulk Import from CSV**
-
-Create `metadata_import.csv`:
-
-```csv
-uuid,title,dataset_name,dataset_path,west,east,south,north
-f0904e61-...,Aerial surveys...,Aerial_surveys_giant_kelp_2019,AODN_data/Aerial surveys...,144,148,-44,-40
-```
-
-Then import:
+Extract metadata from XML files:
 
 ```bash
-docker exec -i marine_timescaledb psql -U marine_user -d marine_db \
-  -c "\COPY metadata(uuid,title,dataset_name,dataset_path,west,east,south,north) FROM STDIN CSV HEADER" < metadata_import.csv
+python populate_metadata.py
+```
+
+This automatically:
+- Scans `AODN_data/` directory
+- Finds `metadata.xml` files
+- Parses ISO 19115-3 XML
+- Extracts 30+ metadata fields
+- Populates `metadata` table
+
+**Expected Output:**
+```
+✓ 38 datasets discovered
+✓ 30+ fields extracted per dataset
+✓ 26/38 datasets with parent_uuid (68%)
+✓ 38/38 with metadata_revision_date (100%)
+✓ 32/38 with WFS URLs (84%)
 ```
 
 ---
 
-### Step 3: Ingest Measurements (Time-Series Data)
+### Step 3: Populate Parameter Mappings
 
-Use **`populate_measurements_v2.py`** for CSV and NetCDF files:
+Load standardized parameter mappings from configuration:
+
+```bash
+python populate_parameter_mappings.py
+```
+
+This script:
+- Reads `config_parameter_mapping.json`
+- Maps raw parameter names to standard codes (BODC, CF)
+- Defines units and namespaces
+- Populates `parameter_mappings` table
+- Creates indexed lookup for fast ETL operations
+
+**Why this matters:** Enables consistent parameter standardization across 80+ different parameter naming conventions found in AODN datasets.
+
+---
+
+### Step 4: Populate Parameters Table ✨ NEW
+
+After measurements are loaded, populate the parameters table:
+
+```bash
+python scripts/populate_parameters_from_measurements.py
+```
+
+This script:
+- Extracts unique parameter codes from measurements
+- Generates human-readable labels
+- Infers units from parameter codes
+- Creates parameter records with proper UUIDs
+- Handles NULL metadata_id correctly
+
+**Key Features:**
+- Generates UUID for each parameter
+- Uses `IS NULL` for proper NULL comparison in SQL
+- Idempotent (safe to run multiple times)
+- Links parameters to parameter_mappings when available
+
+**Expected Output:**
+```
+Found 70 unique parameter codes
+Inserted 70 parameters
+✓ All parameter codes have corresponding parameter records
+```
+
+**Fixes Applied (v2):**
+- Uses `metadata_id IS NULL` instead of `= NULL`
+- Explicitly sets `metadata_id = NULL` in INSERT
+- Proper handling of UNIQUE constraint on (parameter_code, metadata_id)
+
+---
+
+### Step 5: Ingest Measurements (Time-Series Data)
+
+Use **`populate_measurements.py`** for CSV and NetCDF files:
 
 ```bash
 # Full ingestion
-python populate_measurements_v2.py
+python populate_measurements.py
 
 # Single dataset (testing)
-python populate_measurements_v2.py --dataset "Chlorophyll"
+python populate_measurements.py --dataset "Chlorophyll"
 
 # Limit rows for quick test
-python populate_measurements_v2.py --limit 100
+python populate_measurements.py --limit 100
 ```
 
 #### What It Does
@@ -368,21 +366,9 @@ In another terminal:
 watch -n 5 'docker exec marine_timescaledb psql -U marine_user -d marine_db -c "SELECT COUNT(*) FROM measurements;"'
 ```
 
-#### Expected Output
-
-```
-2025-12-20 08:00:00 - [INFO] Found 18 empty datasets
-2025-12-20 08:00:01 - [INFO] Processing: National Outfall Database
-2025-12-20 08:00:01 - [INFO]   Extracting CSV: National_Outfall_Database.csv
-2025-12-20 08:00:08 - [INFO] Inserting 18793 measurements...
-2025-12-20 08:00:09 - [INFO] Inserted 1000/1000 rows (total: 1000)
-...
-2025-12-20 08:00:30 - [INFO] Total inserted: 31501
-```
-
 ---
 
-### Step 4: Ingest Spatial Features (Shapefiles)
+### Step 6: Ingest Spatial Features (Shapefiles)
 
 Use **`populate_spatial.py`** for seagrass, kelp extent, and other polygons:
 
@@ -395,33 +381,9 @@ python populate_spatial.py
 - **geopandas**: For shapefile reading
 - **ogr2ogr**: System tool (install via `gdal-bin` on Ubuntu)
 
-```bash
-# Install GDAL tools
-sudo apt-get install gdal-bin
-
-# Verify
-ogr2ogr --version
-```
-
-#### What It Does
-
-1. Finds all `.shp` files in `AODN_data/`
-2. Converts to GeoJSON
-3. Inserts geometries + attributes into `spatial_features`
-4. Properties stored as JSONB for flexible querying
-
-#### Expected Output
-
-```
-Processing 'Australian Seagrass distribution'...
-  → Inserted 1250 spatial features.
-Processing 'CAMRIS Seagrass Dataset'...
-  → Inserted 850 spatial features.
-```
-
 ---
 
-### Step 5: Ingest Biological Data (Species Observations)
+### Step 7: Ingest Biological Data (Species Observations)
 
 Use **`populate_biological.py`** for RLS surveys, fish counts, invertebrate surveys:
 
@@ -438,21 +400,77 @@ Biological CSVs must have:
 - **Count**: `TOTAL_NUMBER`, `count_value`
 - **Date**: `SURVEY_DATE`, `SIGHTING_DATE`
 
-#### What It Does
+---
 
-1. Detects biological CSVs (checks for species-related columns)
-2. Normalizes taxonomy into `taxonomy` table
-3. Normalizes locations into `locations` table
-4. Inserts observations into `species_observations`
+## Parameter Coverage Analysis
 
-#### Expected Output
+### Analyzing Parameter Coverage ✨ NEW
 
+After ingesting data, analyze which parameters have measurements:
+
+```bash
+python scripts/analyze_parameter_coverage.py
 ```
-Ingesting Condition_of_rocky_reef_communities_fish_surveys.csv...
-  → 450 observations inserted
-Ingesting Condition_of_rocky_reef_communities_algal_surveys.csv...
-  → 320 observations inserted
+
+This comprehensive analysis script generates three CSV reports:
+
+1. **parameter_coverage_YYYYMMDD_HHMMSS.csv**
+   - All parameters from metadata
+   - Measurement counts per parameter
+   - Coverage status (measured/unmeasured)
+
+2. **parameter_statistics_YYYYMMDD_HHMMSS.csv**
+   - Summary statistics by dataset
+   - Parameter counts and percentages
+   - Top measured parameters
+
+3. **unmeasured_parameters_YYYYMMDD_HHMMSS.csv**
+   - Parameters without measurements
+   - Grouped by dataset
+   - Categorized by content type
+
+### Typical Coverage Statistics
+
+**Example Output:**
 ```
+Overall Statistics:
+- Total unique parameters: 361
+- Parameters with measurements: 70 (19.4%)
+- Parameters without measurements: 291 (80.6%)
+- Total measurements: 7,000,000+
+
+Top Measured Parameters:
+1. TEMP - 2,500,000 measurements
+2. PSAL - 2,300,000 measurements
+3. CPHL - 1,800,000 measurements
+```
+
+### Understanding Low Coverage
+
+The 19.4% parameter coverage is expected because:
+
+1. **Metadata Comprehensiveness**: XML metadata lists ALL possible parameters the dataset *could* contain
+2. **Subset Filtering**: Downloaded data may be filtered by region/time
+3. **Different Data Types**:
+   - **Physical measurements**: Temperature, salinity → High coverage
+   - **Biological observations**: Species counts → Separate table (`species_observations`)
+   - **Chemical analyses**: Often not included in time-series files
+
+### Improving Coverage
+
+Several enhancement issues have been created to improve coverage:
+
+- **[Issue #5](https://github.com/botheredbybees/huon-channel-marine-analytics/issues/5)**: Create ETL for biological observations
+  - Would increase coverage to ~50%
+  - Extract species data to `species_observations` table
+
+- **[Issue #6](https://github.com/botheredbybees/huon-channel-marine-analytics/issues/6)**: Add data quality checks
+  - Range validation for oceanographic parameters
+  - Consistency checks for timestamps
+
+- **[Issue #7](https://github.com/botheredbybees/huon-channel-marine-analytics/issues/7)**: Implement fuzzy parameter matching
+  - Intelligent string matching for parameter names
+  - Reduce manual mapping effort
 
 ---
 
@@ -465,9 +483,10 @@ Ingesting Condition_of_rocky_reef_communities_algal_surveys.csv...
 SELECT COUNT(*) FROM measurements;
 
 -- By dataset
-SELECT uuid, COUNT(*) as count
-FROM measurements
-GROUP BY uuid
+SELECT m.uuid, COUNT(*) as count
+FROM measurements meas
+JOIN metadata m ON meas.metadata_id = m.id
+GROUP BY m.uuid
 ORDER BY count DESC;
 
 -- By parameter
@@ -475,6 +494,25 @@ SELECT parameter_code, COUNT(*) as count
 FROM measurements
 GROUP BY parameter_code
 ORDER BY count DESC
+LIMIT 20;
+```
+
+### Check Parameter Population
+
+```sql
+-- Total parameters
+SELECT COUNT(*) FROM parameters;
+
+-- Parameters with measurements
+SELECT 
+    p.parameter_code,
+    p.parameter_label,
+    p.unit_name,
+    COUNT(m.data_id) as measurement_count
+FROM parameters p
+LEFT JOIN measurements m ON m.parameter_code = p.parameter_code
+GROUP BY p.parameter_code, p.parameter_label, p.unit_name
+ORDER BY measurement_count DESC
 LIMIT 20;
 ```
 
@@ -522,13 +560,13 @@ SELECT
     COUNT(*) FILTER (WHERE quality_flag != 1) as questionable_quality
 FROM measurements;
 
--- Parameter coverage
+-- Parameter coverage analysis
 SELECT 
-    namespace,
-    COUNT(DISTINCT parameter_code) as unique_parameters,
-    COUNT(*) as total_measurements
-FROM measurements
-GROUP BY namespace;
+    COUNT(DISTINCT p.parameter_code) as total_parameters,
+    COUNT(DISTINCT m.parameter_code) as measured_parameters,
+    ROUND(100.0 * COUNT(DISTINCT m.parameter_code) / COUNT(DISTINCT p.parameter_code), 1) as coverage_pct
+FROM parameters p
+LEFT JOIN measurements m ON m.parameter_code = p.parameter_code;
 ```
 
 ---
@@ -559,7 +597,37 @@ Required columns (case-insensitive):
 - **Time**: `time`, `date`, `datetime`, `timestamp`
 - **Value**: `value`, `concentration`, `measurement`
 
-If columns have different names, manually inspect and add to parameter mapping.
+If columns have different names, add to parameter mapping configuration.
+
+---
+
+### Issue: "Parameter not found in parameters table"
+
+**Cause**: Parameters table not populated from measurements
+
+**Solution**: Run the parameter population script:
+
+```bash
+python scripts/populate_parameters_from_measurements.py
+```
+
+This creates parameter records for all unique parameter codes found in measurements.
+
+---
+
+### Issue: "Duplicate key violation on parameters"
+
+**Cause**: Re-running parameter population script
+
+**Solution**: This is expected! The script uses `ON CONFLICT DO NOTHING` for safety. To force re-population:
+
+```sql
+-- Delete old parameters
+DELETE FROM parameters WHERE metadata_id IS NULL;
+
+-- Re-run script
+python scripts/populate_parameters_from_measurements.py
+```
 
 ---
 
@@ -579,61 +647,25 @@ iconv -f ISO-8859-1 -t UTF-8 file.csv > file_utf8.csv
 
 ---
 
-### Issue: Time values look wrong (year 3000)
-
-**Cause**: Wrong time reference in NetCDF
-
-**Solution**: Check NetCDF time units:
-
-```bash
-ncdump -v time file.nc | grep "time:units"
-```
-
-If units are non-standard, convert manually:
-
-```python
-import netCDF4
-import cftime
-
-ds = netCDF4.Dataset('file.nc')
-time_var = ds.variables['time']
-time_units = time_var.units
-calendar = time_var.calendar
-
-dates = cftime.num2date(time_var[:], time_units, calendar=calendar)
-print(dates[:5])  # Check first 5 timestamps
-```
-
----
-
-### Issue: "Batch insert failed: duplicate key"
-
-**Cause**: Re-running ETL on already-ingested dataset
-
-**Solution**: This is expected! ETL uses `ON CONFLICT DO NOTHING`. To force re-import:
-
-```sql
--- Delete old data
-DELETE FROM measurements WHERE metadata_id = <dataset_id>;
-
--- Re-run ETL
-python populate_measurements_v2.py --dataset "<name>"
-```
-
----
-
 ## Advanced Topics
 
 ### Custom Parameter Mappings
 
-Add new mappings to database:
+Add new mappings to configuration file and reload:
 
-```sql
-INSERT INTO parameter_mappings (raw_parameter_name, standard_code, namespace, unit, source)
-VALUES ('CUSTOM_PARAM', 'MY_CODE', 'custom', 'units', 'user');
+```json
+{
+  "parameter_mapping": {
+    "CUSTOM_PARAM": ["MY_CODE", "custom", "units"]
+  }
+}
 ```
 
-Update ETL to load from database (future enhancement).
+Then reload:
+
+```bash
+python populate_parameter_mappings.py
+```
 
 ---
 
@@ -643,10 +675,10 @@ For many datasets, process in parallel:
 
 ```bash
 # Terminal 1
-python populate_measurements_v2.py --dataset "Dataset1"
+python populate_measurements.py --dataset "Dataset1"
 
 # Terminal 2  
-python populate_measurements_v2.py --dataset "Dataset2"
+python populate_measurements.py --dataset "Dataset2"
 ```
 
 ---
@@ -660,7 +692,7 @@ For datasets updated regularly:
 wget https://thredds.aodn.org.au/.../latest.nc
 
 # Ingest only new data
-python populate_measurements_v2.py --dataset "IMOS_Coastal_Moorings" --since "2023-12-01"
+python populate_measurements.py --dataset "IMOS_Coastal_Moorings" --since "2023-12-01"
 ```
 
 (Note: `--since` flag not yet implemented; manually filter in ETL script)
@@ -672,9 +704,12 @@ python populate_measurements_v2.py --dataset "IMOS_Coastal_Moorings" --since "20
 - [ ] Database initialized (`init.sql` run successfully)
 - [ ] Python dependencies installed
 - [ ] AODN data downloaded to `AODN_data/`
-- [ ] Metadata table populated
+- [ ] Metadata table populated (`populate_metadata.py`)
+- [ ] Parameter mappings loaded (`populate_parameter_mappings.py`)
 - [ ] Diagnostic run (`diagnostic_etl.py`)
-- [ ] Measurements ingested (`populate_measurements_v2.py`)
+- [ ] Measurements ingested (`populate_measurements.py`)
+- [ ] Parameters table populated (`populate_parameters_from_measurements.py`)
+- [ ] Parameter coverage analyzed (`analyze_parameter_coverage.py`)
 - [ ] Spatial features ingested (`populate_spatial.py`)
 - [ ] Biological data ingested (`populate_biological.py`)
 - [ ] Verification queries run
@@ -684,10 +719,12 @@ python populate_measurements_v2.py --dataset "IMOS_Coastal_Moorings" --since "20
 
 ## Next Steps
 
-1. **Set up Grafana dashboards** → Visualize time-series data
-2. **Spatial analysis in QGIS** → Load spatial features via PostGIS
-3. **Custom queries** → Analyze species-environment relationships
-4. **Automate downloads** → Schedule weekly AODN updates
+1. **Review parameter coverage** → Run `analyze_parameter_coverage.py`
+2. **Set up Grafana dashboards** → Visualize time-series data
+3. **Spatial analysis in QGIS** → Load spatial features via PostGIS
+4. **Custom queries** → Analyze species-environment relationships
+5. **Consider enhancements** → See GitHub issues #5, #6, #7
+6. **Automate downloads** → Schedule weekly AODN updates
 
 ---
 
@@ -698,7 +735,10 @@ python populate_measurements_v2.py --dataset "IMOS_Coastal_Moorings" --since "20
 - **BODC Parameters**: https://www.bodc.ac.uk/data/parameters/
 - **CF Conventions**: https://cfconventions.org/
 - **ISO 19115 Metadata**: https://www.iso.org/standard/53798.html
+- **Project Issues**: https://github.com/botheredbybees/huon-channel-marine-analytics/issues
 
 ---
 
 **Questions?** See `ETL_GUIDE.md` for detailed ETL troubleshooting or check code docstrings.
+
+*Last Updated: January 5, 2026*
