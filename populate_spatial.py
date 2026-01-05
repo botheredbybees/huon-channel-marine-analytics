@@ -31,23 +31,52 @@ def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 def convert_shp_to_geojson(shp_path):
-    """Convert Shapefile to GeoJSON using system ogr2ogr"""
+    """Convert Shapefile to GeoJSON using system ogr2ogr with encoding handling"""
     temp_json = f"/tmp/{uuid.uuid4()}.json"
-    try:
-        # Run ogr2ogr: -t_srs EPSG:4326 ensures lat/lon coordinates
-        cmd = ["ogr2ogr", "-f", "GeoJSON", "-t_srs", "EPSG:4326", temp_json, shp_path]
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        if os.path.exists(temp_json):
-            with open(temp_json, 'r') as f:
-                data = json.load(f)
-            os.remove(temp_json)
-            return data
-    except Exception as e:
-        print(f"Error converting {shp_path}: {e}")
-        if os.path.exists(temp_json):
-            os.remove(temp_json)
+    
+    # Try multiple encoding strategies
+    encoding_strategies = [
+        [],  # Default (let ogr2ogr auto-detect)
+        ["--config", "SHAPE_ENCODING", "UTF-8"],
+        ["--config", "SHAPE_ENCODING", "ISO-8859-1"],  # Latin-1
+        ["--config", "SHAPE_ENCODING", "WINDOWS-1252"], # Windows encoding
+        ["--config", "SHAPE_ENCODING", "CP1252"],       # Alternative Windows
+    ]
+    
+    for strategy in encoding_strategies:
+        try:
+            # Build command with encoding strategy
+            cmd = ["ogr2ogr", "-f", "GeoJSON", "-t_srs", "EPSG:4326"]
+            cmd.extend(strategy)
+            cmd.extend([temp_json, shp_path])
+            
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            if os.path.exists(temp_json):
+                # Try reading with UTF-8, fall back to latin-1
+                try:
+                    with open(temp_json, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except UnicodeDecodeError:
+                    with open(temp_json, 'r', encoding='latin-1') as f:
+                        data = json.load(f)
+                
+                os.remove(temp_json)
+                return data
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            if os.path.exists(temp_json):
+                os.remove(temp_json)
+            continue  # Try next strategy
+        except Exception as e:
+            if os.path.exists(temp_json):
+                os.remove(temp_json)
+            continue
+    
+    # All strategies failed
+    print(f"Error converting {shp_path}: all encoding strategies failed")
     return None
+
+
 
 def extract_centroid(geometry):
     """
