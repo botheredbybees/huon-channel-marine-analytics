@@ -1,0 +1,82 @@
+Metric,Value
+Total Parameters,232
+With Measurements,45
+Without Measurements,187
+Coverage %,19.4%
+With AODN URI,175
+With Mapping Suggestion,204
+
+Standard Codes with Measurements,
+TEMP,10027187,"Raw codes: TEMP,temperature"
+PRES,5537391,"Raw codes: PRES,pressure"
+PSAL,1690892,"Raw codes: PSAL,salinity"
+DOXY,153998,"Raw codes: DOXY,oxygen"
+FLUO,77050,Raw codes: FLUO
+WIND_SPEED,55217,Raw codes: wind_speed
+CPHL,36170,"Raw codes: CPHL,chlorophyll"
+TURB,33158,Raw codes: turbidity
+PH,29921,"Raw codes: PH,ph"
+NTOT,11238,Raw codes: TOTAL_NITROGEN
+CURRENT_SPEED,6013,Raw codes: current_speed
+NTRA,2956,Raw codes: NO3
+PHOS,2476,Raw codes: PO4
+SLCA,2474,Raw codes: SIO4
+AMON,2112,Raw codes: AMMONIA
+NTRI,1476,Raw codes: NITRITE
+
+Top Parameters by Occurrence,
+Abundance of biota,14
+Biotic taxonomic identification,12
+Temperature of the water body,8
+Practical salinity of the water body,7
+Concentration of chlorophyll-a per unit volume of the water body,5
+Turbidity of the water body,4
+Concentration of inferred chlorophyll from relative fluorescence per unit volume of the water body,3
+Concentration of nitrate and nitrite {NO3 and NO2} per unit volume of the water body,3
+Concentration of oxygen {O2} per unit volume of the water body,3
+Concentration of silicate {SiO4} per unit volume of the water body,3
+Downwelling vector irradiance as photons (PAR wavelengths) in the water body,3
+Sea-floor depth below surface of the water body,3
+pH (total scale) of the water body,3
+Concentration of ammonia {NH3} per unit volume of the water body,2
+Concentration of chlorophyll-b per unit volume of the water body,2
+Concentration of nitrite {NO2} per unit volume of the water body,2
+Concentration of suspended particulate material per unit volume of the water body,2
+Concentration of total chlorophyll-c per unit volume of the water body,2
+Concentration of total pigment per unit volume of the water body,2
+Electrical conductivity of the water body,2
+
+Parameters by Dataset,
+IMOS_-_Satellite_Remote_Sensing_-_Ocean_Colour_-_Bio_Optical,59
+National_Outfall_Database,30
+Chlorophyll_sampling_in_the_coastal_waters_of_south_eastern_,13
+Wave_buoys_Observations_-_Australia_-_near_real-time,12
+Baseline_coastal_and_estuarine_condition_assessment_of_the_s,11
+Estuarine_Health_in_Tasmania_status_and_indicators_water_qua,10
+Oceanography_sampling_in_the_coastal_waters_of_south_eastern,9
+IMOS_-_Satellite_Remote_Sensing_-_Satellite_Altimetry_Calibr,8
+Spotted_Handfish_Brachionichthys_hirsutus_-_GPS_Underwater_V,7
+Ocean_acidification_historical_reconstruction,7
+Nutrient_sampling_in_the_coastal_waters_of_south_eastern_Tas,6
+Condition_of_rocky_reef_communities_around_Tasmania_inverteb,5
+IMOS_-_Larval_Fish_Sub-Facility_-_Database_of_Marine_Larval_,5
+Video_surveys_of_long_spined_sea_urchin_Centrostephanus_rodg,5
+Zooplankton_sampling_in_the_coastal_waters_of_south_eastern_,5
+Pigment_sampling_in_the_coastal_waters_of_south_eastern_Tasm,5
+IMOS_-_Autonomous_Underwater_Vehicles_Facility,4
+IMOS_-_Satellite_Remote_Sensing_-_Surface_Waves_Sub-Facility,4
+Condition_of_rocky_reef_communities_around_Tasmania_algal_su,3
+Condition_of_rocky_reef_communities_around_Tasmania_fish_sur,3
+The_Australian_Phytoplankton_Database_1844_-_ongoing_-_abund,3
+Redmap_-_Sightings_of_range_shifting_marine_species,3
+IMOS_-_National_Reef_Monitoring_Network_Sub-Facility_-_Benth,2
+IMOS_-_Understanding_of_Marine_Imagery_UMI_Sub-Facility_-_Sq,2
+IMOS_-_Understanding_of_Marine_Imagery_UMI_Sub-Facility_-_Sq,2
+Phytoplankton_sampling_in_the_coastal_waters_of_south_easter,2
+Remote_sensing_surface_canopy_mapping_of_Giant_Kelp_forests_,1
+CAMRIS_Seagrass_Dataset,1
+Aerial_surveys_of_giant_kelp_Macrocystis_pyrifera_from_Musse,1
+The_Australian_Chlorophyll_a_Database_1965_-_2017,1
+IMOS_-_Satellite_Remote_Sensing_-_MODIS_-_01_day_-_Chlorophy,1
+IMOS_-_Satellite_Remote_Sensing_-_SST_-_L4_-_GAMSSA_-_World,1
+Nearshore_temperature_monitoring_in_Tasmanian_coastal_waters,1
