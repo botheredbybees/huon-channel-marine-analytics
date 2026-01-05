@@ -306,26 +306,73 @@ python populate_measurements.py --dataset "Chlorophyll"
 
 ---
 
-### 6. populate_spatial.py
+### 6. populate_spatial.py ⭐ ENHANCED (v3.0)
 
 **Purpose:** Loads spatial reference data (marine regions, boundaries) from shapefiles.
 
 **Key Functions:**
 - Reads ESRI Shapefiles (`.shp`) using ogr2ogr conversion
-- Extracts polygon geometries for marine regions
-- Converts to PostGIS-compatible geometry format
+- Extracts centroid lat/lon coordinates from polygon/point geometries
+- Converts to database-compatible format (no PostGIS required)
 - Populates `spatial_features` table with region boundaries
 - Supports Tasmania marine bioregions, MPAs, and other spatial features
 - Preserves shapefile attributes as JSONB properties
+- **Handles character encoding issues** (UTF-8, Windows-1252, Latin-1)
+- **Force re-processing** with `--force` flag
+- **Dataset filtering** with `--dataset` flag
+- **Audit trail** via `extracted_at` timestamps
+
+**New in v3.0:**
+- ✅ `--force` flag to re-process existing datasets
+- ✅ `--dataset` filter for selective processing
+- ✅ Robust encoding handling (Windows-1252/CP1252 fallback)
+- ✅ Enhanced logging with Unicode symbols (✓, ✗, ⚠️)
+- ✅ Summary statistics at completion
+- ✅ Timestamp tracking in metadata table
+- ✅ Schema fix (removed uuid field)
 
 **Usage:**
 ```bash
+# Process datasets without spatial features
 python populate_spatial.py
+
+# Force re-process all datasets
+python populate_spatial.py --force
+
+# Process specific dataset
+python populate_spatial.py --dataset "SeaMap Tasmania"
+
+# Force re-process specific dataset
+python populate_spatial.py --force --dataset "Living Shorelines"
+```
+
+**Example Output:**
+```
+Finding datasets...
+Found 7 candidate dataset(s).
+
+Processing 'SeaMap Tasmania benthic habitat map' (1 shapefile(s))...
+  ✓ Inserted 1770 spatial features
+
+Processing 'Living Shorelines Australia database' (2 shapefile(s))...
+  ✓ Inserted 10 spatial features
+
+============================================================
+Processing Complete
+============================================================
+Datasets processed: 7
+New features inserted: 2242
+Total spatial features in database: 2242
 ```
 
 **Requirements:** 
-- GDAL/OGR tools installed
+- GDAL/OGR tools installed (`sudo apt-get install gdal-bin`)
 - Shapefiles must be in `AODN_data/` subdirectories
+- No PostGIS required (uses lat/lon centroids)
+
+**Encoding Fix:**
+Previously failed on datasets with Windows-1252 encoded attributes (e.g., "Living Shorelines Australia").
+Now handles automatically with fallback encoding strategies.
 
 [Detailed Documentation →](populate_spatial_detail.md)
 
@@ -468,7 +515,7 @@ python validate_and_fix_data_issues.py --confirm
    ↓
 5. analyze_parameter_coverage.py  [NEW - Optional but recommended]
    ↓
-6. populate_spatial.py
+6. populate_spatial.py  [ENHANCED v3.0]
    ↓
 7. populate_biological.py
    ↓
@@ -498,6 +545,7 @@ Key optimization techniques across all scripts:
 - **Parallelization:** Scripts can run independently after metadata and parameter mappings load
 - **XML Caching:** Metadata parsed once, stored in database
 - **NULL Handling:** Proper SQL NULL comparison (IS NULL not = NULL)
+- **Encoding Detection:** Shapefile encoding auto-detected (CP1252, Latin-1 fallback)
 
 ---
 
@@ -515,9 +563,15 @@ Common issues and solutions:
    - Check file paths in error messages
    - Verify `config_parameter_mapping.json` exists
 
-### 3. **Encoding errors**
-   - CSV files tried with utf-8, latin1, iso-8859-1
-   - NetCDF files require netCDF4 library
+### 3. **Encoding errors** (populate_spatial.py)
+   - **FIXED in v3.0** - Script now handles automatically
+   - If issues persist, check GDAL installation: `ogr2ogr --version`
+   - Manually test conversion:
+     ```bash
+     ogr2ogr -f GeoJSON -t_srs EPSG:4326 \
+       --config SHAPE_ENCODING CP1252 \
+       test.json problem_file.shp
+     ```
 
 ### 4. **Memory errors**
    - Use `--limit` flag for testing
@@ -555,6 +609,20 @@ Common issues and solutions:
    - Review UNIQUE constraints in schema
    - Use proper NULL handling: `IS NULL` not `= NULL`
 
+### 11. **Shapefile spatial_features table missing**
+   - **FIXED** - Run this SQL to create table:
+     ```sql
+     CREATE TABLE IF NOT EXISTS spatial_features (
+         id SERIAL PRIMARY KEY,
+         metadata_id INTEGER REFERENCES metadata(id),
+         latitude DOUBLE PRECISION,
+         longitude DOUBLE PRECISION,
+         properties JSONB
+     );
+     CREATE INDEX idx_spatial_features_lat_lon ON spatial_features (latitude, longitude);
+     CREATE INDEX idx_spatial_features_metadata_id ON spatial_features(metadata_id);
+     ```
+
 ---
 
 ## Planned Enhancements
@@ -590,6 +658,8 @@ When modifying ETL scripts:
 6. Test with diagnostic_etl.py
 7. Verify data integrity with example_data_access.py
 8. Run parameter coverage analysis after changes
+9. Handle character encoding issues (UTF-8, CP1252, Latin-1)
+10. Add `--force` and `--dataset` arguments where appropriate
 
 ---
 
@@ -605,4 +675,4 @@ When modifying ETL scripts:
 
 ---
 
-*Last Updated: January 5, 2026*
+*Last Updated: January 6, 2026*
