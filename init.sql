@@ -488,6 +488,304 @@ CREATE INDEX IF NOT EXISTS idx_species_obs_taxonomy ON species_observations(taxo
 CREATE INDEX IF NOT EXISTS idx_species_obs_metadata ON species_observations(metadata_id);
 
 -- =============================================================================
+-- TAXONOMY ENRICHMENT TABLES
+-- =============================================================================
+-- Purpose: Cache taxonomic data from external APIs (iNaturalist, WoRMS, GBIF)
+-- Created: January 6, 2026
+-- Dependencies: Requires existing 'taxonomy' table
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. TAXONOMY CACHE TABLE
+-- -----------------------------------------------------------------------------
+-- Stores enriched taxonomic data from external APIs (primarily iNaturalist)
+-- Acts as a cache to avoid repeated API calls and stores additional metadata
+-- not available in source observation files
+
+CREATE TABLE IF NOT EXISTS taxonomy_cache (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    species_name TEXT UNIQUE NOT NULL,
+    
+    -- iNaturalist identifiers
+    inaturalist_taxon_id INTEGER,
+    inaturalist_url TEXT,
+    
+    -- Taxonomic hierarchy (enriched from API)
+    common_name TEXT,
+    genus TEXT,
+    family TEXT,
+    "order" TEXT,
+    class TEXT,
+    phylum TEXT,
+    kingdom TEXT,
+    authority TEXT,  -- Taxonomic authority (e.g., "(Linnaeus, 1758)")
+    
+    -- Taxonomic metadata
+    rank TEXT,  -- species, genus, family, order, class, phylum, kingdom
+    rank_level INTEGER,  -- Numeric rank (10=species, 20=genus, etc.)
+    iconic_taxon_name TEXT,  -- Plantae, Animalia, Chromista, Protozoa, Fungi
+    
+    -- Conservation & distribution
+    conservation_status TEXT,  -- IUCN status if available
+    conservation_status_source TEXT,
+    introduced BOOLEAN DEFAULT FALSE,  -- Is this an introduced/invasive species?
+    endemic BOOLEAN DEFAULT FALSE,  -- Is this endemic to Australia?
+    threatened BOOLEAN DEFAULT FALSE,  -- Is this a threatened species?
+    
+    -- External links
+    wikipedia_url TEXT,
+    wikipedia_summary TEXT,
+    photo_url TEXT,  -- Representative photo URL from iNaturalist
+    photo_attribution TEXT,
+    
+    -- Additional WoRMS data (for marine species)
+    worms_aphia_id INTEGER,
+    worms_lsid TEXT,  -- Life Science Identifier
+    worms_valid_name TEXT,  -- Accepted valid name if this is a synonym
+    is_marine BOOLEAN,
+    is_brackish BOOLEAN,
+    is_freshwater BOOLEAN,
+    is_terrestrial BOOLEAN,
+    
+    -- GBIF data (Global Biodiversity Information Facility)
+    gbif_taxon_key INTEGER,
+    gbif_canonical_name TEXT,
+    
+    -- Raw API responses (stored as JSONB for future reference)
+    inaturalist_response JSONB,
+    worms_response JSONB,
+    gbif_response JSONB,
+    
+    -- Metadata
+    data_source TEXT DEFAULT 'inaturalist',  -- Primary source: inaturalist, worms, gbif, manual
+    last_updated TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexes for taxonomy_cache
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_species ON taxonomy_cache(species_name);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_taxonomy_id ON taxonomy_cache(taxonomy_id);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_inat_id ON taxonomy_cache(inaturalist_taxon_id) WHERE inaturalist_taxon_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_worms_id ON taxonomy_cache(worms_aphia_id) WHERE worms_aphia_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_gbif_key ON taxonomy_cache(gbif_taxon_key) WHERE gbif_taxon_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_iconic ON taxonomy_cache(iconic_taxon_name) WHERE iconic_taxon_name IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_rank ON taxonomy_cache(rank);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_marine ON taxonomy_cache(is_marine) WHERE is_marine = TRUE;
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_source ON taxonomy_cache(data_source);
+
+-- GIN index for JSONB API responses (enables fast JSON queries)
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_inat_response ON taxonomy_cache USING GIN (inaturalist_response);
+
+COMMENT ON TABLE taxonomy_cache IS 'Enriched taxonomic data from external APIs (iNaturalist, WoRMS, GBIF)';
+COMMENT ON COLUMN taxonomy_cache.rank_level IS 'Numeric rank: 10=species, 20=genus, 30=family, 40=order, 50=class, 60=phylum, 70=kingdom';
+COMMENT ON COLUMN taxonomy_cache.iconic_taxon_name IS 'High-level taxonomic group: Plantae, Animalia, Chromista, Protozoa, Fungi, Bacteria, Archaea';
+COMMENT ON COLUMN taxonomy_cache.inaturalist_response IS 'Full JSON response from iNaturalist API for future reference';
+
+-- -----------------------------------------------------------------------------
+-- 2. TAXONOMY ENRICHMENT LOG TABLE
+-- -----------------------------------------------------------------------------
+-- Tracks all API lookups, matches, and failures for debugging and quality control
+-- Essential for identifying species that need manual review
+
+CREATE TABLE IF NOT EXISTS taxonomy_enrichment_log (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    species_name TEXT NOT NULL,
+    
+    -- Search metadata
+    search_query TEXT,  -- Actual query sent to API (may differ from species_name)
+    api_endpoint TEXT,  -- Which API was called (inaturalist, worms, gbif)
+    api_url TEXT,  -- Full URL called
+    
+    -- Response metadata
+    response_status INTEGER,  -- HTTP status code (200, 404, 500, etc.)
+    response_time_ms INTEGER,  -- API response time in milliseconds
+    matches_found INTEGER DEFAULT 0,  -- Number of results returned
+    
+    -- Match selection
+    taxon_id_selected INTEGER,  -- Which taxon ID was chosen from results
+    match_rank INTEGER,  -- Rank of selected match (1=best, 2=second best, etc.)
+    confidence_score DECIMAL(3,2),  -- 0.00 to 1.00 (calculated match confidence)
+    match_method TEXT,  -- exact, fuzzy, genus_only, manual, etc.
+    
+    -- Quality flags
+    needs_manual_review BOOLEAN DEFAULT FALSE,
+    review_reason TEXT,  -- Why this needs review (ambiguous, no_match, low_confidence, etc.)
+    reviewed_by TEXT,  -- Username who reviewed this match
+    reviewed_at TIMESTAMP,
+    review_notes TEXT,
+    
+    -- Error handling
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    
+    -- Metadata
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexes for taxonomy_enrichment_log
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_taxonomy_id ON taxonomy_enrichment_log(taxonomy_id);
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_species ON taxonomy_enrichment_log(species_name);
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_api ON taxonomy_enrichment_log(api_endpoint);
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_status ON taxonomy_enrichment_log(response_status);
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_created ON taxonomy_enrichment_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_needs_review 
+    ON taxonomy_enrichment_log(needs_manual_review) 
+    WHERE needs_manual_review = TRUE;
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_confidence 
+    ON taxonomy_enrichment_log(confidence_score) 
+    WHERE confidence_score < 0.80;
+
+COMMENT ON TABLE taxonomy_enrichment_log IS 'Audit log of all taxonomy API lookups and match decisions';
+COMMENT ON COLUMN taxonomy_enrichment_log.confidence_score IS 'Match confidence: 1.0=exact, 0.9+=high, 0.7-0.9=medium, <0.7=low (needs review)';
+COMMENT ON COLUMN taxonomy_enrichment_log.review_reason IS 'Values: ambiguous, no_match, low_confidence, multiple_matches, synonym_conflict, unidentified_category';
+
+-- -----------------------------------------------------------------------------
+-- 3. TAXONOMY SYNONYMS TABLE
+-- -----------------------------------------------------------------------------
+-- Stores synonym relationships discovered during enrichment
+-- Many species have multiple scientific names; this tracks accepted vs synonym names
+
+CREATE TABLE IF NOT EXISTS taxonomy_synonyms (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    synonym_name TEXT NOT NULL,
+    accepted_name TEXT NOT NULL,
+    status TEXT,  -- synonym, accepted, invalid, misapplied, etc.
+    source TEXT,  -- inaturalist, worms, gbif
+    source_taxon_id INTEGER,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(synonym_name, accepted_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_taxonomy_synonyms_taxonomy_id ON taxonomy_synonyms(taxonomy_id);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_synonyms_synonym ON taxonomy_synonyms(synonym_name);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_synonyms_accepted ON taxonomy_synonyms(accepted_name);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_synonyms_source ON taxonomy_synonyms(source);
+
+COMMENT ON TABLE taxonomy_synonyms IS 'Synonym relationships for species names';
+COMMENT ON COLUMN taxonomy_synonyms.status IS 'Taxonomic status: synonym, accepted, invalid, misapplied, uncertain';
+
+-- -----------------------------------------------------------------------------
+-- 4. TAXONOMY COMMON NAMES TABLE
+-- -----------------------------------------------------------------------------
+-- Stores multiple common names per species (many species have regional variants)
+-- e.g., "Ecklonia radiata" = "Common kelp" (AUS), "Southern kelp" (NZ)
+
+CREATE TABLE IF NOT EXISTS taxonomy_common_names (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    common_name TEXT NOT NULL,
+    language TEXT DEFAULT 'en',  -- ISO 639-1 language code
+    locality TEXT,  -- Australia, Tasmania, New Zealand, etc.
+    is_primary BOOLEAN DEFAULT FALSE,  -- Primary common name for this species
+    source TEXT,  -- inaturalist, worms, gbif, local
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(taxonomy_id, common_name, language)
+);
+
+CREATE INDEX IF NOT EXISTS idx_taxonomy_common_names_taxonomy_id ON taxonomy_common_names(taxonomy_id);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_common_names_name ON taxonomy_common_names(common_name);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_common_names_language ON taxonomy_common_names(language);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_common_names_primary 
+    ON taxonomy_common_names(taxonomy_id, is_primary) 
+    WHERE is_primary = TRUE;
+
+COMMENT ON TABLE taxonomy_common_names IS 'Multiple common names per species with language and locality';
+COMMENT ON COLUMN taxonomy_common_names.locality IS 'Regional variation: Australia, Tasmania, New South Wales, etc.';
+
+-- -----------------------------------------------------------------------------
+-- 5. HELPER VIEW: Taxonomy Summary
+-- -----------------------------------------------------------------------------
+-- Convenient view combining taxonomy table with enrichment status
+
+CREATE OR REPLACE VIEW taxonomy_enrichment_status AS
+SELECT 
+    t.id,
+    t.species_name,
+    t.common_name AS original_common_name,
+    tc.common_name AS enriched_common_name,
+    tc.genus,
+    tc.family,
+    tc."order",
+    tc.class,
+    tc.phylum,
+    tc.kingdom,
+    tc.rank,
+    tc.iconic_taxon_name,
+    tc.conservation_status,
+    tc.introduced,
+    tc.endemic,
+    tc.threatened,
+    tc.data_source,
+    tc.inaturalist_taxon_id,
+    tc.worms_aphia_id,
+    tc.photo_url,
+    tc.wikipedia_url,
+    tc.last_updated AS cache_last_updated,
+    CASE 
+        WHEN tc.id IS NULL THEN 'not_enriched'
+        WHEN tel.needs_manual_review = TRUE THEN 'needs_review'
+        WHEN tc.genus IS NOT NULL AND tc.family IS NOT NULL THEN 'fully_enriched'
+        WHEN tc.genus IS NOT NULL THEN 'partially_enriched'
+        ELSE 'enrichment_failed'
+    END AS enrichment_status,
+    tel.confidence_score,
+    tel.review_reason,
+    tel.matches_found,
+    (SELECT COUNT(*) FROM species_observations WHERE taxonomy_id = t.id) AS observation_count
+FROM taxonomy t
+LEFT JOIN taxonomy_cache tc ON t.id = tc.taxonomy_id
+LEFT JOIN LATERAL (
+    SELECT * FROM taxonomy_enrichment_log 
+    WHERE taxonomy_id = t.id 
+    ORDER BY created_at DESC 
+    LIMIT 1
+) tel ON TRUE;
+
+COMMENT ON VIEW taxonomy_enrichment_status IS 'Summary of taxonomy enrichment status with observation counts';
+
+-- -----------------------------------------------------------------------------
+-- 6. HELPER VIEW: Taxa Needing Manual Review
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW taxa_needing_review AS
+SELECT 
+    t.id AS taxonomy_id,
+    t.species_name,
+    tel.review_reason,
+    tel.confidence_score,
+    tel.matches_found,
+    tel.search_query,
+    tel.created_at AS last_lookup,
+    (SELECT COUNT(*) FROM species_observations WHERE taxonomy_id = t.id) AS observation_count
+FROM taxonomy t
+JOIN taxonomy_enrichment_log tel ON t.id = tel.taxonomy_id
+WHERE tel.needs_manual_review = TRUE
+  AND tel.reviewed_at IS NULL
+ORDER BY observation_count DESC, tel.created_at DESC;
+
+COMMENT ON VIEW taxa_needing_review IS 'Species requiring manual review, ordered by observation count (most important first)';
+
+-- =============================================================================
+-- GRANTS (if needed for read-only users)
+-- =============================================================================
+
+GRANT SELECT ON taxonomy_cache TO marine_user;
+GRANT SELECT ON taxonomy_enrichment_log TO marine_user;
+GRANT SELECT ON taxonomy_synonyms TO marine_user;
+GRANT SELECT ON taxonomy_common_names TO marine_user;
+GRANT SELECT ON taxonomy_enrichment_status TO marine_user;
+GRANT SELECT ON taxa_needing_review TO marine_user;
+
+-- =============================================================================
+-- END OF TAXONOMY ENRICHMENT SCHEMA
+-- =============================================================================
+
+
+-- =============================================================================
 -- GRANTS FOR GRAFANA/PGADMIN
 -- =============================================================================
 
