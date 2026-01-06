@@ -9,7 +9,6 @@ The schema is organized around a central **Metadata** registry, to which all typ
 2.  **Spatial Features**: Polygons, lines, and non-time-series geometries (pure PostgreSQL).
 3.  **Biological Observations**: Species occurrences and taxonomy.
 4.  **Parameter Mappings**: Standardized parameter name mappings.
-5.  **Taxonomy Enrichment**: ⭐ **NEW** - External API cache (iNaturalist, WoRMS, GBIF).
 
 ---
 
@@ -155,18 +154,22 @@ CREATE TABLE metadata (
     
     -- Dataset file paths
     dataset_name TEXT,
-    dataset_path TEXT UNIQUE,
+    dataset_path TEXT,
     
     -- Audit trail
     extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    date_created DATE
+    date_created DATE,
+    
+    -- PostGIS spatial extent (unlocks spatial queries)
+    extent_geom GEOMETRY(POLYGON, 4326),
+    bbox_envelope BOX2D GENERATED ALWAYS AS (BOX2D(extent_geom)) STORED
 );
 
 CREATE INDEX idx_metadata_uuid ON metadata(uuid);
 CREATE INDEX idx_metadata_parent_uuid ON metadata(parent_uuid) WHERE parent_uuid IS NOT NULL;
 CREATE INDEX idx_metadata_bbox ON metadata(west, east, south, north);
 CREATE INDEX idx_metadata_time ON metadata(time_start, time_end);
-CREATE INDEX idx_metadata_dataset_path ON metadata(dataset_path);
+CREATE INDEX idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
 ```
 
 #### Key Fields ⭐ ENHANCED
@@ -193,6 +196,116 @@ CREATE INDEX idx_metadata_dataset_path ON metadata(dataset_path);
 *   **`dataset_path`**: Relative path to the source folder/file on disk.
 *   **`dataset_name`**: Human-readable name of the dataset (e.g., "Australian Chlorophyll-a Database").
 
+#### XML Metadata Extraction ⭐ NEW
+
+Metadata fields are extracted from ISO 19115-3 XML files using multiple XPath patterns:
+
+```python
+# Example extraction patterns from populate_metadata.py v4.0
+
+# Parent UUID (links to collection)
+parent_uuid = xml.find('.//mdb:parentMetadata[@uuidref]')
+
+# Metadata dates
+creation_date = xml.find('.//cit:date[.//cit:CI_DateTypeCode[@codeListValue="creation"]]/cit:date')
+revision_date = xml.find('.//cit:date[.//cit:CI_DateTypeCode[@codeListValue="revision"]]/cit:date')
+
+# Multiple credits (concatenated)
+credits = xml.findall('.//mri:credit/gco:CharacterString')
+credit_text = '; '.join([c.text for c in credits if c.text])
+
+# Processing lineage
+lineage = xml.find('.//mrl:statement/gco:CharacterString')
+
+# Distribution URLs
+wfs_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "OGC:WFS")]]')
+wms_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "OGC:WMS")]]')
+portal_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "WWW:LINK-1.0-http--portal")]]')
+pub_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "WWW:LINK-1.0-http--publication")]]')
+```
+
+**Extraction Statistics (typical AODN dataset):**
+- **30+ fields** extracted per XML file
+- **100% success rate** for core fields (title, bbox, dates)
+- **68%** datasets with parent_uuid
+- **84%** datasets with WFS URLs
+- **92%** datasets with WMS URLs
+- **50%** datasets with multiple credits
+
+**Extraction Patterns by XML Element:**
+
+| Field | XML XPath Pattern | Fallback Strategy |
+|-------|-------------------|-------------------|
+| `parent_uuid` | `mdb:parentMetadata[@uuidref]` | NULL if not found |
+| `metadata_revision_date` | `cit:date[cit:CI_DateTypeCode="revision"]` | Use creation_date |
+| `credit` | All `mri:credit/gco:CharacterString` | Concatenate with "; " |
+| `lineage` | `mrl:statement/gco:CharacterString` | Try 3 different patterns |
+| `distribution_wfs_url` | `cit:linkage[protocol="OGC:WFS"]` | NULL if not found |
+| `license_url` | `mrd:graphicOverview/cit:onlineResource` | NULL if not found |
+
+#### Relationships
+
+| Field | Links To | Purpose |
+|-------|----------|---------|
+| `id` | FK in `parameters`, `measurements`, `species_observations` | Primary relationships |
+| `uuid` | FK in `measurements.uuid`, `parameters.uuid` | Backward reference field |
+| `parent_uuid` | `metadata.uuid` | Hierarchical dataset relationships |
+
+#### Usage Examples
+
+```sql
+-- Find all child datasets of a collection
+SELECT id, title, dataset_name
+FROM metadata
+WHERE parent_uuid = 'abc123-parent-uuid';
+
+-- Get dataset with all distribution endpoints
+SELECT 
+  title, 
+  distribution_wfs_url, 
+  distribution_wms_url, 
+  distribution_portal_url
+FROM metadata
+WHERE distribution_wfs_url IS NOT NULL;
+
+-- Find datasets updated in last year
+SELECT title, metadata_revision_date
+FROM metadata
+WHERE metadata_revision_date > NOW() - INTERVAL '1 year'
+ORDER BY metadata_revision_date DESC;
+
+-- Get all credits for a dataset
+SELECT title, credit
+FROM metadata
+WHERE credit LIKE '%;%';  -- Multiple credits
+
+-- Find datasets by contributor
+SELECT title, credit
+FROM metadata
+WHERE credit ILIKE '%CSIRO%';
+
+-- Get hierarchical dataset tree
+WITH RECURSIVE dataset_tree AS (
+  -- Root datasets
+  SELECT id, uuid, parent_uuid, title, 0 as level
+  FROM metadata
+  WHERE parent_uuid IS NULL
+  
+  UNION ALL
+  
+  -- Child datasets
+  SELECT m.id, m.uuid, m.parent_uuid, m.title, dt.level + 1
+  FROM metadata m
+  INNER JOIN dataset_tree dt ON m.parent_uuid = dt.uuid
+)
+SELECT 
+  REPEAT('  ', level) || title as hierarchy,
+  uuid,
+  parent_uuid
+FROM dataset_tree
+ORDER BY level, title;
+```
+
 ### `parameters` (One-to-Many with Metadata)
 Describes specific variables available in a dataset (e.g., "Sea Surface Temperature").
 
@@ -202,6 +315,7 @@ Describes specific variables available in a dataset (e.g., "Sea Surface Temperat
 CREATE TABLE parameters (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
+    uuid TEXT NOT NULL REFERENCES metadata(uuid) ON DELETE CASCADE,
     parameter_code TEXT NOT NULL,
     parameter_label TEXT,
     standard_name TEXT,
@@ -217,7 +331,7 @@ CREATE TABLE parameters (
     created_at TIMESTAMP DEFAULT NOW(),
     imos_parameter_uri TEXT REFERENCES imos_vocab_parameters(uri),
     imos_unit_uri TEXT REFERENCES imos_vocab_units(uri),
-    UNIQUE(metadata_id, parameter_code)
+    UNIQUE(uuid, parameter_code)
 );
 ```
 
@@ -238,16 +352,16 @@ A **Hypertable** partitioned by `time`. Stores physical and chemical sensor data
 ```sql
 CREATE TABLE measurements (
     time TIMESTAMPTZ NOT NULL,
-    data_id BIGSERIAL,
-    metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
+    data_id BIGSERIAL PRIMARY KEY,
+    uuid TEXT REFERENCES metadata(uuid) ON DELETE CASCADE,
     parameter_code TEXT NOT NULL,
     namespace TEXT NOT NULL DEFAULT 'custom',
     value DOUBLE PRECISION NOT NULL,
     uom TEXT NOT NULL,
-    location_qc_flag TEXT,
     uncertainty DOUBLE PRECISION,
     depth_m NUMERIC,
     location_id BIGINT REFERENCES locations(id),
+    metadata_id INTEGER REFERENCES metadata(id),
     quality_flag SMALLINT DEFAULT 1
 );
 
@@ -255,10 +369,6 @@ CREATE TABLE measurements (
 SELECT create_hypertable('measurements', by_range('time'));
 
 -- Add compression
-ALTER TABLE measurements SET (
-    timescaledb.compress = true, 
-    timescaledb.compress_segmentby = 'parameter_code, namespace'
-);
 SELECT add_compression_policy('measurements', INTERVAL '7 days');
 ```
 
@@ -313,13 +423,13 @@ Stores non-time-series spatial data using pure PostgreSQL (no PostGIS geometries
 CREATE TABLE spatial_features (
     id SERIAL PRIMARY KEY,
     metadata_id INTEGER REFERENCES metadata(id),
+    uuid TEXT,
     latitude DOUBLE PRECISION,
     longitude DOUBLE PRECISION,
     properties JSONB
 );
 
-CREATE INDEX idx_spatial_features_lat_lon ON spatial_features (latitude, longitude);
-CREATE INDEX idx_spatial_features_metadata_id ON spatial_features(metadata_id);
+CREATE INDEX spatial_features_lat_lon_idx ON spatial_features (latitude, longitude);
 ```
 
 #### Key Fields
@@ -383,8 +493,6 @@ CREATE TABLE species_observations (
 );
 
 CREATE INDEX idx_species_obs_lat_lon ON species_observations (latitude, longitude);
-CREATE INDEX idx_species_obs_taxonomy ON species_observations(taxonomy_id);
-CREATE INDEX idx_species_obs_metadata ON species_observations(metadata_id);
 ```
 
 #### Key Fields
@@ -394,302 +502,6 @@ CREATE INDEX idx_species_obs_metadata ON species_observations(metadata_id);
 *   **`count_value`**: Numeric abundance (if available).
 *   **`count_category`**: Text description if count is a range (e.g., "DOC" - Dominant).
 *   **`latitude`, `longitude`**: **[Key Field]** Denormalized coordinates. While redundant with `locations`, storing them here allows for faster heatmap generation and spatial filtering without joins.
-
----
-
-## 5. Taxonomy Enrichment ⭐ NEW (January 6, 2026)
-
-External API cache system for enriching species taxonomy from iNaturalist, WoRMS, and GBIF. **564 species** ready for enrichment (100% missing genus, family, common_name).
-
-### `taxonomy_cache`
-Primary enrichment data storage with 48 columns of taxonomic metadata.
-
-#### DDL
-
-```sql
-CREATE TABLE taxonomy_cache (
-    id SERIAL PRIMARY KEY,
-    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
-    species_name TEXT UNIQUE NOT NULL,
-    
-    -- iNaturalist identifiers
-    inaturalist_taxon_id INTEGER,
-    inaturalist_url TEXT,
-    
-    -- Taxonomic hierarchy (enriched from API)
-    common_name TEXT,
-    genus TEXT,
-    family TEXT,
-    "order" TEXT,
-    class TEXT,
-    phylum TEXT,
-    kingdom TEXT,
-    authority TEXT,  -- Taxonomic authority (e.g., "(Linnaeus, 1758)")
-    
-    -- Taxonomic metadata
-    rank TEXT,  -- species, genus, family, order, class, phylum, kingdom
-    rank_level INTEGER,  -- Numeric rank (10=species, 20=genus, etc.)
-    iconic_taxon_name TEXT,  -- Plantae, Animalia, Chromista, Protozoa, Fungi
-    
-    -- Conservation & distribution
-    conservation_status TEXT,  -- IUCN status if available
-    conservation_status_source TEXT,
-    introduced BOOLEAN DEFAULT FALSE,  -- Is this an introduced/invasive species?
-    endemic BOOLEAN DEFAULT FALSE,  -- Is this endemic to Australia?
-    threatened BOOLEAN DEFAULT FALSE,  -- Is this a threatened species?
-    
-    -- External links
-    wikipedia_url TEXT,
-    wikipedia_summary TEXT,
-    photo_url TEXT,  -- Representative photo URL from iNaturalist
-    photo_attribution TEXT,
-    
-    -- Additional WoRMS data (for marine species)
-    worms_aphia_id INTEGER,
-    worms_lsid TEXT,  -- Life Science Identifier
-    worms_valid_name TEXT,  -- Accepted valid name if this is a synonym
-    is_marine BOOLEAN,
-    is_brackish BOOLEAN,
-    is_freshwater BOOLEAN,
-    is_terrestrial BOOLEAN,
-    
-    -- GBIF data (Global Biodiversity Information Facility)
-    gbif_taxon_key INTEGER,
-    gbif_canonical_name TEXT,
-    
-    -- Raw API responses (stored as JSONB for future reference)
-    inaturalist_response JSONB,
-    worms_response JSONB,
-    gbif_response JSONB,
-    
-    -- Metadata
-    data_source TEXT DEFAULT 'inaturalist',  -- Primary source: inaturalist, worms, gbif, manual
-    last_updated TIMESTAMP DEFAULT NOW(),
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Indexes for taxonomy_cache
-CREATE INDEX idx_taxonomy_cache_species ON taxonomy_cache(species_name);
-CREATE INDEX idx_taxonomy_cache_taxonomy_id ON taxonomy_cache(taxonomy_id);
-CREATE INDEX idx_taxonomy_cache_inat_id ON taxonomy_cache(inaturalist_taxon_id) WHERE inaturalist_taxon_id IS NOT NULL;
-CREATE INDEX idx_taxonomy_cache_worms_id ON taxonomy_cache(worms_aphia_id) WHERE worms_aphia_id IS NOT NULL;
-CREATE INDEX idx_taxonomy_cache_gbif_key ON taxonomy_cache(gbif_taxon_key) WHERE gbif_taxon_key IS NOT NULL;
-CREATE INDEX idx_taxonomy_cache_iconic ON taxonomy_cache(iconic_taxon_name) WHERE iconic_taxon_name IS NOT NULL;
-CREATE INDEX idx_taxonomy_cache_rank ON taxonomy_cache(rank);
-CREATE INDEX idx_taxonomy_cache_marine ON taxonomy_cache(is_marine) WHERE is_marine = TRUE;
-CREATE INDEX idx_taxonomy_cache_source ON taxonomy_cache(data_source);
-CREATE INDEX idx_taxonomy_cache_inat_response ON taxonomy_cache USING GIN (inaturalist_response);
-```
-
-#### Key Fields
-
-*   **`taxonomy_id`**: FK to `taxonomy` table (the base species list).
-*   **`species_name`**: Species scientific name (denormalized for faster lookups).
-*   **`inaturalist_taxon_id`**: Primary external ID from iNaturalist API.
-*   **`iconic_taxon_name`**: High-level taxonomic group (Plantae, Animalia, Chromista, etc.).
-*   **`rank_level`**: Numeric taxonomic rank (10=species, 20=genus, 30=family, etc.).
-*   **`conservation_status`**: IUCN status if available from API.
-*   **`introduced`, `endemic`, `threatened`**: Boolean flags for conservation management.
-*   **`inaturalist_response`, `worms_response`, `gbif_response`**: Full JSONB API responses for future data mining.
-*   **`data_source`**: Tracks which API was primary source (inaturalist, worms, gbif, manual).
-
-### `taxonomy_enrichment_log`
-Complete audit trail of all API lookups and match decisions.
-
-#### DDL
-
-```sql
-CREATE TABLE taxonomy_enrichment_log (
-    id SERIAL PRIMARY KEY,
-    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
-    species_name TEXT NOT NULL,
-    
-    -- Search metadata
-    search_query TEXT,  -- Actual query sent to API (may differ from species_name)
-    api_endpoint TEXT,  -- Which API was called (inaturalist, worms, gbif)
-    api_url TEXT,  -- Full URL called
-    
-    -- Response metadata
-    response_status INTEGER,  -- HTTP status code (200, 404, 500, etc.)
-    response_time_ms INTEGER,  -- API response time in milliseconds
-    matches_found INTEGER DEFAULT 0,  -- Number of results returned
-    
-    -- Match selection
-    taxon_id_selected INTEGER,  -- Which taxon ID was chosen from results
-    match_rank INTEGER,  -- Rank of selected match (1=best, 2=second best, etc.)
-    confidence_score DECIMAL(3,2),  -- 0.00 to 1.00 (calculated match confidence)
-    match_method TEXT,  -- exact, fuzzy, genus_only, manual, etc.
-    
-    -- Quality flags
-    needs_manual_review BOOLEAN DEFAULT FALSE,
-    review_reason TEXT,  -- Why this needs review (ambiguous, no_match, low_confidence, etc.)
-    reviewed_by TEXT,  -- Username who reviewed this match
-    reviewed_at TIMESTAMP,
-    review_notes TEXT,
-    
-    -- Error handling
-    error_message TEXT,
-    retry_count INTEGER DEFAULT 0,
-    
-    -- Metadata
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Indexes for taxonomy_enrichment_log
-CREATE INDEX idx_enrichment_log_taxonomy_id ON taxonomy_enrichment_log(taxonomy_id);
-CREATE INDEX idx_enrichment_log_species ON taxonomy_enrichment_log(species_name);
-CREATE INDEX idx_enrichment_log_api ON taxonomy_enrichment_log(api_endpoint);
-CREATE INDEX idx_enrichment_log_status ON taxonomy_enrichment_log(response_status);
-CREATE INDEX idx_enrichment_log_created ON taxonomy_enrichment_log(created_at DESC);
-CREATE INDEX idx_enrichment_log_needs_review 
-    ON taxonomy_enrichment_log(needs_manual_review) 
-    WHERE needs_manual_review = TRUE;
-CREATE INDEX idx_enrichment_log_confidence 
-    ON taxonomy_enrichment_log(confidence_score) 
-    WHERE confidence_score < 0.80;
-```
-
-#### Key Fields
-
-*   **`confidence_score`**: Match quality metric (1.0=exact, 0.9+=high, 0.7-0.9=medium, <0.7=low/needs review).
-*   **`needs_manual_review`**: Boolean flag for species requiring human verification.
-*   **`review_reason`**: Categorizes why review is needed (ambiguous, no_match, low_confidence, multiple_matches, synonym_conflict, unidentified_category).
-*   **`response_time_ms`**: API performance tracking for rate limiting decisions.
-*   **`matches_found`**: Number of results returned by API (0 = not found, >1 = ambiguous).
-
-### `taxonomy_synonyms`
-Tracks synonym relationships discovered during enrichment.
-
-#### DDL
-
-```sql
-CREATE TABLE taxonomy_synonyms (
-    id SERIAL PRIMARY KEY,
-    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
-    synonym_name TEXT NOT NULL,
-    accepted_name TEXT NOT NULL,
-    status TEXT,  -- synonym, accepted, invalid, misapplied, etc.
-    source TEXT,  -- inaturalist, worms, gbif
-    source_taxon_id INTEGER,
-    notes TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(synonym_name, accepted_name)
-);
-
-CREATE INDEX idx_taxonomy_synonyms_taxonomy_id ON taxonomy_synonyms(taxonomy_id);
-CREATE INDEX idx_taxonomy_synonyms_synonym ON taxonomy_synonyms(synonym_name);
-CREATE INDEX idx_taxonomy_synonyms_accepted ON taxonomy_synonyms(accepted_name);
-CREATE INDEX idx_taxonomy_synonyms_source ON taxonomy_synonyms(source);
-```
-
-#### Key Fields
-
-*   **`synonym_name`**: Alternate scientific name for the species.
-*   **`accepted_name`**: Currently accepted valid taxonomic name.
-*   **`status`**: Taxonomic status (synonym, accepted, invalid, misapplied, uncertain).
-*   **`source`**: Which API provided this synonym relationship.
-
-### `taxonomy_common_names`
-Stores multiple common names per species with language and regional variants.
-
-#### DDL
-
-```sql
-CREATE TABLE taxonomy_common_names (
-    id SERIAL PRIMARY KEY,
-    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
-    common_name TEXT NOT NULL,
-    language TEXT DEFAULT 'en',  -- ISO 639-1 language code
-    locality TEXT,  -- Australia, Tasmania, New Zealand, etc.
-    is_primary BOOLEAN DEFAULT FALSE,  -- Primary common name for this species
-    source TEXT,  -- inaturalist, worms, gbif, local
-    created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(taxonomy_id, common_name, language)
-);
-
-CREATE INDEX idx_taxonomy_common_names_taxonomy_id ON taxonomy_common_names(taxonomy_id);
-CREATE INDEX idx_taxonomy_common_names_name ON taxonomy_common_names(common_name);
-CREATE INDEX idx_taxonomy_common_names_language ON taxonomy_common_names(language);
-CREATE INDEX idx_taxonomy_common_names_primary 
-    ON taxonomy_common_names(taxonomy_id, is_primary) 
-    WHERE is_primary = TRUE;
-```
-
-#### Key Fields
-
-*   **`locality`**: Regional variation (e.g., "Australia", "Tasmania", "New South Wales").
-*   **`language`**: ISO 639-1 code (en, fr, de, etc.).
-*   **`is_primary`**: Flags the preferred common name for display.
-
-### `taxonomy_enrichment_status` (View)
-Convenient summary combining taxonomy with enrichment status and observation counts.
-
-```sql
-CREATE OR REPLACE VIEW taxonomy_enrichment_status AS
-SELECT 
-    t.id,
-    t.species_name,
-    t.common_name AS original_common_name,
-    tc.common_name AS enriched_common_name,
-    tc.genus,
-    tc.family,
-    tc."order",
-    tc.class,
-    tc.phylum,
-    tc.kingdom,
-    tc.rank,
-    tc.iconic_taxon_name,
-    tc.conservation_status,
-    tc.introduced,
-    tc.endemic,
-    tc.threatened,
-    tc.data_source,
-    tc.inaturalist_taxon_id,
-    tc.worms_aphia_id,
-    tc.photo_url,
-    tc.wikipedia_url,
-    tc.last_updated AS cache_last_updated,
-    CASE 
-        WHEN tc.id IS NULL THEN 'not_enriched'
-        WHEN tel.needs_manual_review = TRUE THEN 'needs_review'
-        WHEN tc.genus IS NOT NULL AND tc.family IS NOT NULL THEN 'fully_enriched'
-        WHEN tc.genus IS NOT NULL THEN 'partially_enriched'
-        ELSE 'enrichment_failed'
-    END AS enrichment_status,
-    tel.confidence_score,
-    tel.review_reason,
-    tel.matches_found,
-    (SELECT COUNT(*) FROM species_observations WHERE taxonomy_id = t.id) AS observation_count
-FROM taxonomy t
-LEFT JOIN taxonomy_cache tc ON t.id = tc.taxonomy_id
-LEFT JOIN LATERAL (
-    SELECT * FROM taxonomy_enrichment_log 
-    WHERE taxonomy_id = t.id 
-    ORDER BY created_at DESC 
-    LIMIT 1
-) tel ON TRUE;
-```
-
-### `taxa_needing_review` (View)
-Species flagged for manual review, prioritized by observation count.
-
-```sql
-CREATE OR REPLACE VIEW taxa_needing_review AS
-SELECT 
-    t.id AS taxonomy_id,
-    t.species_name,
-    tel.review_reason,
-    tel.confidence_score,
-    tel.matches_found,
-    tel.search_query,
-    tel.created_at AS last_lookup,
-    (SELECT COUNT(*) FROM species_observations WHERE taxonomy_id = t.id) AS observation_count
-FROM taxonomy t
-JOIN taxonomy_enrichment_log tel ON t.id = tel.taxonomy_id
-WHERE tel.needs_manual_review = TRUE
-  AND tel.reviewed_at IS NULL
-ORDER BY observation_count DESC, tel.created_at DESC;
-```
 
 ---
 
@@ -705,10 +517,6 @@ erDiagram
 
     LOCATIONS ||--o{ SPECIES_OBSERVATIONS : at
     TAXONOMY ||--o{ SPECIES_OBSERVATIONS : is_of
-    TAXONOMY ||--o| TAXONOMY_CACHE : enriched_by
-    TAXONOMY ||--o{ TAXONOMY_ENRICHMENT_LOG : tracked_by
-    TAXONOMY ||--o{ TAXONOMY_SYNONYMS : has_synonyms
-    TAXONOMY ||--o{ TAXONOMY_COMMON_NAMES : has_common_names
     
     PARAMETER_MAPPINGS ||--o{ MEASUREMENTS : standardizes
 
@@ -723,21 +531,6 @@ erDiagram
         double latitude
         double longitude
         jsonb properties
-    }
-    
-    TAXONOMY_CACHE {
-        int taxonomy_id FK
-        string species_name
-        int inaturalist_taxon_id
-        string iconic_taxon_name
-        jsonb inaturalist_response
-    }
-    
-    TAXONOMY_ENRICHMENT_LOG {
-        int taxonomy_id FK
-        decimal confidence_score
-        boolean needs_manual_review
-        string review_reason
     }
     
     PARAMETER_MAPPINGS {
@@ -811,6 +604,8 @@ SELECT
     m.uncertainty, m.depth_m, m.location_id, m.quality_flag,
     md.title AS dataset_title,
     md.dataset_name,
+    md.metadata_revision_date,
+    md.credit,
     p.parameter_label,
     p.unit_name,
     md.west, md.east, md.south, md.north
@@ -847,10 +642,9 @@ GROUP BY p.parameter_code, p.parameter_label, p.aodn_parameter_uri;
 ### Indexes
 
 - **B-tree indexes** on all foreign keys and commonly filtered columns
-- **Sparse B-tree indexes** on `taxonomy_cache` external IDs (only non-null values)
-- **Partial indexes** for common queries (`WHERE needs_manual_review = TRUE`, `WHERE confidence_score < 0.80`)
+- **Sparse B-tree index** on `metadata.parent_uuid` (only non-null values)
 - **BRIN indexes** on `measurements.time` for efficient time-range scans
-- **GIN indexes** on JSONB columns (`taxonomy_cache.inaturalist_response`) and text search
+- **GIN indexes** on text columns for text search
 - **Composite indexes** for multi-column queries (e.g., bbox + time)
 
 ### Compression
@@ -889,94 +683,66 @@ WHERE parameter_code = 'TEMP'
 ORDER BY time;
 ```
 
-### Check taxonomy enrichment status
+### Find datasets with WFS endpoints
 
 ```sql
--- Overall enrichment statistics
-SELECT 
-    COUNT(*) as total_species,
-    COUNT(tc.id) as enriched_species,
-    COUNT(CASE WHEN tc.genus IS NOT NULL THEN 1 END) as has_genus,
-    COUNT(CASE WHEN tc.family IS NOT NULL THEN 1 END) as has_family,
-    COUNT(CASE WHEN tel.needs_manual_review = TRUE THEN 1 END) as needs_review,
-    ROUND(100.0 * COUNT(tc.id) / COUNT(*), 1) as pct_enriched
-FROM taxonomy t
-LEFT JOIN taxonomy_cache tc ON t.id = tc.taxonomy_id
-LEFT JOIN LATERAL (
-    SELECT needs_manual_review 
-    FROM taxonomy_enrichment_log 
-    WHERE taxonomy_id = t.id 
-    ORDER BY created_at DESC 
-    LIMIT 1
-) tel ON TRUE;
+SELECT title, dataset_name, distribution_wfs_url
+FROM metadata
+WHERE distribution_wfs_url IS NOT NULL
+ORDER BY title;
 ```
 
-### Find species needing manual review (prioritized)
+### Get parameter mapping variants
 
 ```sql
-SELECT species_name, review_reason, confidence_score, observation_count
-FROM taxa_needing_review
-LIMIT 10;
+-- Find all ways to represent temperature
+SELECT raw_parameter_name, standard_code, namespace, unit
+FROM parameter_mappings
+WHERE standard_code = 'TEMP'
+ORDER BY namespace, raw_parameter_name;
 ```
 
-### Get enriched species with photos
+### Find child datasets of a collection
 
 ```sql
-SELECT 
-    t.species_name,
-    tc.common_name,
-    tc.family,
-    tc.photo_url,
-    tc.photo_attribution,
-    tc.wikipedia_url,
-    (SELECT COUNT(*) FROM species_observations WHERE taxonomy_id = t.id) as obs_count
-FROM taxonomy t
-JOIN taxonomy_cache tc ON t.id = tc.taxonomy_id
-WHERE tc.photo_url IS NOT NULL
-ORDER BY obs_count DESC
-LIMIT 20;
+SELECT id, title, dataset_name, metadata_revision_date
+FROM metadata
+WHERE parent_uuid = '744ac2a9-689c-40d3-b262-0df6863f0327'
+ORDER BY metadata_revision_date DESC;
 ```
 
-### Find introduced/invasive marine species
+### Get datasets by contributor
 
 ```sql
-SELECT 
-    tc.species_name,
-    tc.common_name,
-    tc.family,
-    tc.conservation_status,
-    tc.data_source
-FROM taxonomy_cache tc
-WHERE tc.introduced = TRUE 
-  AND tc.is_marine = TRUE
-ORDER BY tc.family, tc.species_name;
+SELECT title, credit, metadata_revision_date
+FROM metadata
+WHERE credit ILIKE '%CSIRO%'
+ORDER BY metadata_revision_date DESC;
 ```
 
-### Get synonym mappings
+### Get hierarchical dataset relationships
 
 ```sql
+WITH RECURSIVE dataset_tree AS (
+  -- Root datasets (no parent)
+  SELECT id, uuid, parent_uuid, title, 0 as level
+  FROM metadata
+  WHERE parent_uuid IS NULL
+  
+  UNION ALL
+  
+  -- Child datasets
+  SELECT m.id, m.uuid, m.parent_uuid, m.title, dt.level + 1
+  FROM metadata m
+  INNER JOIN dataset_tree dt ON m.parent_uuid = dt.uuid
+)
 SELECT 
-    synonym_name,
-    accepted_name,
-    status,
-    source
-FROM taxonomy_synonyms
-WHERE accepted_name LIKE '%Ecklonia%'
-ORDER BY accepted_name, synonym_name;
-```
-
-### API performance metrics
-
-```sql
-SELECT 
-    api_endpoint,
-    COUNT(*) as total_calls,
-    AVG(response_time_ms) as avg_response_ms,
-    COUNT(CASE WHEN response_status = 200 THEN 1 END) as success_count,
-    COUNT(CASE WHEN response_status != 200 THEN 1 END) as error_count,
-    ROUND(100.0 * COUNT(CASE WHEN response_status = 200 THEN 1 END) / COUNT(*), 1) as success_rate
-FROM taxonomy_enrichment_log
-GROUP BY api_endpoint;
+  REPEAT('  ', level) || title as hierarchy,
+  uuid,
+  parent_uuid,
+  level
+FROM dataset_tree
+ORDER BY level, title;
 ```
 
 ---
@@ -989,29 +755,63 @@ GROUP BY api_endpoint;
 - **v1.1** (2025-12-20): Added `parameter_mappings` table to replace JSON config
 - **v3.0** (2025-12-30): Removed PostGIS dependency, pure PostgreSQL spatial columns
 - **v3.1** (2025-12-30): Added `aodn_uuid` field for AODN provenance tracking
-- **v3.2** (2026-01-01): Removed `uuid` field, `dataset_path` now primary stable identifier
-- **v4.0** (2026-01-04): ✨ **MAJOR UPDATE** - Enhanced metadata table with 30+ fields
-- **v4.1** (2026-01-06): ✨ **NEW** - Taxonomy enrichment system (4 tables, 2 views, 26 indexes)
+- **v4.0** (2026-01-04): ✨ **MAJOR UPDATE** - Enhanced metadata table with 30+ fields:
+  - Added `parent_uuid` for hierarchical datasets (68% populated)
+  - Added `metadata_revision_date` for change tracking (100% populated)
+  - Added distribution URLs: WFS (84%), WMS (92%), Portal (45%), Publication (37%)
+  - Enhanced `credit` field with multi-contributor support (50% have multiple credits)
+  - Enhanced `lineage` with full processing history from XML
+  - Added `license_url` for data licensing
+  - Full ISO 19115-3 XML metadata extraction (30+ fields per dataset)
 
-### Taxonomy Enrichment Statistics (as of Jan 6, 2026)
+### Migration from v3.1 to v4.0
 
+The schema is already up-to-date if using `init.sql` from v4.0. For existing databases:
+
+```sql
+-- Verify current schema version
+SELECT column_name, data_type 
+FROM information_schema.columns 
+WHERE table_name = 'metadata' 
+ORDER BY ordinal_position;
+
+-- Check if new fields exist
+SELECT EXISTS (
+  SELECT 1 FROM information_schema.columns 
+  WHERE table_name = 'metadata' AND column_name = 'parent_uuid'
+) AS has_parent_uuid;
+
+-- Check field population rates
+SELECT 
+  COUNT(*) as total_records,
+  COUNT(parent_uuid) as has_parent_uuid,
+  COUNT(metadata_revision_date) as has_revision_date,
+  COUNT(distribution_wfs_url) as has_wfs,
+  COUNT(distribution_portal_url) as has_portal,
+  ROUND(100.0 * COUNT(parent_uuid) / COUNT(*), 1) as pct_parent,
+  ROUND(100.0 * COUNT(metadata_revision_date) / COUNT(*), 1) as pct_revision,
+  ROUND(100.0 * COUNT(distribution_wfs_url) / COUNT(*), 1) as pct_wfs
+FROM metadata;
 ```
-Total species: 564
-Missing common_name: 564 (100%)
-Missing genus: 564 (100%)
-Missing family: 564 (100%)
 
-Tables created:
-  ✓ taxonomy_cache (primary enrichment data - 48 columns)
-  ✓ taxonomy_enrichment_log (API call audit trail)
-  ✓ taxonomy_synonyms (name variations)
-  ✓ taxonomy_common_names (vernacular names)
+If fields are missing, they will be added by re-running `populate_metadata.py` which creates fields on-the-fly.
 
-Views created:
-  ✓ taxonomy_enrichment_status (enrichment summary)
-  ✓ taxa_needing_review (flagged for manual review)
+### Re-populating Enhanced Metadata
 
-Ready to run: python enrich_taxonomy_from_inaturalist.py
+To update existing records with enhanced metadata:
+
+```bash
+# Backup existing database
+pg_dump -h localhost -p 5433 -U marine_user -d marine_db > backup_v3.sql
+
+# Run enhanced metadata extraction
+python scripts/populate_metadata.py
+
+# Verify results
+psql -h localhost -p 5433 -U marine_user -d marine_db -c "
+SELECT title, parent_uuid, metadata_revision_date, 
+       distribution_wfs_url IS NOT NULL as has_wfs
+FROM metadata LIMIT 5;"
 ```
 
 ### Future Enhancements
@@ -1023,10 +823,6 @@ Ready to run: python enrich_taxonomy_from_inaturalist.py
 - [ ] Data quality scoring metrics table
 - [ ] Versioned metadata (track changes over time)
 - [ ] Full-text search on metadata using PostgreSQL `tsvector`
-- [x] ✅ **COMPLETED**: Taxonomy enrichment from external APIs (iNaturalist, WoRMS, GBIF)
-- [ ] Automated taxonomy refresh (monthly updates from APIs)
-- [ ] Machine learning-based taxonomic name matching
-- [ ] Integration with Atlas of Living Australia (ALA)
 
 ---
 
@@ -1038,12 +834,9 @@ Ready to run: python enrich_taxonomy_from_inaturalist.py
 - **CF Conventions**: https://cfconventions.org/
 - **AODN/IMOS**: https://aodn.org.au/
 - **ISO 19115-3 Standard**: https://www.iso.org/standard/32579.html
-- **iNaturalist API**: https://api.inaturalist.org/v1/docs/
-- **WoRMS (World Register of Marine Species)**: https://www.marinespecies.org/
-- **GBIF API**: https://www.gbif.org/developer/summary
 
 ---
 
-*Last Updated: January 6, 2026*  
-*Schema Version: 4.1*  
+*Last Updated: January 4, 2026*  
+*Schema Version: 4.0*  
 *Contributors: Huon Channel Marine Analytics Project*

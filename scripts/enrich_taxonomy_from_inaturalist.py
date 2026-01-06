@@ -615,7 +615,7 @@ def main():
         'port': int(os.getenv('DB_PORT', 5433)),
         'database': os.getenv('DB_NAME', 'marine_db'),
         'user': os.getenv('DB_USER', 'marine_user'),
-        'password': os.getenv('DB_PASSWORD', 'marine_pass')
+        'password': os.getenv('DB_PASSWORD', 'marine_pass123')
     }
     
     # Create logs directory if it doesn't exist
