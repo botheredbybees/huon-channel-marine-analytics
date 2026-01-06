@@ -2,8 +2,8 @@
 -- Huon Channel Marine Analytics - Database Initialization Script (PostGIS-Free)
 -- =============================================================================
 -- Purpose: Creates PostgreSQL database schema for AODN marine data
--- Version: 3.2 (Pure PostgreSQL - no PostGIS, removed uuid field)
--- Last Updated: January 1, 2026
+-- Version: 3.3 (Pure PostgreSQL - WoRMS/GBIF enrichment support added)
+-- Last Updated: January 6, 2026
 --
 -- IMPORTANT NOTES:
 -- 1. Removed ALL PostGIS dependencies (GEOMETRY, ST_* functions, BOX2D, GIST on geometry)
@@ -13,6 +13,7 @@
 -- 5. TimescaleDB hypertable enabled for measurements table
 -- 6. Removed confusing 'uuid' field - now using aodn_uuid for AODN catalog IDs
 -- 7. dataset_path is now the primary stable identifier for upserts
+-- 8. Added WoRMS/GBIF columns to taxonomy_cache (v3.3 - Jan 6, 2026)
 -- =============================================================================
 
 -- Enable extensions (NO PostGIS)
@@ -492,13 +493,14 @@ CREATE INDEX IF NOT EXISTS idx_species_obs_metadata ON species_observations(meta
 -- =============================================================================
 -- Purpose: Cache taxonomic data from external APIs (iNaturalist, WoRMS, GBIF)
 -- Created: January 6, 2026
+-- Version: 1.1 (Added WoRMS/GBIF columns)
 -- Dependencies: Requires existing 'taxonomy' table
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
 -- 1. TAXONOMY CACHE TABLE
 -- -----------------------------------------------------------------------------
--- Stores enriched taxonomic data from external APIs (primarily iNaturalist)
+-- Stores enriched taxonomic data from external APIs (iNaturalist, WoRMS, GBIF)
 -- Acts as a cache to avoid repeated API calls and stores additional metadata
 -- not available in source observation files
 
@@ -539,18 +541,27 @@ CREATE TABLE IF NOT EXISTS taxonomy_cache (
     photo_url TEXT,  -- Representative photo URL from iNaturalist
     photo_attribution TEXT,
     
-    -- Additional WoRMS data (for marine species)
+    -- WoRMS data (World Register of Marine Species)
     worms_aphia_id INTEGER,
     worms_lsid TEXT,  -- Life Science Identifier
+    worms_url TEXT,  -- Direct URL to WoRMS species page
     worms_valid_name TEXT,  -- Accepted valid name if this is a synonym
+    scientific_name_authorship TEXT,  -- Taxonomic authority from WoRMS/GBIF
+    taxonomic_status TEXT,  -- accepted, synonym, invalid, etc.
+    accepted_name TEXT,  -- Valid/accepted name if current name is synonym
+    accepted_aphia_id INTEGER,  -- WoRMS AphiaID of accepted name
     is_marine BOOLEAN,
     is_brackish BOOLEAN,
     is_freshwater BOOLEAN,
     is_terrestrial BOOLEAN,
+    is_extinct BOOLEAN DEFAULT FALSE,  -- Extinction status
     
     -- GBIF data (Global Biodiversity Information Facility)
     gbif_taxon_key INTEGER,
+    gbif_scientific_name TEXT,  -- Full scientific name from GBIF
     gbif_canonical_name TEXT,
+    match_type TEXT,  -- GBIF match type: EXACT, FUZZY, HIGHERRANK
+    confidence INTEGER,  -- GBIF match confidence (0-100)
     
     -- Raw API responses (stored as JSONB for future reference)
     inaturalist_response JSONB,
@@ -573,6 +584,9 @@ CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_iconic ON taxonomy_cache(iconic_ta
 CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_rank ON taxonomy_cache(rank);
 CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_marine ON taxonomy_cache(is_marine) WHERE is_marine = TRUE;
 CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_source ON taxonomy_cache(data_source);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_taxonomic_status ON taxonomy_cache(taxonomic_status);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_accepted_aphia_id ON taxonomy_cache(accepted_aphia_id) WHERE accepted_aphia_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_match_type ON taxonomy_cache(match_type);
 
 -- GIN index for JSONB API responses (enables fast JSON queries)
 CREATE INDEX IF NOT EXISTS idx_taxonomy_cache_inat_response ON taxonomy_cache USING GIN (inaturalist_response);
@@ -581,6 +595,15 @@ COMMENT ON TABLE taxonomy_cache IS 'Enriched taxonomic data from external APIs (
 COMMENT ON COLUMN taxonomy_cache.rank_level IS 'Numeric rank: 10=species, 20=genus, 30=family, 40=order, 50=class, 60=phylum, 70=kingdom';
 COMMENT ON COLUMN taxonomy_cache.iconic_taxon_name IS 'High-level taxonomic group: Plantae, Animalia, Chromista, Protozoa, Fungi, Bacteria, Archaea';
 COMMENT ON COLUMN taxonomy_cache.inaturalist_response IS 'Full JSON response from iNaturalist API for future reference';
+COMMENT ON COLUMN taxonomy_cache.scientific_name_authorship IS 'Taxonomic authority (e.g., "(Linnaeus, 1758)")';
+COMMENT ON COLUMN taxonomy_cache.taxonomic_status IS 'Status: accepted, synonym, invalid, etc.';
+COMMENT ON COLUMN taxonomy_cache.accepted_name IS 'Valid/accepted name if this is a synonym';
+COMMENT ON COLUMN taxonomy_cache.accepted_aphia_id IS 'WoRMS AphiaID of accepted name';
+COMMENT ON COLUMN taxonomy_cache.worms_url IS 'Direct URL to WoRMS species page';
+COMMENT ON COLUMN taxonomy_cache.is_extinct IS 'Whether species is extinct';
+COMMENT ON COLUMN taxonomy_cache.gbif_scientific_name IS 'Full scientific name from GBIF';
+COMMENT ON COLUMN taxonomy_cache.match_type IS 'GBIF match type: EXACT, FUZZY, HIGHERRANK';
+COMMENT ON COLUMN taxonomy_cache.confidence IS 'GBIF match confidence (0-100)';
 
 -- -----------------------------------------------------------------------------
 -- 2. TAXONOMY ENRICHMENT LOG TABLE
@@ -722,6 +745,9 @@ SELECT
     tc.data_source,
     tc.inaturalist_taxon_id,
     tc.worms_aphia_id,
+    tc.gbif_taxon_key,
+    tc.taxonomic_status,
+    tc.is_marine,
     tc.photo_url,
     tc.wikipedia_url,
     tc.last_updated AS cache_last_updated,
@@ -808,15 +834,16 @@ GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO marine_user;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO marine_user;
 
 -- =============================================================================
--- DATABASE STATISTICS (Post-Cleanup, January 1, 2026)
+-- DATABASE STATISTICS (Post-Cleanup, January 6, 2026)
 -- =============================================================================
--- Schema Version: 3.2 (Pure PostgreSQL, no PostGIS, removed uuid field)
+-- Schema Version: 3.3 (Pure PostgreSQL + WoRMS/GBIF enrichment)
 -- Total measurements capacity: 12M+ (quality-controlled)
 -- Unique parameters: 125+
 -- Datasets: 38+
 -- Compatible with: timescale/timescaledb:latest-pg18 (Community license)
 -- CHANGED: Removed uuid field, aodn_uuid is now sole AODN identifier
 -- dataset_path is primary stable identifier for upserts
+-- ADDED: WoRMS/GBIF columns to taxonomy_cache (v3.3 - Jan 6, 2026)
 -- =============================================================================
 
 VACUUM ANALYZE;
