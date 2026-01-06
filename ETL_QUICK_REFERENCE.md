@@ -10,7 +10,7 @@ python diagnostic_etl.py
 cat diagnostic_report.json | jq '.summary'
 
 # 3. Ingest all data
-python populate_measurements_v2.py
+python populate_measurements.py
 
 # 4. Check results
 psql -d marine_db -U marine_user -c "SELECT COUNT(*) FROM measurements;"
@@ -35,19 +35,19 @@ jq '.datasets[] | select(.status=="failed")' diagnostic_report.json
 
 ```bash
 # Full ingestion
-python populate_measurements_v2.py
+python populate_measurements.py
 
 # Specific dataset (partial name match)
-python populate_measurements_v2.py --dataset "Wave buoys"
+python populate_measurements.py --dataset "Wave buoys"
 
 # Test mode (first 100 rows only)
-python populate_measurements_v2.py --limit 100
+python populate_measurements.py --limit 100
 
 # With custom parameter mapping
-python populate_measurements_v2.py --config config_parameter_mapping.json
+python populate_measurements.py --config config_parameter_mapping.json
 
 # Combine options
-python populate_measurements_v2.py --dataset "Chlorophyll" --limit 500
+python populate_measurements.py --dataset "Chlorophyll" --limit 500
 ```
 
 ### Spatial & Biological
@@ -135,7 +135,7 @@ jq '.parameter_mapping' config_parameter_mapping.json | jq 'keys' | head -20
 "MY_PARAM": ["MY_CODE", "custom", "unit"]
 
 # Then run ETL with config
-python populate_measurements_v2.py --config config_parameter_mapping.json
+python populate_measurements.py --config config_parameter_mapping.json
 ```
 
 ### Find Unmapped Parameters
@@ -207,7 +207,7 @@ psql -c "SELECT pg_size_pretty(pg_total_relation_size('measurements'));"
 ```
 huon-channel-marine-analytics/
 ├── diagnostic_etl.py              ← Run first
-├── populate_measurements_v2.py    ← Main ETL
+├── populate_measurements.py    ← Main ETL
 ├── populate_spatial.py            ← Shapefiles
 ├── populate_biological.py         ← Species observations
 ├── config_parameter_mapping.json  ← Edit for custom mappings
@@ -236,14 +236,14 @@ huon-channel-marine-analytics/
 ### Ingest + Verify
 
 ```bash
-python populate_measurements_v2.py --dataset "Name" && \
+python populate_measurements.py --dataset "Name" && \
 psql -c "SELECT COUNT(*) FROM measurements WHERE uuid = 'UUID';"
 ```
 
 ### Test Before Full Ingest
 
 ```bash
-python populate_measurements_v2.py --dataset "Name" --limit 100
+python populate_measurements.py --dataset "Name" --limit 100
 # Check results, then remove --limit
 ```
 
@@ -254,7 +254,7 @@ python populate_measurements_v2.py --dataset "Name" --limit 100
 psql -c "DELETE FROM measurements WHERE metadata_id = 123;"
 
 # Re-run ETL
-python populate_measurements_v2.py --dataset "Name"
+python populate_measurements.py --dataset "Name"
 ```
 
 ### Generate Diagnostic Again

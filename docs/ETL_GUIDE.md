@@ -37,25 +37,25 @@ Common failure reasons:
 Ingest all datasets with edge case handling:
 
 ```bash
-python populate_measurements_v2.py
+python populate_measurements.py
 ```
 
 For a specific dataset:
 
 ```bash
-python populate_measurements_v2.py --dataset "Chlorophyll sampling"
+python populate_measurements.py --dataset "Chlorophyll sampling"
 ```
 
 For testing (limit rows):
 
 ```bash
-python populate_measurements_v2.py --limit 100
+python populate_measurements.py --limit 100
 ```
 
 With custom parameter mapping:
 
 ```bash
-python populate_measurements_v2.py --config config_parameter_mapping.json
+python populate_measurements.py --config config_parameter_mapping.json
 ```
 
 ## Architecture
@@ -169,7 +169,7 @@ Edit `config_parameter_mapping.json` to add mappings for your datasets:
 Then use:
 
 ```bash
-python populate_measurements_v2.py --config config_parameter_mapping.json
+python populate_measurements.py --config config_parameter_mapping.json
 ```
 
 ### Unmapped Parameters
@@ -366,7 +366,7 @@ The ETL processes in 1000-row batches. For large datasets (>1M rows):
 # Monitor insert rate
 watch -n 5 'psql -c "SELECT COUNT(*) FROM measurements"'
 
-# Adjust batch size in populate_measurements_v2.py line 362:
+# Adjust batch size in populate_measurements.py line 362:
 BATCH_SIZE = 5000  # Increase for faster inserts
 ```
 
@@ -376,10 +376,10 @@ You can run multiple ETL instances on different datasets:
 
 ```bash
 # Terminal 1
-python populate_measurements_v2.py --dataset "Chlorophyll sampling"
+python populate_measurements.py --dataset "Chlorophyll sampling"
 
 # Terminal 2
-python populate_measurements_v2.py --dataset "Wave buoys"
+python populate_measurements.py --dataset "Wave buoys"
 ```
 
 ### Index Optimization
@@ -444,7 +444,7 @@ Structure:
 1. **Run diagnostic**: `python diagnostic_etl.py`
 2. **Review failures**: Check `diagnostic_report.json`
 3. **Add custom mappings**: Edit `config_parameter_mapping.json` if needed
-4. **Run ETL v2**: `python populate_measurements_v2.py`
+4. **Run ETL v2**: `python populate_measurements.py`
 5. **Verify**: Check `SELECT COUNT(*) FROM measurements`
 6. **Spatial/Biological**: Run `populate_spatial.py` and `populate_biological.py` separately
 
