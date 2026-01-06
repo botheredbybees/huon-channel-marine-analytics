@@ -9,6 +9,7 @@ The schema is organized around a central **Metadata** registry, to which all typ
 2.  **Spatial Features**: Polygons, lines, and non-time-series geometries (pure PostgreSQL).
 3.  **Biological Observations**: Species occurrences and taxonomy.
 4.  **Parameter Mappings**: Standardized parameter name mappings.
+5.  **Taxonomy Enrichment**: WoRMS & GBIF API integration for species data.
 
 ---
 
@@ -196,150 +197,6 @@ CREATE INDEX idx_metadata_extent_geom ON metadata USING GIST(extent_geom);
 *   **`dataset_path`**: Relative path to the source folder/file on disk.
 *   **`dataset_name`**: Human-readable name of the dataset (e.g., "Australian Chlorophyll-a Database").
 
-#### XML Metadata Extraction ⭐ NEW
-
-Metadata fields are extracted from ISO 19115-3 XML files using multiple XPath patterns:
-
-```python
-# Example extraction patterns from populate_metadata.py v4.0
-
-# Parent UUID (links to collection)
-parent_uuid = xml.find('.//mdb:parentMetadata[@uuidref]')
-
-# Metadata dates
-creation_date = xml.find('.//cit:date[.//cit:CI_DateTypeCode[@codeListValue="creation"]]/cit:date')
-revision_date = xml.find('.//cit:date[.//cit:CI_DateTypeCode[@codeListValue="revision"]]/cit:date')
-
-# Multiple credits (concatenated)
-credits = xml.findall('.//mri:credit/gco:CharacterString')
-credit_text = '; '.join([c.text for c in credits if c.text])
-
-# Processing lineage
-lineage = xml.find('.//mrl:statement/gco:CharacterString')
-
-# Distribution URLs
-wfs_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "OGC:WFS")]]')
-wms_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "OGC:WMS")]]')
-portal_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "WWW:LINK-1.0-http--portal")]]')
-pub_url = xml.find('.//cit:linkage[../cit:protocol[contains(text(), "WWW:LINK-1.0-http--publication")]]')
-```
-
-**Extraction Statistics (typical AODN dataset):**
-- **30+ fields** extracted per XML file
-- **100% success rate** for core fields (title, bbox, dates)
-- **68%** datasets with parent_uuid
-- **84%** datasets with WFS URLs
-- **92%** datasets with WMS URLs
-- **50%** datasets with multiple credits
-
-**Extraction Patterns by XML Element:**
-
-| Field | XML XPath Pattern | Fallback Strategy |
-|-------|-------------------|-------------------|
-| `parent_uuid` | `mdb:parentMetadata[@uuidref]` | NULL if not found |
-| `metadata_revision_date` | `cit:date[cit:CI_DateTypeCode="revision"]` | Use creation_date |
-| `credit` | All `mri:credit/gco:CharacterString` | Concatenate with "; " |
-| `lineage` | `mrl:statement/gco:CharacterString` | Try 3 different patterns |
-| `distribution_wfs_url` | `cit:linkage[protocol="OGC:WFS"]` | NULL if not found |
-| `license_url` | `mrd:graphicOverview/cit:onlineResource` | NULL if not found |
-
-#### Relationships
-
-| Field | Links To | Purpose |
-|-------|----------|---------|
-| `id` | FK in `parameters`, `measurements`, `species_observations` | Primary relationships |
-| `uuid` | FK in `measurements.uuid`, `parameters.uuid` | Backward reference field |
-| `parent_uuid` | `metadata.uuid` | Hierarchical dataset relationships |
-
-#### Usage Examples
-
-```sql
--- Find all child datasets of a collection
-SELECT id, title, dataset_name
-FROM metadata
-WHERE parent_uuid = 'abc123-parent-uuid';
-
--- Get dataset with all distribution endpoints
-SELECT 
-  title, 
-  distribution_wfs_url, 
-  distribution_wms_url, 
-  distribution_portal_url
-FROM metadata
-WHERE distribution_wfs_url IS NOT NULL;
-
--- Find datasets updated in last year
-SELECT title, metadata_revision_date
-FROM metadata
-WHERE metadata_revision_date > NOW() - INTERVAL '1 year'
-ORDER BY metadata_revision_date DESC;
-
--- Get all credits for a dataset
-SELECT title, credit
-FROM metadata
-WHERE credit LIKE '%;%';  -- Multiple credits
-
--- Find datasets by contributor
-SELECT title, credit
-FROM metadata
-WHERE credit ILIKE '%CSIRO%';
-
--- Get hierarchical dataset tree
-WITH RECURSIVE dataset_tree AS (
-  -- Root datasets
-  SELECT id, uuid, parent_uuid, title, 0 as level
-  FROM metadata
-  WHERE parent_uuid IS NULL
-  
-  UNION ALL
-  
-  -- Child datasets
-  SELECT m.id, m.uuid, m.parent_uuid, m.title, dt.level + 1
-  FROM metadata m
-  INNER JOIN dataset_tree dt ON m.parent_uuid = dt.uuid
-)
-SELECT 
-  REPEAT('  ', level) || title as hierarchy,
-  uuid,
-  parent_uuid
-FROM dataset_tree
-ORDER BY level, title;
-```
-
-### `parameters` (One-to-Many with Metadata)
-Describes specific variables available in a dataset (e.g., "Sea Surface Temperature").
-
-#### DDL
-
-```sql
-CREATE TABLE parameters (
-    id SERIAL PRIMARY KEY,
-    metadata_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
-    uuid TEXT NOT NULL REFERENCES metadata(uuid) ON DELETE CASCADE,
-    parameter_code TEXT NOT NULL,
-    parameter_label TEXT,
-    standard_name TEXT,
-    aodn_parameter_uri TEXT,
-    unit_name TEXT,
-    unit_uri TEXT,
-    content_type TEXT DEFAULT 'physicalMeasurement',
-    is_depth BOOLEAN DEFAULT FALSE,
-    temporal_start TIMESTAMP,
-    temporal_end TIMESTAMP,
-    vertical_min NUMERIC(6,2),
-    vertical_max NUMERIC(6,2),
-    created_at TIMESTAMP DEFAULT NOW(),
-    imos_parameter_uri TEXT REFERENCES imos_vocab_parameters(uri),
-    imos_unit_uri TEXT REFERENCES imos_vocab_units(uri),
-    UNIQUE(uuid, parameter_code)
-);
-```
-
-#### Key Fields
-
-*   **`parameter_code`**: Critical linking field. Matches `parameter_code` in the `measurements` table.
-*   **`aodn_parameter_uri`**: Link to the controlled vocabulary definition.
-
 ---
 
 ## 2. Time-Series Data (TimescaleDB)
@@ -432,12 +289,6 @@ CREATE TABLE spatial_features (
 CREATE INDEX spatial_features_lat_lon_idx ON spatial_features (latitude, longitude);
 ```
 
-#### Key Fields
-
-*   **`latitude`, `longitude`**: Point coordinates in decimal degrees (WGS84).
-*   **`properties`**: **[Key Field] JSONB** column containing all feature attributes (e.g., `{"density": "High", "area_ha": 50}`). This allows schema-less storage of diverse shapefile attributes.
-*   **`metadata_id`**: FK to `metadata`.
-
 ---
 
 ## 4. Biological Data
@@ -462,12 +313,6 @@ CREATE TABLE taxonomy (
     authority TEXT
 );
 ```
-
-#### Key Fields
-
-*   **`species_name`**: Scientific name (Unique).
-*   **`common_name`**: Vernacular name.
-*   **`family`, `phylum`, `class`**: Taxonomic hierarchy.
 
 ### `species_observations`
 The core fact table for biology.
@@ -495,13 +340,377 @@ CREATE TABLE species_observations (
 CREATE INDEX idx_species_obs_lat_lon ON species_observations (latitude, longitude);
 ```
 
+---
+
+## 5. Taxonomy Enrichment (WoRMS & GBIF) ⭐ NEW v3.3
+
+Automatic enrichment of species data from authoritative taxonomic databases:
+- **WoRMS** (World Register of Marine Species): Marine species authority
+- **GBIF** (Global Biodiversity Information Facility): Terrestrial/freshwater fallback
+
+### `taxonomy_cache` ⭐ PRIMARY ENRICHMENT TABLE
+
+Caches enriched taxonomic data from external APIs (iNaturalist, WoRMS, GBIF). Avoids repeated API calls and stores additional metadata not available in source observation files.
+
+#### DDL
+
+```sql
+CREATE TABLE taxonomy_cache (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    species_name TEXT UNIQUE NOT NULL,
+    
+    -- iNaturalist identifiers (from previous enrichment)
+    inaturalist_taxon_id INTEGER,
+    inaturalist_url TEXT,
+    
+    -- Taxonomic hierarchy (enriched from APIs)
+    common_name TEXT,
+    genus TEXT,
+    family TEXT,
+    "order" TEXT,
+    class TEXT,
+    phylum TEXT,
+    kingdom TEXT,
+    authority TEXT,
+    
+    -- Taxonomic metadata
+    rank TEXT,  -- species, genus, family, order, class, phylum, kingdom
+    rank_level INTEGER,  -- Numeric rank (10=species, 20=genus, etc.)
+    iconic_taxon_name TEXT,  -- Plantae, Animalia, Chromista, Protozoa, Fungi
+    
+    -- Conservation & distribution
+    conservation_status TEXT,  -- IUCN status if available
+    conservation_status_source TEXT,
+    introduced BOOLEAN DEFAULT FALSE,
+    endemic BOOLEAN DEFAULT FALSE,
+    threatened BOOLEAN DEFAULT FALSE,
+    
+    -- External links
+    wikipedia_url TEXT,
+    wikipedia_summary TEXT,
+    photo_url TEXT,
+    photo_attribution TEXT,
+    
+    -- ⭐ WoRMS data (World Register of Marine Species)
+    worms_aphia_id INTEGER,
+    worms_lsid TEXT,  -- Life Science Identifier
+    worms_url TEXT,  -- Direct URL to WoRMS species page
+    worms_valid_name TEXT,  -- Accepted valid name if this is a synonym
+    scientific_name_authorship TEXT,  -- Taxonomic authority from WoRMS/GBIF
+    taxonomic_status TEXT,  -- accepted, synonym, invalid, etc.
+    accepted_name TEXT,  -- Valid/accepted name if current name is synonym
+    accepted_aphia_id INTEGER,  -- WoRMS AphiaID of accepted name
+    is_marine BOOLEAN,
+    is_brackish BOOLEAN,
+    is_freshwater BOOLEAN,
+    is_terrestrial BOOLEAN,
+    is_extinct BOOLEAN DEFAULT FALSE,
+    
+    -- ⭐ GBIF data (Global Biodiversity Information Facility)
+    gbif_taxon_key INTEGER,
+    gbif_scientific_name TEXT,  -- Full scientific name from GBIF
+    gbif_canonical_name TEXT,
+    match_type TEXT,  -- GBIF match type: EXACT, FUZZY, HIGHERRANK
+    confidence INTEGER,  -- GBIF match confidence (0-100)
+    
+    -- Raw API responses (JSONB for future reference)
+    inaturalist_response JSONB,
+    worms_response JSONB,
+    gbif_response JSONB,
+    
+    -- Metadata
+    data_source TEXT DEFAULT 'inaturalist',  -- Primary source: inaturalist, worms, gbif, manual
+    last_updated TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Performance indexes
+CREATE INDEX idx_taxonomy_cache_species ON taxonomy_cache(species_name);
+CREATE INDEX idx_taxonomy_cache_taxonomy_id ON taxonomy_cache(taxonomy_id);
+CREATE INDEX idx_taxonomy_cache_worms_id ON taxonomy_cache(worms_aphia_id) WHERE worms_aphia_id IS NOT NULL;
+CREATE INDEX idx_taxonomy_cache_gbif_key ON taxonomy_cache(gbif_taxon_key) WHERE gbif_taxon_key IS NOT NULL;
+CREATE INDEX idx_taxonomy_cache_taxonomic_status ON taxonomy_cache(taxonomic_status);
+CREATE INDEX idx_taxonomy_cache_accepted_aphia_id ON taxonomy_cache(accepted_aphia_id) WHERE accepted_aphia_id IS NOT NULL;
+CREATE INDEX idx_taxonomy_cache_match_type ON taxonomy_cache(match_type);
+CREATE INDEX idx_taxonomy_cache_marine ON taxonomy_cache(is_marine) WHERE is_marine = TRUE;
+
+-- GIN index for JSONB queries
+CREATE INDEX idx_taxonomy_cache_inat_response ON taxonomy_cache USING GIN (inaturalist_response);
+```
+
+#### Key WoRMS Fields ⭐ NEW
+
+- **`worms_aphia_id`**: Unique WoRMS species identifier (AphiaID)
+- **`worms_url`**: Direct link to species page on marinespecies.org
+- **`scientific_name_authorship`**: Taxonomic authority (e.g., "(C.Agardh) J.Agardh, 1848")
+- **`taxonomic_status`**: `accepted`, `synonym`, `invalid`, `nomen dubium`
+- **`accepted_name`**: If this is a synonym, the accepted valid name
+- **`accepted_aphia_id`**: WoRMS ID of the accepted taxon
+- **`is_marine`**, **`is_brackish`**, **`is_freshwater`**, **`is_terrestrial`**: Habitat flags
+- **`is_extinct`**: Extinction status
+- **`worms_response`**: Full JSON API response for provenance
+
+#### Key GBIF Fields ⭐ NEW
+
+- **`gbif_taxon_key`**: Unique GBIF taxon identifier
+- **`gbif_scientific_name`**: Full scientific name with authorship from GBIF
+- **`match_type`**: Match quality - `EXACT`, `FUZZY`, `HIGHERRANK`
+- **`confidence`**: GBIF match confidence score (0-100)
+- **`gbif_response`**: Full JSON API response
+
+#### Example Queries
+
+```sql
+-- Get all marine species with WoRMS data
+SELECT 
+    species_name,
+    worms_aphia_id,
+    taxonomic_status,
+    family,
+    worms_url
+FROM taxonomy_cache
+WHERE is_marine = TRUE
+  AND worms_aphia_id IS NOT NULL
+ORDER BY family, species_name;
+
+-- Find species that are synonyms
+SELECT 
+    species_name,
+    taxonomic_status,
+    accepted_name,
+    worms_url
+FROM taxonomy_cache
+WHERE taxonomic_status = 'synonym'
+  AND accepted_name IS NOT NULL;
+
+-- Get species with high-confidence GBIF matches
+SELECT 
+    species_name,
+    match_type,
+    confidence,
+    gbif_scientific_name
+FROM taxonomy_cache
+WHERE match_type = 'EXACT'
+  AND confidence >= 95
+ORDER BY species_name;
+
+-- Find extinct species
+SELECT species_name, family, phylum, worms_url
+FROM taxonomy_cache
+WHERE is_extinct = TRUE;
+```
+
+### `taxonomy_enrichment_log`
+
+Audit log of all API lookups, matches, and failures. Essential for debugging and quality control.
+
+#### DDL
+
+```sql
+CREATE TABLE taxonomy_enrichment_log (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    species_name TEXT NOT NULL,
+    
+    -- Search metadata
+    search_query TEXT,
+    api_endpoint TEXT,  -- 'worms', 'gbif', 'inaturalist'
+    api_url TEXT,
+    
+    -- Response metadata
+    response_status INTEGER,  -- HTTP status (200, 404, 500)
+    response_time_ms INTEGER,
+    matches_found INTEGER DEFAULT 0,
+    
+    -- Match selection
+    taxon_id_selected INTEGER,
+    match_rank INTEGER,
+    confidence_score DECIMAL(3,2),  -- 0.00 to 1.00
+    match_method TEXT,  -- exact, fuzzy, genus_only, manual
+    
+    -- Quality flags
+    needs_manual_review BOOLEAN DEFAULT FALSE,
+    review_reason TEXT,
+    reviewed_by TEXT,
+    reviewed_at TIMESTAMP,
+    review_notes TEXT,
+    
+    -- Error handling
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_enrichment_log_taxonomy_id ON taxonomy_enrichment_log(taxonomy_id);
+CREATE INDEX idx_enrichment_log_api ON taxonomy_enrichment_log(api_endpoint);
+CREATE INDEX idx_enrichment_log_needs_review ON taxonomy_enrichment_log(needs_manual_review) 
+    WHERE needs_manual_review = TRUE;
+```
+
 #### Key Fields
 
-*   **`taxonomy_id`**: FK to `taxonomy`.
-*   **`location_id`**: FK to `locations`.
-*   **`count_value`**: Numeric abundance (if available).
-*   **`count_category`**: Text description if count is a range (e.g., "DOC" - Dominant).
-*   **`latitude`, `longitude`**: **[Key Field]** Denormalized coordinates. While redundant with `locations`, storing them here allows for faster heatmap generation and spatial filtering without joins.
+- **`confidence_score`**: Match confidence (1.0=exact, 0.9+=high, 0.7-0.9=medium, <0.7=needs review)
+- **`needs_manual_review`**: Flag for low-confidence or ambiguous matches
+- **`review_reason`**: Why review needed - `ambiguous`, `no_match`, `low_confidence`, `multiple_matches`, `synonym_conflict`
+
+### `taxonomy_synonyms`
+
+Tracks synonym relationships discovered during enrichment. Many species have multiple scientific names.
+
+#### DDL
+
+```sql
+CREATE TABLE taxonomy_synonyms (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    synonym_name TEXT NOT NULL,
+    accepted_name TEXT NOT NULL,
+    status TEXT,  -- synonym, accepted, invalid, misapplied
+    source TEXT,  -- inaturalist, worms, gbif
+    source_taxon_id INTEGER,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(synonym_name, accepted_name)
+);
+```
+
+### `taxonomy_common_names`
+
+Multiple common names per species with language and regional variants.
+
+#### DDL
+
+```sql
+CREATE TABLE taxonomy_common_names (
+    id SERIAL PRIMARY KEY,
+    taxonomy_id INTEGER REFERENCES taxonomy(id) ON DELETE CASCADE,
+    common_name TEXT NOT NULL,
+    language TEXT DEFAULT 'en',  -- ISO 639-1
+    locality TEXT,  -- Australia, Tasmania, New Zealand, etc.
+    is_primary BOOLEAN DEFAULT FALSE,
+    source TEXT,  -- inaturalist, worms, gbif, local
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(taxonomy_id, common_name, language)
+);
+```
+
+#### Example: Regional Common Names
+
+```sql
+INSERT INTO taxonomy_common_names (taxonomy_id, common_name, language, locality, is_primary, source)
+VALUES 
+    (42, 'Common kelp', 'en', 'Australia', TRUE, 'worms'),
+    (42, 'Southern kelp', 'en', 'New Zealand', FALSE, 'worms'),
+    (42, 'Golden kelp', 'en', 'Tasmania', FALSE, 'local');
+```
+
+### Views for Taxonomy Enrichment
+
+#### `taxonomy_enrichment_status`
+
+Convenient summary view combining taxonomy with enrichment status.
+
+```sql
+CREATE VIEW taxonomy_enrichment_status AS
+SELECT 
+    t.id,
+    t.species_name,
+    tc.common_name AS enriched_common_name,
+    tc.genus,
+    tc.family,
+    tc.phylum,
+    tc.rank,
+    tc.iconic_taxon_name,
+    tc.conservation_status,
+    tc.worms_aphia_id,
+    tc.gbif_taxon_key,
+    tc.taxonomic_status,
+    tc.is_marine,
+    CASE 
+        WHEN tc.id IS NULL THEN 'not_enriched'
+        WHEN tel.needs_manual_review = TRUE THEN 'needs_review'
+        WHEN tc.genus IS NOT NULL AND tc.family IS NOT NULL THEN 'fully_enriched'
+        WHEN tc.genus IS NOT NULL THEN 'partially_enriched'
+        ELSE 'enrichment_failed'
+    END AS enrichment_status,
+    tel.confidence_score,
+    (SELECT COUNT(*) FROM species_observations WHERE taxonomy_id = t.id) AS observation_count
+FROM taxonomy t
+LEFT JOIN taxonomy_cache tc ON t.id = tc.taxonomy_id
+LEFT JOIN LATERAL (
+    SELECT * FROM taxonomy_enrichment_log 
+    WHERE taxonomy_id = t.id 
+    ORDER BY created_at DESC 
+    LIMIT 1
+) tel ON TRUE;
+```
+
+#### `taxa_needing_review`
+
+Quality control view showing species requiring manual review.
+
+```sql
+CREATE VIEW taxa_needing_review AS
+SELECT 
+    t.id AS taxonomy_id,
+    t.species_name,
+    tel.review_reason,
+    tel.confidence_score,
+    tel.matches_found,
+    tel.created_at AS last_lookup,
+    (SELECT COUNT(*) FROM species_observations WHERE taxonomy_id = t.id) AS observation_count
+FROM taxonomy t
+JOIN taxonomy_enrichment_log tel ON t.id = tel.taxonomy_id
+WHERE tel.needs_manual_review = TRUE
+  AND tel.reviewed_at IS NULL
+ORDER BY observation_count DESC, tel.created_at DESC;
+```
+
+### Enrichment Workflow
+
+1. **Initial Load**: Base taxonomy from observation files → `taxonomy` table
+2. **iNaturalist Enrichment**: `scripts/enrich_taxonomy_from_inaturalist.py` → `taxonomy_cache`
+3. **WoRMS/GBIF Enrichment**: `scripts/enrich_taxonomy_from_worms.py` → additional fields in `taxonomy_cache`
+4. **Quality Review**: Query `taxa_needing_review` for manual verification
+5. **Ongoing Sync**: Periodic re-enrichment to capture taxonomy updates
+
+### Example Enrichment Queries
+
+```sql
+-- Check enrichment coverage
+SELECT 
+    enrichment_status,
+    COUNT(*) as count,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) as percentage
+FROM taxonomy_enrichment_status
+GROUP BY enrichment_status
+ORDER BY count DESC;
+
+-- Find species with conflicting WoRMS/GBIF classification
+SELECT 
+    species_name,
+    worms_aphia_id,
+    gbif_taxon_key,
+    family,
+    phylum
+FROM taxonomy_cache
+WHERE worms_aphia_id IS NOT NULL 
+  AND gbif_taxon_key IS NOT NULL
+  AND family IS NOT NULL
+ORDER BY family;
+
+-- Get API performance statistics
+SELECT 
+    api_endpoint,
+    COUNT(*) as total_calls,
+    AVG(response_time_ms) as avg_response_time_ms,
+    SUM(CASE WHEN response_status = 200 THEN 1 ELSE 0 END) as successful,
+    SUM(CASE WHEN needs_manual_review THEN 1 ELSE 0 END) as needs_review
+FROM taxonomy_enrichment_log
+GROUP BY api_endpoint;
+```
 
 ---
 
@@ -517,6 +726,10 @@ erDiagram
 
     LOCATIONS ||--o{ SPECIES_OBSERVATIONS : at
     TAXONOMY ||--o{ SPECIES_OBSERVATIONS : is_of
+    TAXONOMY ||--o{ TAXONOMY_CACHE : enriches
+    TAXONOMY_CACHE ||--o{ TAXONOMY_ENRICHMENT_LOG : logs
+    TAXONOMY ||--o{ TAXONOMY_SYNONYMS : has_synonyms
+    TAXONOMY ||--o{ TAXONOMY_COMMON_NAMES : has_common_names
     
     PARAMETER_MAPPINGS ||--o{ MEASUREMENTS : standardizes
 
@@ -527,26 +740,13 @@ erDiagram
         string namespace
     }
     
-    SPATIAL_FEATURES {
-        double latitude
-        double longitude
-        jsonb properties
-    }
-    
-    PARAMETER_MAPPINGS {
-        string raw_parameter_name
-        string standard_code
-        string namespace
-        string unit
-    }
-    
-    METADATA {
-        string uuid PK
-        string parent_uuid FK
-        string dataset_name
-        string distribution_wfs_url
-        string distribution_wms_url
-        timestamp metadata_revision_date
+    TAXONOMY_CACHE {
+        int worms_aphia_id
+        int gbif_taxon_key
+        string taxonomic_status
+        boolean is_marine
+        jsonb worms_response
+        jsonb gbif_response
     }
 ```
 
@@ -591,60 +791,14 @@ GROUP BY bucket, parameter_code, namespace, location_id;
 
 ---
 
-## Views
-
-### `measurements_with_metadata`
-
-Grafana-friendly view joining measurements with dataset metadata.
-
-```sql
-CREATE VIEW measurements_with_metadata AS
-SELECT 
-    m.time, m.data_id, m.parameter_code, m.namespace, m.value, m.uom,
-    m.uncertainty, m.depth_m, m.location_id, m.quality_flag,
-    md.title AS dataset_title,
-    md.dataset_name,
-    md.metadata_revision_date,
-    md.credit,
-    p.parameter_label,
-    p.unit_name,
-    md.west, md.east, md.south, md.north
-FROM measurements m
-LEFT JOIN metadata md ON m.metadata_id = md.id
-LEFT JOIN parameters p ON md.id = p.metadata_id AND m.parameter_code = p.parameter_code;
-```
-
-### `datasets_by_parameter`
-
-Spatial view showing which datasets contain specific parameters.
-
-```sql
-CREATE VIEW datasets_by_parameter AS
-SELECT 
-    p.parameter_code,
-    p.parameter_label,
-    p.aodn_parameter_uri,
-    COUNT(DISTINCT md.id) AS dataset_count,
-    MIN(md.west) AS bbox_west,
-    MIN(md.south) AS bbox_south,
-    MAX(md.east) AS bbox_east,
-    MAX(md.north) AS bbox_north,
-    ARRAY_AGG(DISTINCT md.dataset_name) AS datasets
-FROM parameters p
-JOIN metadata md ON p.metadata_id = md.id
-GROUP BY p.parameter_code, p.parameter_label, p.aodn_parameter_uri;
-```
-
----
-
 ## Performance Features
 
 ### Indexes
 
 - **B-tree indexes** on all foreign keys and commonly filtered columns
-- **Sparse B-tree index** on `metadata.parent_uuid` (only non-null values)
+- **Sparse B-tree indexes** on optional fields (only non-null values)
 - **BRIN indexes** on `measurements.time` for efficient time-range scans
-- **GIN indexes** on text columns for text search
+- **GIN indexes** on text columns for full-text search and JSONB queries
 - **Composite indexes** for multi-column queries (e.g., bbox + time)
 
 ### Compression
@@ -683,66 +837,24 @@ WHERE parameter_code = 'TEMP'
 ORDER BY time;
 ```
 
-### Find datasets with WFS endpoints
+### Find marine kelp species with WoRMS data
 
 ```sql
-SELECT title, dataset_name, distribution_wfs_url
-FROM metadata
-WHERE distribution_wfs_url IS NOT NULL
-ORDER BY title;
-```
-
-### Get parameter mapping variants
-
-```sql
--- Find all ways to represent temperature
-SELECT raw_parameter_name, standard_code, namespace, unit
-FROM parameter_mappings
-WHERE standard_code = 'TEMP'
-ORDER BY namespace, raw_parameter_name;
-```
-
-### Find child datasets of a collection
-
-```sql
-SELECT id, title, dataset_name, metadata_revision_date
-FROM metadata
-WHERE parent_uuid = '744ac2a9-689c-40d3-b262-0df6863f0327'
-ORDER BY metadata_revision_date DESC;
-```
-
-### Get datasets by contributor
-
-```sql
-SELECT title, credit, metadata_revision_date
-FROM metadata
-WHERE credit ILIKE '%CSIRO%'
-ORDER BY metadata_revision_date DESC;
-```
-
-### Get hierarchical dataset relationships
-
-```sql
-WITH RECURSIVE dataset_tree AS (
-  -- Root datasets (no parent)
-  SELECT id, uuid, parent_uuid, title, 0 as level
-  FROM metadata
-  WHERE parent_uuid IS NULL
-  
-  UNION ALL
-  
-  -- Child datasets
-  SELECT m.id, m.uuid, m.parent_uuid, m.title, dt.level + 1
-  FROM metadata m
-  INNER JOIN dataset_tree dt ON m.parent_uuid = dt.uuid
-)
 SELECT 
-  REPEAT('  ', level) || title as hierarchy,
-  uuid,
-  parent_uuid,
-  level
-FROM dataset_tree
-ORDER BY level, title;
+    tc.species_name,
+    tc.common_name,
+    tc.family,
+    tc.worms_aphia_id,
+    tc.worms_url,
+    COUNT(so.id) as observation_count
+FROM taxonomy_cache tc
+JOIN taxonomy t ON tc.taxonomy_id = t.id
+LEFT JOIN species_observations so ON t.id = so.taxonomy_id
+WHERE tc.is_marine = TRUE
+  AND tc.family LIKE '%aceae'  -- Algae families
+  AND tc.worms_aphia_id IS NOT NULL
+GROUP BY tc.species_name, tc.common_name, tc.family, tc.worms_aphia_id, tc.worms_url
+ORDER BY observation_count DESC;
 ```
 
 ---
@@ -755,74 +867,35 @@ ORDER BY level, title;
 - **v1.1** (2025-12-20): Added `parameter_mappings` table to replace JSON config
 - **v3.0** (2025-12-30): Removed PostGIS dependency, pure PostgreSQL spatial columns
 - **v3.1** (2025-12-30): Added `aodn_uuid` field for AODN provenance tracking
-- **v4.0** (2026-01-04): ✨ **MAJOR UPDATE** - Enhanced metadata table with 30+ fields:
-  - Added `parent_uuid` for hierarchical datasets (68% populated)
-  - Added `metadata_revision_date` for change tracking (100% populated)
-  - Added distribution URLs: WFS (84%), WMS (92%), Portal (45%), Publication (37%)
-  - Enhanced `credit` field with multi-contributor support (50% have multiple credits)
-  - Enhanced `lineage` with full processing history from XML
-  - Added `license_url` for data licensing
-  - Full ISO 19115-3 XML metadata extraction (30+ fields per dataset)
+- **v3.2** (2026-01-01): Added taxonomy enrichment tables (iNaturalist)
+- **v3.3** (2026-01-06): ✨ **ADDED WoRMS/GBIF enrichment support**
+  - 9 new WoRMS columns: `worms_aphia_id`, `worms_url`, `scientific_name_authorship`, `taxonomic_status`, `accepted_name`, `accepted_aphia_id`, `is_extinct`, `is_marine`, `is_brackish`
+  - 4 new GBIF columns: `gbif_taxon_key`, `gbif_scientific_name`, `match_type`, `confidence`
+  - Added `taxonomy_enrichment_log` audit table
+  - Added `taxonomy_synonyms` and `taxonomy_common_names` tables
+  - Migration: `db/migrations/002_add_worms_gbif_columns.sql`
+- **v4.0** (2026-01-04): Enhanced metadata table with 30+ fields from ISO 19115-3 XML
 
-### Migration from v3.1 to v4.0
+### Migration from v3.2 to v3.3
 
-The schema is already up-to-date if using `init.sql` from v4.0. For existing databases:
-
-```sql
--- Verify current schema version
-SELECT column_name, data_type 
-FROM information_schema.columns 
-WHERE table_name = 'metadata' 
-ORDER BY ordinal_position;
-
--- Check if new fields exist
-SELECT EXISTS (
-  SELECT 1 FROM information_schema.columns 
-  WHERE table_name = 'metadata' AND column_name = 'parent_uuid'
-) AS has_parent_uuid;
-
--- Check field population rates
-SELECT 
-  COUNT(*) as total_records,
-  COUNT(parent_uuid) as has_parent_uuid,
-  COUNT(metadata_revision_date) as has_revision_date,
-  COUNT(distribution_wfs_url) as has_wfs,
-  COUNT(distribution_portal_url) as has_portal,
-  ROUND(100.0 * COUNT(parent_uuid) / COUNT(*), 1) as pct_parent,
-  ROUND(100.0 * COUNT(metadata_revision_date) / COUNT(*), 1) as pct_revision,
-  ROUND(100.0 * COUNT(distribution_wfs_url) / COUNT(*), 1) as pct_wfs
-FROM metadata;
-```
-
-If fields are missing, they will be added by re-running `populate_metadata.py` which creates fields on-the-fly.
-
-### Re-populating Enhanced Metadata
-
-To update existing records with enhanced metadata:
+For existing databases, apply the WoRMS/GBIF migration:
 
 ```bash
-# Backup existing database
-pg_dump -h localhost -p 5433 -U marine_user -d marine_db > backup_v3.sql
+# Apply migration
+psql -h localhost -p 5433 -U marine_user -d marine_db -f db/migrations/002_add_worms_gbif_columns.sql
 
-# Run enhanced metadata extraction
-python scripts/populate_metadata.py
-
-# Verify results
+# Verify columns added
 psql -h localhost -p 5433 -U marine_user -d marine_db -c "
-SELECT title, parent_uuid, metadata_revision_date, 
-       distribution_wfs_url IS NOT NULL as has_wfs
-FROM metadata LIMIT 5;"
+SELECT column_name, data_type 
+FROM information_schema.columns 
+WHERE table_name = 'taxonomy_cache' 
+  AND column_name IN ('worms_aphia_id', 'gbif_taxon_key', 'taxonomic_status')
+ORDER BY column_name;"
+
+# Run enrichment
+python scripts/enrich_taxonomy_from_worms.py --limit 10  # Test
+python scripts/enrich_taxonomy_from_worms.py  # Full enrichment
 ```
-
-### Future Enhancements
-
-- [ ] Automated metadata refresh pipeline (daily sync from AODN)
-- [ ] Web UI for parameter mapping management
-- [ ] IMOS vocabulary table population from AODN API
-- [ ] Real-time data ingestion pipeline (streaming)
-- [ ] Data quality scoring metrics table
-- [ ] Versioned metadata (track changes over time)
-- [ ] Full-text search on metadata using PostgreSQL `tsvector`
 
 ---
 
@@ -834,9 +907,13 @@ FROM metadata LIMIT 5;"
 - **CF Conventions**: https://cfconventions.org/
 - **AODN/IMOS**: https://aodn.org.au/
 - **ISO 19115-3 Standard**: https://www.iso.org/standard/32579.html
+- **WoRMS REST API**: https://www.marinespecies.org/rest/
+- **WoRMS Website**: https://www.marinespecies.org
+- **GBIF API**: https://www.gbif.org/developer/summary
+- **GBIF Species Match**: https://www.gbif.org/tools/species-lookup
 
 ---
 
-*Last Updated: January 4, 2026*  
-*Schema Version: 4.0*  
+*Last Updated: January 6, 2026*  
+*Schema Version: 3.3 (WoRMS/GBIF Enrichment)*  
 *Contributors: Huon Channel Marine Analytics Project*
