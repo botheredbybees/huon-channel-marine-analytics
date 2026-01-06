@@ -41,7 +41,7 @@ Usage:
 
 Author: Huon Channel Marine Analytics
 Created: January 6, 2026
-Version: 1.0
+Version: 1.1
 """
 
 import os
@@ -367,7 +367,10 @@ class WoRMSGBIFEnricher:
         return 0.3
     
     def extract_worms_data(self, record: Dict) -> Dict:
-        """Extract relevant data from WoRMS AphiaRecord."""
+        """Extract relevant data from WoRMS AphiaRecord.
+        
+        Note: WoRMS API returns 1/0 for booleans, must convert to Python bool.
+        """
         # Get classification (need separate API call for full hierarchy)
         aphia_id = record.get('AphiaID')
         
@@ -386,11 +389,12 @@ class WoRMSGBIFEnricher:
             'family': record.get('family'),
             'genus': record.get('genus'),
             'rank': record.get('rank'),
-            'is_marine': record.get('isMarine', True),
-            'is_brackish': record.get('isBrackish', False),
-            'is_freshwater': record.get('isFreshwater', False),
-            'is_terrestrial': record.get('isTerrestrial', False),
-            'is_extinct': record.get('isExtinct', False),
+            # Convert WoRMS integer booleans (1/0) to Python bool (True/False)
+            'is_marine': bool(record.get('isMarine', 1)),
+            'is_brackish': bool(record.get('isBrackish', 0)),
+            'is_freshwater': bool(record.get('isFreshwater', 0)),
+            'is_terrestrial': bool(record.get('isTerrestrial', 0)),
+            'is_extinct': bool(record.get('isExtinct', 0)),
             'data_source': 'worms',
             'worms_response': json.dumps(record)
         }
@@ -435,6 +439,7 @@ class WoRMSGBIFEnricher:
                         scientific_name_authorship = COALESCE(scientific_name_authorship, %(scientific_name_authorship)s),
                         taxonomic_status = %(taxonomic_status)s,
                         accepted_name = %(accepted_name)s,
+                        accepted_aphia_id = %(accepted_aphia_id)s,
                         is_marine = %(is_marine)s,
                         is_brackish = %(is_brackish)s,
                         is_freshwater = %(is_freshwater)s,
@@ -456,6 +461,8 @@ class WoRMSGBIFEnricher:
                         gbif_canonical_name = %(gbif_canonical_name)s,
                         scientific_name_authorship = COALESCE(scientific_name_authorship, %(scientific_name_authorship)s),
                         taxonomic_status = %(taxonomic_status)s,
+                        match_type = %(match_type)s,
+                        confidence = %(confidence)s,
                         kingdom = COALESCE(kingdom, %(kingdom)s),
                         phylum = COALESCE(phylum, %(phylum)s),
                         class = COALESCE(class, %(class)s),
@@ -486,13 +493,13 @@ class WoRMSGBIFEnricher:
                         query = """
                             INSERT INTO taxonomy_cache (
                                 taxonomy_id, species_name, worms_aphia_id, worms_url, worms_lsid,
-                                scientific_name_authorship, taxonomic_status, accepted_name,
+                                scientific_name_authorship, taxonomic_status, accepted_name, accepted_aphia_id,
                                 kingdom, phylum, class, \"order\", family, genus,
                                 is_marine, is_brackish, is_freshwater, is_terrestrial, is_extinct,
                                 data_source, worms_response
                             ) VALUES (
                                 %(taxonomy_id)s, %(species_name)s, %(worms_aphia_id)s, %(worms_url)s, %(worms_lsid)s,
-                                %(scientific_name_authorship)s, %(taxonomic_status)s, %(accepted_name)s,
+                                %(scientific_name_authorship)s, %(taxonomic_status)s, %(accepted_name)s, %(accepted_aphia_id)s,
                                 %(kingdom)s, %(phylum)s, %(class)s, %(order)s, %(family)s, %(genus)s,
                                 %(is_marine)s, %(is_brackish)s, %(is_freshwater)s, %(is_terrestrial)s, %(is_extinct)s,
                                 %(data_source)s, %(worms_response)s::jsonb
@@ -503,11 +510,13 @@ class WoRMSGBIFEnricher:
                             INSERT INTO taxonomy_cache (
                                 taxonomy_id, species_name, gbif_taxon_key, gbif_scientific_name,
                                 gbif_canonical_name, scientific_name_authorship, taxonomic_status,
+                                match_type, confidence,
                                 kingdom, phylum, class, \"order\", family, genus,
                                 data_source, gbif_response
                             ) VALUES (
                                 %(taxonomy_id)s, %(species_name)s, %(gbif_taxon_key)s, %(gbif_scientific_name)s,
                                 %(gbif_canonical_name)s, %(scientific_name_authorship)s, %(taxonomic_status)s,
+                                %(match_type)s, %(confidence)s,
                                 %(kingdom)s, %(phylum)s, %(class)s, %(order)s, %(family)s, %(genus)s,
                                 %(data_source)s, %(gbif_response)s::jsonb
                             )
