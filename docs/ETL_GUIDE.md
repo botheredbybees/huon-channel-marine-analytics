@@ -295,6 +295,15 @@ Expects CSV columns:
 - Count: `TOTAL_NUMBER`, `count_value`
 - Date: `SURVEY_DATE`, `SIGHTING_DATE`
 
+## Data Quality Fixes Applied
+
+### 2026-01-07: Flagged Invalid Pressure Measurements
+- **Issue**: 144,462 negative pressure values (range: -2306 to -1 dbar)
+- **Action**: Set `quality_flag = 2` for all PRES/pressure records with value < 0
+- **Rationale**: Physical impossibility; likely sensor malfunction or fill values
+- **Preserved**: All records retained for forensic analysis
+- **Affected datasets**: IMOS/AODN mooring and CTD data (1991-2025)
+
 ## Troubleshooting
 
 ### Issue: "No time variable found"
