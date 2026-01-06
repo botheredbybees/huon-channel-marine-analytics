@@ -9,6 +9,7 @@ into the PostgreSQL database. It supports:
 - NetCDF files with time-series data
 - Automatic location coordinate validation and patching
 - Batch insertion for performance
+- Smart PH/phosphorus disambiguation (fixes Issue #5)
 """
 
 import sys
@@ -99,6 +100,7 @@ def get_or_create_location(cursor, latitude: float, longitude: float, metadata_i
 # PARAMETER DETECTION
 # ============================================================================
 
+# Updated to separate PH and phosphate keywords (fixes Issue #5)
 PARAMETER_KEYWORDS = {
     'temperature': ['temp', 'temperature', 'sst', 'sea_surface_temperature', 'TEMP'],
     'salinity': ['sal', 'salinity', 'psal', 'PSAL'],
@@ -106,14 +108,91 @@ PARAMETER_KEYWORDS = {
     'oxygen': ['oxygen', 'o2', 'doxy', 'dissolved_oxygen'],
     'chlorophyll': ['chlorophyll', 'chl', 'chla', 'cphl'],
     'turbidity': ['turbidity', 'turb', 'ntu'],
-    'ph': ['ph', 'ph_total', 'ph_insitu'],
+    'ph': ['ph_total', 'ph_insitu', 'ph_seawater'],  # Only true pH keywords
+    'phosphate': ['phosphate', 'po4', 'phos', 'phosphorus'],  # Phosphate keywords
     'current_speed': ['current', 'velocity', 'speed', 'ucur', 'vcur'],
     'wave_height': ['wave_height', 'hs', 'significant_wave_height'],
     'wind_speed': ['wind_speed', 'wspd', 'wind']
 }
 
-def detect_parameters(columns) -> dict:
-    """Detect which oceanographic parameters are present in columns."""
+def smart_detect_ph_or_phosphate(column_name: str, values: pd.Series) -> str:
+    """
+    Intelligently detect whether 'PH' column is pH or phosphate based on value range.
+    
+    Addresses Issue #5: PH parameter ambiguity discovered 2026-01-07
+    
+    Rules:
+    - If column is explicitly 'PH' (ambiguous), check value distribution:
+      - Values mostly in 6-9 range → 'ph' (acidity)
+      - Values mostly in -2 to 4 range → 'phosphate' (concentration)
+      - Mixed or unclear → log warning and default to 'ph' for safety
+    - If column contains 'phosph' or 'po4' → 'phosphate'
+    - If column contains 'ph_' or 'acidity' → 'ph'
+    
+    Args:
+        column_name: The column header/name
+        values: The data values in the column
+    
+    Returns:
+        'ph' or 'phosphate'
+    """
+    col_lower = str(column_name).lower()
+    
+    # Explicit phosphate indicators
+    if any(keyword in col_lower for keyword in ['phosph', 'po4', 'phos']):
+        return 'phosphate'
+    
+    # Explicit pH indicators
+    if any(keyword in col_lower for keyword in ['ph_', 'acidity']):
+        return 'ph'
+    
+    # Ambiguous 'PH' - use value-based detection
+    if col_lower == 'ph':
+        # Get non-null numeric values
+        numeric_values = pd.to_numeric(values, errors='coerce').dropna()
+        
+        if len(numeric_values) == 0:
+            logger.warning(f"    ⚠️ Column '{column_name}' has no valid numeric values, defaulting to 'ph'")
+            return 'ph'
+        
+        # Count values in typical ranges
+        ph_range = numeric_values[(numeric_values >= 6) & (numeric_values <= 9)].count()
+        phosphate_range = numeric_values[(numeric_values >= -2) & (numeric_values <= 4)].count()
+        total = len(numeric_values)
+        
+        ph_pct = (ph_range / total) * 100 if total > 0 else 0
+        phosphate_pct = (phosphate_range / total) * 100 if total > 0 else 0
+        
+        # Decision logic
+        if ph_pct > 80:  # >80% of values in pH range
+            logger.info(f"    ✓ Column '{column_name}' detected as pH (acidity) - {ph_pct:.1f}% in 6-9 range")
+            return 'ph'
+        elif phosphate_pct > 80:  # >80% of values in phosphate range
+            logger.info(f"    ✓ Column '{column_name}' detected as PHOSPHATE - {phosphate_pct:.1f}% in -2 to 4 range")
+            return 'phosphate'
+        else:
+            # Ambiguous - log for manual review
+            logger.warning(
+                f"    ⚠️ AMBIGUOUS: Column '{column_name}' unclear - "
+                f"pH range: {ph_pct:.1f}%, phosphate range: {phosphate_pct:.1f}%. "
+                f"Defaulting to 'ph' - MANUAL REVIEW RECOMMENDED"
+            )
+            return 'ph'  # Conservative default
+    
+    # Should not reach here, but default to ph
+    return 'ph'
+
+def detect_parameters(columns, dataframe=None) -> dict:
+    """
+    Detect which oceanographic parameters are present in columns.
+    
+    Args:
+        columns: List of column names
+        dataframe: Optional DataFrame to access values for smart detection
+    
+    Returns:
+        Dictionary mapping parameter names to column names
+    """
     detected = {}
     
     for param_name, keywords in PARAMETER_KEYWORDS.items():
@@ -121,6 +200,16 @@ def detect_parameters(columns) -> dict:
             col_lower = str(col).lower()
             if any(keyword in col_lower for keyword in keywords):
                 detected[param_name] = col
+                break
+    
+    # Special handling for ambiguous 'PH' column
+    if dataframe is not None:
+        for col in columns:
+            col_lower = str(col).lower()
+            if col_lower == 'ph' and 'ph' not in detected and 'phosphate' not in detected:
+                # Use smart detection
+                param = smart_detect_ph_or_phosphate(col, dataframe[col])
+                detected[param] = col
                 break
     
     return detected
@@ -151,8 +240,8 @@ class CSVExtractor:
             if df.empty:
                 return []
             
-            # Detect parameters
-            params = detect_parameters(df.columns)
+            # Detect parameters (pass dataframe for smart PH detection)
+            params = detect_parameters(df.columns, dataframe=df)
             if not params:
                 logger.info(f"    ⚠ No parameter columns detected in {file_path.name}")
                 return []
@@ -197,12 +286,16 @@ class CSVExtractor:
                     try:
                         value = float(row[param_col])
                         if pd.notna(value):
+                            # Map parameter names to standard codes
+                            param_code = 'PO4' if param_name == 'phosphate' else param_name.upper()
+                            namespace = 'bodc' if param_name in ['phosphate', 'ph'] else 'custom'
+                            
                             measurements.append((
                                 timestamp or datetime.now(),  # time (required)
                                 metadata_id,  # metadata_id
                                 location_id,  # location_id
-                                param_name,  # parameter_code
-                                'custom',  # namespace
+                                param_code,  # parameter_code
+                                namespace,  # namespace
                                 value,  # value
                                 'unknown',  # uom (unit of measure)
                                 None,  # uncertainty
@@ -237,7 +330,7 @@ class NetCDFExtractor:
         try:
             ds = xr.open_dataset(file_path)
             
-            # Detect parameters
+            # Detect parameters (NetCDF doesn't need smart detection, use metadata)
             params = detect_parameters(list(ds.data_vars) + list(ds.coords))
             if not params:
                 logger.info(f"    ⚠ No parameter variables detected in {file_path.name}")
@@ -301,12 +394,16 @@ class NetCDFExtractor:
                                 except:
                                     pass
                             
+                            # Map parameter names to standard codes
+                            param_code = 'PO4' if param_name == 'phosphate' else param_name.upper()
+                            namespace = 'bodc' if param_name in ['phosphate', 'ph'] else 'custom'
+                            
                             measurements.append((
                                 timestamp,  # time
                                 metadata_id,  # metadata_id
                                 location_id,  # location_id
-                                param_name,  # parameter_code
-                                'custom',  # namespace
+                                param_code,  # parameter_code
+                                namespace,  # namespace
                                 float(value),  # value
                                 'unknown',  # uom
                                 None,  # uncertainty
@@ -327,12 +424,16 @@ class NetCDFExtractor:
                                 except:
                                     pass
                             
+                            # Map parameter names to standard codes
+                            param_code = 'PO4' if param_name == 'phosphate' else param_name.upper()
+                            namespace = 'bodc' if param_name in ['phosphate', 'ph'] else 'custom'
+                            
                             measurements.append((
                                 datetime.now(),  # time
                                 metadata_id,  # metadata_id
                                 location_id,  # location_id
-                                param_name,  # parameter_code
-                                'custom',  # namespace
+                                param_code,  # parameter_code
+                                namespace,  # namespace
                                 value,  # value
                                 'unknown',  # uom
                                 None,  # uncertainty
@@ -400,6 +501,7 @@ def main():
     try:
         logger.info(f"{'='*70}")
         logger.info(f"🔍 Detecting parameters in dataset columns...")
+        logger.info(f"💡 Smart PH/phosphate disambiguation enabled (Issue #5 fix)")
         logger.info(f"{'='*70}\n")
         
         conn = get_db_connection()
