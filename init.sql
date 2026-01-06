@@ -187,13 +187,7 @@ CREATE TABLE metadata (
   dataset_name TEXT,
   dataset_path TEXT UNIQUE,  -- For upsert conflict detection
   extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  date_created DATE,
-  
-  -- PostGIS spatial extent (unlocks spatial queries)
-  extent_geom GEOMETRY(POLYGON, 4326),
-  
-  -- Materialized bounding box for non-spatial queries
-  bbox_envelope BOX2D GENERATED ALWAYS AS (BOX2D(extent_geom)) STORED
+  date_created DATE
 );
 
 -- Metadata indexes (pure PostgreSQL)
