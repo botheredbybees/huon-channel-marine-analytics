@@ -416,11 +416,12 @@ SELECT
   dataset_title,
   location_id
 FROM measurements_with_metadata
-WHERE quality_flag IN (1,2)
+WHERE quality_flag = 1  -- Only good data
 GROUP BY
   time_bucket('15 minutes', time),
   parameter_code, dataset_title, location_id
 ORDER BY time DESC, parameter_code;
+
 
 -- =============================================================================
 -- ETL QA/QC SUMMARY VIEW
