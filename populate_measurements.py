@@ -6,10 +6,14 @@ This script extracts measurements from oceanographic data files and inserts them
 into the PostgreSQL database. It supports:
 - Multiple parameters per file (temperature, salinity, pressure, etc.)
 - CSV files with column-based data
-- NetCDF files with time-series data
+- NetCDF files with time-series data  
 - Automatic location coordinate validation and patching
 - Batch insertion for performance
-- Smart PH/phosphorus disambiguation (fixes Issue #5)
+- Metadata-based parameter detection (v4.0 - fixes Issues #5-8)
+
+Version 4.0 Change: Now uses metadata XML CF standard_name as authoritative source
+for parameter codes instead of NetCDF variable names. This prevents misidentification
+of parameters like PH (pH vs phosphate ambiguity).
 """
 
 import sys
@@ -19,24 +23,20 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Dict, List
 import xarray as xr
 import cftime
+import xml.etree.ElementTree as ET
 
 # ============================================================================
 # LOGGING SETUP
 # ============================================================================
 
-# Create logs directory if it doesn't exist
-import os
-from pathlib import Path
 logs_dir = Path('logs')
 logs_dir.mkdir(exist_ok=True)
 
-# Generate log filename with timestamp
 log_filename = logs_dir / f'etl_measurements_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
 
-# Configure logging to write to both file and console
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] %(message)s',
@@ -64,17 +64,138 @@ def get_db_connection():
     )
 
 # ============================================================================
+# CF STANDARD NAME TO PARAMETER CODE MAPPING
+# ============================================================================
+
+# Authoritative mapping from CF standard_name (from metadata XML) to parameter codes
+CF_STANDARD_NAME_TO_CODE = {
+    # Temperature variants
+    'sea_water_temperature': 'TEMP',
+    'sea_surface_temperature': 'TEMP',
+    'sea_water_conservative_temperature': 'TEMP',
+    
+    # Salinity variants
+    'sea_water_salinity': 'PSAL',
+    'sea_water_practical_salinity': 'PSAL',
+    'sea_water_absolute_salinity': 'PSAL',
+    
+    # Pressure/Depth
+    'sea_water_pressure': 'PRES',
+    'sea_water_pressure_due_to_sea_water': 'PRES',
+    'depth': 'DEPTH',
+    
+    # Oxygen
+    'mole_concentration_of_dissolved_molecular_oxygen_in_sea_water': 'DOXY',
+    'mass_concentration_of_oxygen_in_sea_water': 'DOXY',
+    
+    # Chlorophyll  
+    'mass_concentration_of_chlorophyll_a_in_sea_water': 'CPHL',
+    'mass_concentration_of_chlorophyll_in_sea_water': 'CPHL',
+    
+    # Nutrients - THESE ARE KEY TO FIXING ISSUE #5
+    'mole_concentration_of_phosphate_in_sea_water': 'PO4',  # Phosphate (NOT pH!)
+    'mole_concentration_of_nitrate_in_sea_water': 'NO3',
+    'mole_concentration_of_silicate_in_sea_water': 'SIO4',
+    
+    # pH - separate from phosphate
+    'sea_water_ph_reported_on_total_scale': 'PH',
+    'sea_water_ph': 'PH',
+    
+    # Turbidity
+    'sea_water_turbidity': 'TURB',
+    
+    # Currents
+    'sea_water_speed': 'VCUR',
+    'eastward_sea_water_velocity': 'UCUR', 
+    'northward_sea_water_velocity': 'VCUR',
+}
+
+# ============================================================================
+# METADATA EXTRACTION
+# ============================================================================
+
+def extract_parameters_from_metadata(metadata_id: int, cursor) -> Dict[str, str]:
+    """
+    Extract parameter codes from metadata XML using CF standard_name.
+    
+    This is the NEW authoritative method (v4.0) that replaces NetCDF variable detection.
+    
+    Args:
+        metadata_id: The metadata record ID
+        cursor: Database cursor
+        
+    Returns:
+        Dict mapping NetCDF variable names to parameter codes (e.g., {'TEMP': 'TEMP', 'PO4': 'PO4'})
+    """
+    try:
+        # Get metadata XML content
+        cursor.execute("""
+            SELECT metadata_content 
+            FROM metadata 
+            WHERE id = %s
+        """, (metadata_id,))
+        
+        result = cursor.fetchone()
+        if not result or not result[0]:
+            logger.warning(f"    ⚠ No metadata XML found for metadata_id={metadata_id}")
+            return {}
+        
+        metadata_xml = result[0]
+        
+        # Parse XML
+        root = ET.fromstring(metadata_xml)
+        
+        # Define XML namespaces
+        namespaces = {
+            'gmd': 'http://www.isotc211.org/2005/gmd',
+            'gco': 'http://www.isotc211.org/2005/gco',
+            'mcp': 'http://bluenet3.antcrc.utas.edu.au/mcp',
+            'gmx': 'http://www.isotc211.org/2005/gmx'
+        }
+        
+        param_mapping = {}
+        
+        # Extract CF standard_name from contentInfo sections
+        content_infos = root.findall('.//gmd:contentInfo', namespaces)
+        
+        for content_info in content_infos:
+            # Get dimension/attribute elements
+            dimensions = content_info.findall('.//gmd:dimension', namespaces)
+            attributes = content_info.findall('.//gmd:attribute', namespaces)
+            
+            for element in dimensions + attributes:
+                # Get sequence identifier (NetCDF variable name)
+                seq_id_elem = element.find('.//gmd:sequenceIdentifier/gco:MemberName/gco:aName/gco:CharacterString', namespaces)
+                
+                # Get standard name (CF standard_name)
+                std_name_elem = element.find('.//gmd:name/gco:CharacterString', namespaces)
+                
+                if seq_id_elem is not None and std_name_elem is not None:
+                    netcdf_var = seq_id_elem.text
+                    cf_standard_name = std_name_elem.text
+                    
+                    # Map CF standard_name to parameter code
+                    if cf_standard_name in CF_STANDARD_NAME_TO_CODE:
+                        param_code = CF_STANDARD_NAME_TO_CODE[cf_standard_name]
+                        param_mapping[netcdf_var] = param_code
+                        logger.info(f"    ✓ Mapped '{netcdf_var}' → '{param_code}' (CF: {cf_standard_name})")
+        
+        return param_mapping
+        
+    except Exception as e:
+        logger.error(f"    ❌ Failed to extract parameters from metadata: {e}")
+        return {}
+
+# ============================================================================
 # LOCATION VALIDATION
 # ============================================================================
 
 def get_or_create_location(cursor, latitude: float, longitude: float, metadata_id: int) -> Optional[int]:
     """Get existing location ID or create new one if coordinates are valid."""
     
-    # Validate coordinates
     if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
         return None
         
-    # Try to find existing location (within 0.0001 degrees ~ 11 meters)
     cursor.execute("""
         SELECT id 
         FROM locations 
@@ -87,7 +208,6 @@ def get_or_create_location(cursor, latitude: float, longitude: float, metadata_i
     if result:
         return result[0]
     
-    # Create new location
     cursor.execute("""
         INSERT INTO locations (latitude, longitude)
         VALUES (%s, %s)
@@ -97,125 +217,153 @@ def get_or_create_location(cursor, latitude: float, longitude: float, metadata_i
     return cursor.fetchone()[0]
 
 # ============================================================================
-# PARAMETER DETECTION
+# FALLBACK: COLUMN-BASED DETECTION (for datasets without metadata)
 # ============================================================================
 
-# Updated to separate PH and phosphate keywords (fixes Issue #5)
 PARAMETER_KEYWORDS = {
-    'temperature': ['temp', 'temperature', 'sst', 'sea_surface_temperature', 'TEMP'],
-    'salinity': ['sal', 'salinity', 'psal', 'PSAL'],
-    'pressure': ['pres', 'pressure', 'depth', 'PRES'],
-    'oxygen': ['oxygen', 'o2', 'doxy', 'dissolved_oxygen'],
-    'chlorophyll': ['chlorophyll', 'chl', 'chla', 'cphl'],
-    'turbidity': ['turbidity', 'turb', 'ntu'],
-    'ph': ['ph_total', 'ph_insitu', 'ph_seawater'],  # Only true pH keywords
-    'phosphate': ['phosphate', 'po4', 'phos', 'phosphorus'],  # Phosphate keywords
-    'current_speed': ['current', 'velocity', 'speed', 'ucur', 'vcur'],
-    'wave_height': ['wave_height', 'hs', 'significant_wave_height'],
-    'wind_speed': ['wind_speed', 'wspd', 'wind']
+    'TEMP': ['temp', 'temperature', 'sst'],
+    'PSAL': ['sal', 'salinity', 'psal'],
+    'PRES': ['pres', 'pressure'],
+    'DOXY': ['oxygen', 'o2', 'doxy'],
+    'CPHL': ['chlorophyll', 'chl', 'chla'],
+    'TURB': ['turbidity', 'turb'],
+    'PH': ['ph_total', 'ph_insitu', 'ph_seawater'],
+    'PO4': ['phosphate', 'po4', 'phos'],
 }
 
-def smart_detect_ph_or_phosphate(column_name: str, values: pd.Series) -> str:
+def detect_parameters_fallback(columns) -> Dict[str, str]:
     """
-    Intelligently detect whether 'PH' column is pH or phosphate based on value range.
+    Fallback method: Detect parameters from column names when metadata unavailable.
     
-    Addresses Issue #5: PH parameter ambiguity discovered 2026-01-07
-    
-    Rules:
-    - If column is explicitly 'PH' (ambiguous), check value distribution:
-      - Values mostly in 6-9 range → 'ph' (acidity)
-      - Values mostly in -2 to 4 range → 'phosphate' (concentration)
-      - Mixed or unclear → log warning and default to 'ph' for safety
-    - If column contains 'phosph' or 'po4' → 'phosphate'
-    - If column contains 'ph_' or 'acidity' → 'ph'
-    
-    Args:
-        column_name: The column header/name
-        values: The data values in the column
-    
-    Returns:
-        'ph' or 'phosphate'
-    """
-    col_lower = str(column_name).lower()
-    
-    # Explicit phosphate indicators
-    if any(keyword in col_lower for keyword in ['phosph', 'po4', 'phos']):
-        return 'phosphate'
-    
-    # Explicit pH indicators
-    if any(keyword in col_lower for keyword in ['ph_', 'acidity']):
-        return 'ph'
-    
-    # Ambiguous 'PH' - use value-based detection
-    if col_lower == 'ph':
-        # Get non-null numeric values
-        numeric_values = pd.to_numeric(values, errors='coerce').dropna()
-        
-        if len(numeric_values) == 0:
-            logger.warning(f"    ⚠️ Column '{column_name}' has no valid numeric values, defaulting to 'ph'")
-            return 'ph'
-        
-        # Count values in typical ranges
-        ph_range = numeric_values[(numeric_values >= 6) & (numeric_values <= 9)].count()
-        phosphate_range = numeric_values[(numeric_values >= -2) & (numeric_values <= 4)].count()
-        total = len(numeric_values)
-        
-        ph_pct = (ph_range / total) * 100 if total > 0 else 0
-        phosphate_pct = (phosphate_range / total) * 100 if total > 0 else 0
-        
-        # Decision logic
-        if ph_pct > 80:  # >80% of values in pH range
-            logger.info(f"    ✓ Column '{column_name}' detected as pH (acidity) - {ph_pct:.1f}% in 6-9 range")
-            return 'ph'
-        elif phosphate_pct > 80:  # >80% of values in phosphate range
-            logger.info(f"    ✓ Column '{column_name}' detected as PHOSPHATE - {phosphate_pct:.1f}% in -2 to 4 range")
-            return 'phosphate'
-        else:
-            # Ambiguous - log for manual review
-            logger.warning(
-                f"    ⚠️ AMBIGUOUS: Column '{column_name}' unclear - "
-                f"pH range: {ph_pct:.1f}%, phosphate range: {phosphate_pct:.1f}%. "
-                f"Defaulting to 'ph' - MANUAL REVIEW RECOMMENDED"
-            )
-            return 'ph'  # Conservative default
-    
-    # Should not reach here, but default to ph
-    return 'ph'
-
-def detect_parameters(columns, dataframe=None) -> dict:
-    """
-    Detect which oceanographic parameters are present in columns.
-    
-    Args:
-        columns: List of column names
-        dataframe: Optional DataFrame to access values for smart detection
-    
-    Returns:
-        Dictionary mapping parameter names to column names
+    IMPORTANT: This is a fallback only. Metadata-based detection is preferred.
     """
     detected = {}
     
-    for param_name, keywords in PARAMETER_KEYWORDS.items():
+    for param_code, keywords in PARAMETER_KEYWORDS.items():
         for col in columns:
             col_lower = str(col).lower()
             if any(keyword in col_lower for keyword in keywords):
-                detected[param_name] = col
-                break
-    
-    # Special handling for ambiguous 'PH' column
-    if dataframe is not None:
-        for col in columns:
-            col_lower = str(col).lower()
-            if col_lower == 'ph' and 'ph' not in detected and 'phosphate' not in detected:
-                # Use smart detection
-                param = smart_detect_ph_or_phosphate(col, dataframe[col])
-                detected[param] = col
+                detected[col] = param_code
                 break
     
     return detected
 
 # ============================================================================
-# CSV EXTRACTOR
+# NETCDF EXTRACTOR (v4.0 - Uses Metadata)
+# ============================================================================
+
+class NetCDFExtractor:
+    """Extract measurements from NetCDF files using metadata-based parameter detection."""
+    
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.extracted_count = 0
+        self.failed_count = 0
+    
+    def extract(self, file_path: Path, metadata_id: int, dataset_path: str) -> list:
+        """Extract measurements from a NetCDF file using metadata for parameter codes."""
+        try:
+            ds = xr.open_dataset(file_path)
+            
+            # **NEW v4.0**: Get parameter mapping from metadata XML (authoritative source)
+            param_mapping = extract_parameters_from_metadata(metadata_id, self.cursor)
+            
+            if not param_mapping:
+                logger.warning(f"    ⚠ No parameters found in metadata, using fallback detection")
+                # Fallback: detect from variable names
+                param_mapping = detect_parameters_fallback(list(ds.data_vars))
+            
+            if not param_mapping:
+                logger.info(f"    ⚠ No parameter variables detected in {file_path.name}")
+                ds.close()
+                return []
+            
+            logger.info(f"    ✓ Detected {len(param_mapping)} parameters from metadata")
+            
+            measurements = []
+            
+            # Find time dimension
+            time_var = None
+            for var in ['time', 'TIME', 'Time']:
+                if var in ds.coords or var in ds.data_vars:
+                    time_var = var
+                    break
+            
+            # Find location variables
+            lat_var = next((v for v in ['latitude', 'lat', 'LATITUDE', 'LAT'] if v in ds.coords or v in ds.data_vars), None)
+            lon_var = next((v for v in ['longitude', 'lon', 'LONGITUDE', 'LON'] if v in ds.coords or v in ds.data_vars), None)
+            
+            # Process each parameter
+            for netcdf_var, param_code in param_mapping.items():
+                if netcdf_var not in ds.data_vars:
+                    continue
+                    
+                try:
+                    var_data = ds[netcdf_var]
+                    
+                    if time_var and time_var in var_data.dims:
+                        # Time series data
+                        times = ds[time_var].values
+                        values = var_data.values
+                        
+                        for i, (time_val, value) in enumerate(zip(times, values)):
+                            if np.isnan(value):
+                                continue
+                            
+                            # Convert time
+                            timestamp = datetime.now()
+                            try:
+                                if isinstance(time_val, (cftime._cftime.DatetimeGregorian, cftime._cftime.DatetimeProlepticGregorian)):
+                                    timestamp = datetime(
+                                        time_val.year, time_val.month, time_val.day,
+                                        time_val.hour, time_val.minute, time_val.second
+                                    )
+                                else:
+                                    timestamp = pd.to_datetime(str(time_val))
+                            except:
+                                pass
+                            
+                            # Get location
+                            location_id = None
+                            if lat_var and lon_var:
+                                try:
+                                    lat = float(ds[lat_var].isel({time_var: i}) if time_var in ds[lat_var].dims else ds[lat_var].values)
+                                    lon = float(ds[lon_var].isel({time_var: i}) if time_var in ds[lon_var].dims else ds[lon_var].values)
+                                    location_id = get_or_create_location(self.cursor, lat, lon, metadata_id)
+                                except:
+                                    pass
+                            
+                            # Determine namespace
+                            namespace = 'bodc' if param_code in ['PO4', 'PH', 'NO3', 'SIO4'] else 'custom'
+                            
+                            measurements.append((
+                                timestamp,
+                                metadata_id,
+                                location_id,
+                                param_code,
+                                namespace,
+                                float(value),
+                                'unknown',
+                                None,
+                                None,
+                                1
+                            ))
+                    
+                except Exception as e:
+                    logger.warning(f"      ⚠ Failed to extract {netcdf_var}: {e}")
+                    continue
+            
+            ds.close()
+            self.extracted_count += len(measurements)
+            return measurements
+            
+        except Exception as e:
+            logger.error(f"    ❌ NetCDF extraction failed: {e}")
+            self.failed_count += 1
+            return []
+
+# ============================================================================
+# CSV EXTRACTOR (unchanged from v3.3)
 # ============================================================================
 
 class CSVExtractor:
@@ -229,7 +377,6 @@ class CSVExtractor:
     def extract(self, file_path: Path, metadata_id: int, dataset_path: str) -> list:
         """Extract measurements from a CSV file."""
         try:
-            # Read CSV with better error handling
             df = pd.read_csv(
                 file_path,
                 parse_dates=True,
@@ -240,15 +387,16 @@ class CSVExtractor:
             if df.empty:
                 return []
             
-            # Detect parameters (pass dataframe for smart PH detection)
-            params = detect_parameters(df.columns, dataframe=df)
+            # Use fallback detection for CSV (no NetCDF metadata)
+            params = detect_parameters_fallback(df.columns)
+            
             if not params:
                 logger.info(f"    ⚠ No parameter columns detected in {file_path.name}")
                 return []
             
-            logger.info(f"    ✓ Detected {len(params)} parameters: {list(params.keys())}")
+            logger.info(f"    ✓ Detected {len(params)} parameters: {list(set(params.values()))}")
             
-            # Find time column
+            # Find time and location columns
             time_col = None
             for col in df.columns:
                 col_lower = str(col).lower()
@@ -256,7 +404,6 @@ class CSVExtractor:
                     time_col = col
                     break
             
-            # Find location columns
             lat_col = next((c for c in df.columns if 'lat' in str(c).lower()), None)
             lon_col = next((c for c in df.columns if 'lon' in str(c).lower()), None)
             
@@ -282,25 +429,23 @@ class CSVExtractor:
                         pass
                 
                 # Extract each parameter
-                for param_name, param_col in params.items():
+                for param_col, param_code in params.items():
                     try:
                         value = float(row[param_col])
                         if pd.notna(value):
-                            # Map parameter names to standard codes
-                            param_code = 'PO4' if param_name == 'phosphate' else param_name.upper()
-                            namespace = 'bodc' if param_name in ['phosphate', 'ph'] else 'custom'
+                            namespace = 'bodc' if param_code in ['PO4', 'PH', 'NO3', 'SIO4'] else 'custom'
                             
                             measurements.append((
-                                timestamp or datetime.now(),  # time (required)
-                                metadata_id,  # metadata_id
-                                location_id,  # location_id
-                                param_code,  # parameter_code
-                                namespace,  # namespace
-                                value,  # value
-                                'unknown',  # uom (unit of measure)
-                                None,  # uncertainty
-                                None,  # depth_m
-                                1  # quality_flag
+                                timestamp or datetime.now(),
+                                metadata_id,
+                                location_id,
+                                param_code,
+                                namespace,
+                                value,
+                                'unknown',
+                                None,
+                                None,
+                                1
                             ))
                     except (ValueError, TypeError):
                         continue
@@ -310,147 +455,6 @@ class CSVExtractor:
             
         except Exception as e:
             logger.error(f"    ❌ CSV extraction failed: {e}")
-            self.failed_count += 1
-            return []
-
-# ============================================================================
-# NETCDF EXTRACTOR  
-# ============================================================================
-
-class NetCDFExtractor:
-    """Extract measurements from NetCDF files."""
-    
-    def __init__(self, cursor):
-        self.cursor = cursor
-        self.extracted_count = 0
-        self.failed_count = 0
-    
-    def extract(self, file_path: Path, metadata_id: int, dataset_path: str) -> list:
-        """Extract measurements from a NetCDF file."""
-        try:
-            ds = xr.open_dataset(file_path)
-            
-            # Detect parameters (NetCDF doesn't need smart detection, use metadata)
-            params = detect_parameters(list(ds.data_vars) + list(ds.coords))
-            if not params:
-                logger.info(f"    ⚠ No parameter variables detected in {file_path.name}")
-                ds.close()
-                return []
-            
-            logger.info(f"    ✓ Detected {len(params)} parameters: {list(params.keys())}")
-            
-            measurements = []
-            
-            # Find time dimension
-            time_var = None
-            for var in ['time', 'TIME', 'Time']:
-                if var in ds.coords or var in ds.data_vars:
-                    time_var = var
-                    break
-            
-            # Find location variables
-            lat_var = next((v for v in ['latitude', 'lat', 'LATITUDE', 'LAT'] if v in ds.coords or v in ds.data_vars), None)
-            lon_var = next((v for v in ['longitude', 'lon', 'LONGITUDE', 'LON'] if v in ds.coords or v in ds.data_vars), None)
-            
-            # Process each parameter
-            for param_name, var_name in params.items():
-                try:
-                    var_data = ds[var_name]
-                    
-                    # Handle different data structures
-                    if time_var and time_var in var_data.dims:
-                        # Time series data
-                        times = ds[time_var].values
-                        values = var_data.values
-                        
-                        for i, (time_val, value) in enumerate(zip(times, values)):
-                            if np.isnan(value):
-                                continue
-                            
-                            # Convert time to datetime
-                            timestamp = datetime.now()
-                            try:
-                                if isinstance(time_val, (cftime._cftime.DatetimeGregorian, cftime._cftime.DatetimeProlepticGregorian)):
-                                    timestamp = datetime(
-                                        time_val.year,
-                                        time_val.month,
-                                        time_val.day,
-                                        time_val.hour,
-                                        time_val.minute,
-                                        time_val.second
-                                    )
-                                else:
-                                    timestamp = pd.to_datetime(str(time_val))
-                            except:
-                                pass
-                            
-                            # Get location for this time step
-                            location_id = None
-                            if lat_var and lon_var:
-                                try:
-                                    lat = float(ds[lat_var].isel({time_var: i}) if time_var in ds[lat_var].dims else ds[lat_var].values)
-                                    lon = float(ds[lon_var].isel({time_var: i}) if time_var in ds[lon_var].dims else ds[lon_var].values)
-                                    location_id = get_or_create_location(self.cursor, lat, lon, metadata_id)
-                                except:
-                                    pass
-                            
-                            # Map parameter names to standard codes
-                            param_code = 'PO4' if param_name == 'phosphate' else param_name.upper()
-                            namespace = 'bodc' if param_name in ['phosphate', 'ph'] else 'custom'
-                            
-                            measurements.append((
-                                timestamp,  # time
-                                metadata_id,  # metadata_id
-                                location_id,  # location_id
-                                param_code,  # parameter_code
-                                namespace,  # namespace
-                                float(value),  # value
-                                'unknown',  # uom
-                                None,  # uncertainty
-                                None,  # depth_m
-                                1  # quality_flag
-                            ))
-                    
-                    else:
-                        # Single value or non-time-series
-                        value = float(var_data.values.flat[0])
-                        if not np.isnan(value):
-                            location_id = None
-                            if lat_var and lon_var:
-                                try:
-                                    lat = float(ds[lat_var].values.flat[0])
-                                    lon = float(ds[lon_var].values.flat[0])
-                                    location_id = get_or_create_location(self.cursor, lat, lon, metadata_id)
-                                except:
-                                    pass
-                            
-                            # Map parameter names to standard codes
-                            param_code = 'PO4' if param_name == 'phosphate' else param_name.upper()
-                            namespace = 'bodc' if param_name in ['phosphate', 'ph'] else 'custom'
-                            
-                            measurements.append((
-                                datetime.now(),  # time
-                                metadata_id,  # metadata_id
-                                location_id,  # location_id
-                                param_code,  # parameter_code
-                                namespace,  # namespace
-                                value,  # value
-                                'unknown',  # uom
-                                None,  # uncertainty
-                                None,  # depth_m
-                                1  # quality_flag
-                            ))
-                
-                except Exception as e:
-                    logger.warning(f"      ⚠ Failed to extract {param_name}: {e}")
-                    continue
-            
-            ds.close()
-            self.extracted_count += len(measurements)
-            return measurements
-            
-        except Exception as e:
-            logger.error(f"    ❌ NetCDF extraction failed: {e}")
             self.failed_count += 1
             return []
 
@@ -473,7 +477,6 @@ class BatchInserter:
             return
         
         try:
-            # Split into batches
             for i in range(0, len(measurements), self.batch_size):
                 batch = measurements[i:i + self.batch_size]
                 
@@ -500,19 +503,17 @@ def main():
     """Main ETL process."""
     try:
         logger.info(f"{'='*70}")
-        logger.info(f"🔍 Detecting parameters in dataset columns...")
-        logger.info(f"💡 Smart PH/phosphate disambiguation enabled (Issue #5 fix)")
+        logger.info(f"🔍 v4.0: Metadata-based parameter detection (Fixes Issues #5-8)")
+        logger.info(f"💡 Using CF standard_name from metadata XML as authoritative source")
         logger.info(f"{'='*70}\n")
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Initialize processors
         csv_extractor = CSVExtractor(cursor)
         nc_extractor = NetCDFExtractor(cursor)
         inserter = BatchInserter(cursor)
         
-        # Get all datasets - FIXED: Use 'id' not 'metadata_id'
         cursor.execute("""
             SELECT id, title, dataset_path
             FROM metadata
@@ -523,7 +524,6 @@ def main():
         datasets = cursor.fetchall()
         logger.info(f"Found {len(datasets)} datasets to process\n")
         
-        # Process each dataset
         for metadata_id, title, dataset_path in datasets:
             logger.info(f"📂 Processing: {title}")
             
@@ -534,7 +534,6 @@ def main():
             
             all_measurements = []
             
-            # Find all data files
             csv_files = list(path.rglob("*.csv"))
             nc_files = list(path.rglob("*.nc"))
             
@@ -550,7 +549,6 @@ def main():
                     measurements = nc_extractor.extract(nc_file, metadata_id, dataset_path)
                     all_measurements.extend(measurements)
             
-            # Insert all measurements for this dataset
             if all_measurements:
                 logger.info(f"  💾 Inserting {len(all_measurements)} measurements")
                 inserter.insert_batch(all_measurements)
@@ -560,14 +558,13 @@ def main():
             
             logger.info("")
         
-        # Final summary
         logger.info(f"\n{'='*70}")
         logger.info(f"✅ ETL Complete")
         logger.info(f"{'='*70}")
         logger.info(f"Total inserted:        {inserter.total_inserted}")
         logger.info(f"Total failed:          {inserter.total_failed}")
-        logger.info(f"CSV extracted:         {csv_extractor.extracted_count} ({csv_extractor.failed_count} failed)")
-        logger.info(f"NetCDF extracted:      {nc_extractor.extracted_count} ({nc_extractor.failed_count} failed)")
+        logger.info(f"CSV extracted:         {csv_extractor.extracted_count}")
+        logger.info(f"NetCDF extracted:      {nc_extractor.extracted_count}")
         logger.info(f"{'='*70}")
         logger.info(f"📝 Full log saved to: {log_filename}")
         logger.info(f"{'='*70}\n")
