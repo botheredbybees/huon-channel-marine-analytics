@@ -10,10 +10,10 @@ into the PostgreSQL database. It supports:
 - Automatic location coordinate validation and patching
 - Batch insertion for performance
 - Metadata-based parameter detection (v4.0 - fixes Issues #5-8)
+- Unit extraction from NetCDF/metadata (v4.1 - fixes unitless entries)
 
-Version 4.0 Change: Now uses metadata XML CF standard_name as authoritative source
-for parameter codes instead of NetCDF variable names. This prevents misidentification
-of parameters like PH (pH vs phosphate ambiguity).
+Version 4.1 Change: Now extracts units from NetCDF attributes and metadata XML
+instead of hardcoding 'unknown'. Fixes unitless entries in grafana_parameters view.
 """
 
 import sys
@@ -23,7 +23,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import xarray as xr
 import cftime
 import xml.etree.ElementTree as ET
@@ -110,22 +110,41 @@ CF_STANDARD_NAME_TO_CODE = {
     'northward_sea_water_velocity': 'VCUR',
 }
 
+# Standard units for each parameter code (fallback when not in data)
+CF_STANDARD_UNITS = {
+    'TEMP': 'Degrees Celsius',
+    'PSAL': 'PSS-78',
+    'PRES': 'Decibars',
+    'DEPTH': 'meters',
+    'DOXY': 'ml/l',
+    'CPHL': 'mg/m3',
+    'PO4': 'mmol/m3',  # Standard for phosphate concentration
+    'NO3': 'mmol/m3',
+    'SIO4': 'mmol/m3',
+    'PH': 'pH',  # Standard for pH (dimensionless but reported as 'pH')
+    'TURB': 'NTU',
+    'UCUR': 'm/s',
+    'VCUR': 'm/s',
+}
+
 # ============================================================================
 # METADATA EXTRACTION
 # ============================================================================
 
-def extract_parameters_from_metadata(metadata_id: int, cursor) -> Dict[str, str]:
+def extract_parameters_from_metadata(metadata_id: int, cursor) -> Dict[str, Tuple[str, str]]:
     """
-    Extract parameter codes from metadata XML using CF standard_name.
+    Extract parameter codes AND units from metadata XML using CF standard_name.
     
     This is the NEW authoritative method (v4.0) that replaces NetCDF variable detection.
+    v4.1: Now also extracts units from metadata.
     
     Args:
         metadata_id: The metadata record ID
         cursor: Database cursor
         
     Returns:
-        Dict mapping NetCDF variable names to parameter codes (e.g., {'TEMP': 'TEMP', 'PO4': 'PO4'})
+        Dict mapping NetCDF variable names to (parameter_code, unit) tuples
+        Example: {'TEMP': ('TEMP', 'Degrees Celsius'), 'PO4': ('PO4', 'mmol/m3')}
     """
     try:
         # Get metadata XML content
@@ -170,6 +189,9 @@ def extract_parameters_from_metadata(metadata_id: int, cursor) -> Dict[str, str]
                 # Get standard name (CF standard_name)
                 std_name_elem = element.find('.//gmd:name/gco:CharacterString', namespaces)
                 
+                # Get units (NEW in v4.1)
+                unit_elem = element.find('.//gmd:units/gco:CharacterString', namespaces)
+                
                 if seq_id_elem is not None and std_name_elem is not None:
                     netcdf_var = seq_id_elem.text
                     cf_standard_name = std_name_elem.text
@@ -177,8 +199,15 @@ def extract_parameters_from_metadata(metadata_id: int, cursor) -> Dict[str, str]
                     # Map CF standard_name to parameter code
                     if cf_standard_name in CF_STANDARD_NAME_TO_CODE:
                         param_code = CF_STANDARD_NAME_TO_CODE[cf_standard_name]
-                        param_mapping[netcdf_var] = param_code
-                        logger.info(f"    ✓ Mapped '{netcdf_var}' → '{param_code}' (CF: {cf_standard_name})")
+                        
+                        # Get units from metadata or use standard units
+                        if unit_elem is not None and unit_elem.text:
+                            unit = unit_elem.text
+                        else:
+                            unit = CF_STANDARD_UNITS.get(param_code, 'unknown')
+                        
+                        param_mapping[netcdf_var] = (param_code, unit)
+                        logger.info(f"    ✓ Mapped '{netcdf_var}' → '{param_code}' [{unit}] (CF: {cf_standard_name})")
         
         return param_mapping
         
@@ -236,6 +265,7 @@ def detect_parameters_fallback(columns) -> Dict[str, str]:
     Fallback method: Detect parameters from column names when metadata unavailable.
     
     IMPORTANT: This is a fallback only. Metadata-based detection is preferred.
+    Returns only parameter codes (units will use CF_STANDARD_UNITS).
     """
     detected = {}
     
@@ -249,7 +279,7 @@ def detect_parameters_fallback(columns) -> Dict[str, str]:
     return detected
 
 # ============================================================================
-# NETCDF EXTRACTOR (v4.0 - Uses Metadata)
+# NETCDF EXTRACTOR (v4.1 - Extracts Units)
 # ============================================================================
 
 class NetCDFExtractor:
@@ -261,17 +291,21 @@ class NetCDFExtractor:
         self.failed_count = 0
     
     def extract(self, file_path: Path, metadata_id: int, dataset_path: str) -> list:
-        """Extract measurements from a NetCDF file using metadata for parameter codes."""
+        """Extract measurements from a NetCDF file using metadata for parameter codes and units."""
         try:
             ds = xr.open_dataset(file_path)
             
-            # **NEW v4.0**: Get parameter mapping from metadata XML (authoritative source)
+            # **v4.0**: Get parameter mapping from metadata XML (authoritative source)
+            # **v4.1**: Now returns (param_code, unit) tuples
             param_mapping = extract_parameters_from_metadata(metadata_id, self.cursor)
             
             if not param_mapping:
                 logger.warning(f"    ⚠ No parameters found in metadata, using fallback detection")
-                # Fallback: detect from variable names
-                param_mapping = detect_parameters_fallback(list(ds.data_vars))
+                # Fallback: detect from variable names (returns param_code only)
+                param_codes = detect_parameters_fallback(list(ds.data_vars))
+                # Convert to (param_code, unit) tuples with standard units
+                param_mapping = {var: (code, CF_STANDARD_UNITS.get(code, 'unknown')) 
+                                for var, code in param_codes.items()}
             
             if not param_mapping:
                 logger.info(f"    ⚠ No parameter variables detected in {file_path.name}")
@@ -294,12 +328,19 @@ class NetCDFExtractor:
             lon_var = next((v for v in ['longitude', 'lon', 'LONGITUDE', 'LON'] if v in ds.coords or v in ds.data_vars), None)
             
             # Process each parameter
-            for netcdf_var, param_code in param_mapping.items():
+            for netcdf_var, (param_code, metadata_unit) in param_mapping.items():
                 if netcdf_var not in ds.data_vars:
                     continue
                     
                 try:
                     var_data = ds[netcdf_var]
+                    
+                    # **v4.1**: Extract units from NetCDF variable attributes (preferred over metadata)
+                    if 'units' in var_data.attrs and var_data.attrs['units']:
+                        unit = var_data.attrs['units']
+                    else:
+                        # Use metadata unit or standard unit as fallback
+                        unit = metadata_unit if metadata_unit != 'unknown' else CF_STANDARD_UNITS.get(param_code, 'unknown')
                     
                     if time_var and time_var in var_data.dims:
                         # Time series data
@@ -343,7 +384,7 @@ class NetCDFExtractor:
                                 param_code,
                                 namespace,
                                 float(value),
-                                'unknown',
+                                unit,  # **v4.1**: Now uses extracted unit instead of 'unknown'
                                 None,
                                 None,
                                 1
@@ -363,7 +404,7 @@ class NetCDFExtractor:
             return []
 
 # ============================================================================
-# CSV EXTRACTOR (unchanged from v3.3)
+# CSV EXTRACTOR (v4.1 - Uses Standard Units)
 # ============================================================================
 
 class CSVExtractor:
@@ -435,6 +476,9 @@ class CSVExtractor:
                         if pd.notna(value):
                             namespace = 'bodc' if param_code in ['PO4', 'PH', 'NO3', 'SIO4'] else 'custom'
                             
+                            # **v4.1**: Use standard units for CSV (no NetCDF attributes)
+                            unit = CF_STANDARD_UNITS.get(param_code, 'unknown')
+                            
                             measurements.append((
                                 timestamp or datetime.now(),
                                 metadata_id,
@@ -442,7 +486,7 @@ class CSVExtractor:
                                 param_code,
                                 namespace,
                                 value,
-                                'unknown',
+                                unit,  # **v4.1**: Now uses standard unit instead of 'unknown'
                                 None,
                                 None,
                                 1
@@ -503,8 +547,9 @@ def main():
     """Main ETL process."""
     try:
         logger.info(f"{'='*70}")
-        logger.info(f"🔍 v4.0: Metadata-based parameter detection (Fixes Issues #5-8)")
+        logger.info(f"🔍 v4.1: Metadata-based parameter detection + unit extraction")
         logger.info(f"💡 Using CF standard_name from metadata XML as authoritative source")
+        logger.info(f"📏 Extracting units from NetCDF attributes and metadata")
         logger.info(f"{'='*70}\n")
         
         conn = get_db_connection()
