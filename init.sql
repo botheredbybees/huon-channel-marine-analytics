@@ -792,6 +792,84 @@ GRANT SELECT ON taxa_needing_review TO marine_user;
 -- END OF TAXONOMY ENRICHMENT SCHEMA
 -- =============================================================================
 
+-- =============================================================================
+-- CSIRO DATA INTEGRATION (Storm Bay, AquaWatch)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS public.csiro_model_grid (
+  grid_id SERIAL PRIMARY KEY,
+  source TEXT NOT NULL, -- e.g. "StormBay_2023"
+  i INTEGER,
+  j INTEGER,
+  latitude DOUBLE PRECISION NOT NULL,
+  longitude DOUBLE PRECISION NOT NULL,
+  depth DOUBLE PRECISION,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_csiro_model_grid_source ON public.csiro_model_grid(source);
+CREATE INDEX IF NOT EXISTS idx_csiro_model_grid_lat_lon ON public.csiro_model_grid(latitude, longitude);
+
+CREATE TABLE IF NOT EXISTS public.csiro_model_timeseries (
+  time TIMESTAMPTZ NOT NULL,
+  grid_id INTEGER REFERENCES csiro_model_grid(grid_id) ON DELETE CASCADE,
+  temp DOUBLE PRECISION,
+  salinity DOUBLE PRECISION,
+  nitrate DOUBLE PRECISION,
+  phosphate DOUBLE PRECISION,
+  chlorophyll DOUBLE PRECISION,
+  oxygen DOUBLE PRECISION,
+  turbidity DOUBLE PRECISION,
+  source_run_id TEXT
+);
+
+-- Make it a TimescaleDB hypertable
+DO $$
+BEGIN
+  PERFORM create_hypertable('csiro_model_timeseries', by_range('time'));
+EXCEPTION
+  WHEN duplicate_table THEN
+    NULL;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_csiro_model_ts_grid ON public.csiro_model_timeseries(grid_id, time DESC);
+
+CREATE TABLE IF NOT EXISTS public.csiro_satellite_products (
+  time TIMESTAMPTZ NOT NULL,
+  latitude DOUBLE PRECISION NOT NULL,
+  longitude DOUBLE PRECISION NOT NULL,
+  sst DOUBLE PRECISION,
+  chl_a DOUBLE PRECISION,
+  turbidity DOUBLE PRECISION,
+  data_source TEXT
+);
+
+DO $$
+BEGIN
+  PERFORM create_hypertable('csiro_satellite_products', by_range('time'));
+EXCEPTION
+  WHEN duplicate_table THEN
+    NULL;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_csiro_sat_lat_lon ON public.csiro_satellite_products(latitude, longitude);
+
+CREATE TABLE IF NOT EXISTS public.csiro_grid_to_location_mapping (
+  mapping_id SERIAL PRIMARY KEY,
+  location_id INTEGER REFERENCES locations(id) ON DELETE CASCADE,
+  grid_id INTEGER REFERENCES csiro_model_grid(grid_id) ON DELETE CASCADE,
+  distance_meters DOUBLE PRECISION NOT NULL,
+  rank INTEGER DEFAULT 1,
+  UNIQUE(location_id, grid_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_csiro_mapping_loc ON public.csiro_grid_to_location_mapping(location_id);
+CREATE INDEX IF NOT EXISTS idx_csiro_mapping_grid ON public.csiro_grid_to_location_mapping(grid_id);
+
+GRANT SELECT ON csiro_model_grid TO marine_user;
+GRANT SELECT ON csiro_model_timeseries TO marine_user;
+GRANT SELECT ON csiro_grid_to_location_mapping TO marine_user;
+GRANT SELECT ON csiro_satellite_products TO marine_user;
 
 -- =============================================================================
 -- GRANTS FOR GRAFANA/PGADMIN
